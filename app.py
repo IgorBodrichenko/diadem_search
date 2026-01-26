@@ -1,6 +1,7 @@
 import os
+import json
 from typing import List, Dict
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -100,6 +101,7 @@ def get_matches(query: str, top_k: int) -> List[Dict]:
 def health():
     return {"ok": True}
 
+# ---- JSON chat (обычный) ----
 @app.post("/chat")
 def chat(payload: Dict = Body(...)):
     query = (payload.get("query") or "").strip()
@@ -113,7 +115,7 @@ def chat(payload: Dict = Body(...)):
 
     user = f"QUESTION:\n{query}\n\nINFORMATION:\n{context}"
 
-    chat = openai.chat.completions.create(
+    resp = openai.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -122,9 +124,10 @@ def chat(payload: Dict = Body(...)):
         temperature=0.2,
     )
 
-    answer = (chat.choices[0].message.content or "").strip()
+    answer = (resp.choices[0].message.content or "").strip()
     return {"answer": answer}
 
+# ---- простой text/plain stream ----
 @app.post("/chat/stream")
 def chat_stream(payload: Dict = Body(...)):
     query = (payload.get("query") or "").strip()
@@ -135,7 +138,6 @@ def chat_stream(payload: Dict = Body(...)):
 
     matches = get_matches(query, top_k)
     context = build_context(matches)
-
     user = f"QUESTION:\n{query}\n\nINFORMATION:\n{context}"
 
     def gen():
@@ -153,5 +155,51 @@ def chat_stream(payload: Dict = Body(...)):
             if delta:
                 yield delta
 
-    # Простой text stream (не SSE). Bubble можно принимать как “текст по кускам”
     return StreamingResponse(gen(), media_type="text/plain; charset=utf-8")
+
+# ---- SSE stream (лучше для Bubble) ----
+@app.post("/chat/sse")
+def chat_sse(payload: Dict = Body(...)):
+    query = (payload.get("query") or "").strip()
+    top_k = int(payload.get("top_k") or TOP_K)
+
+    if not query:
+        def empty_gen():
+            yield "event: done\ndata: {}\n\n"
+        return StreamingResponse(
+            empty_gen(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    matches = get_matches(query, top_k)
+    context = build_context(matches)
+    user = f"QUESTION:\n{query}\n\nINFORMATION:\n{context}"
+
+    def gen():
+        # важно: стартовый chunk, чтобы Bubble сразу увидел поток
+        yield "event: start\ndata: {}\n\n"
+
+        stream = openai.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
+            stream=True,
+        )
+
+        for event in stream:
+            delta = event.choices[0].delta.content
+            if delta:
+                data = json.dumps({"text": delta}, ensure_ascii=False)
+                yield f"event: chunk\ndata: {data}\n\n"
+
+        yield "event: done\ndata: {}\n\n"
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
