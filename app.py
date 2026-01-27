@@ -245,11 +245,16 @@ def _current_step(mode: str, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return steps[idx]
 
 
+# ✅ FIX: НЕ продвигаем step_index если user_input пустой
 def _advance_with_answer(mode: str, state: Dict[str, Any], user_input: str) -> Dict[str, Any]:
+    # no answer -> do not advance
+    if not user_input.strip():
+        return state
+
     steps = _steps(mode)
     idx = _clamp_int(state.get("step_index"), 0, 0, max(len(steps) - 1, 0))
 
-    if user_input.strip() and steps:
+    if steps:
         key = steps[idx]["key"]
         state["answers"][key] = user_input.strip()
 
@@ -302,8 +307,9 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
 
     state = _load_state(session_id, mode)
 
-    # If first call and no query: ask first question without advancing
-    if not query and int(state.get("step_index", 0)) == 0:
+    # ✅ FIX: если query пустой — НЕ двигаем шаг, просто задаём текущий вопрос
+    if not query:
+        # ask current question
         info = _retrieve_info_for_coach(mode, f"template {mode}", top_k)
         user_msg = _make_coach_user_message(mode, state, "", info)
     else:
