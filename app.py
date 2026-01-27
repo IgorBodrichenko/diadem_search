@@ -2,7 +2,7 @@ import os
 import json
 import uuid
 import time
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -66,7 +66,7 @@ def _cleanup_sessions():
     """Lazy cleanup on each request to avoid growing forever."""
     cutoff = _now() - SESSION_TTL_SECONDS
     to_delete = []
-    for sid, entry in SESSIONS.items():
+    for sid, entry in list(SESSIONS.items()):
         if int(entry.get("updated_at", 0)) < cutoff:
             to_delete.append(sid)
     for sid in to_delete:
@@ -188,9 +188,11 @@ SYSTEM_PROMPT_COACH = (
     "- If the user answers, briefly reflect it in 1–2 lines, then move to the next step.\n"
     "- Do NOT lecture. Do NOT dump long explanations.\n"
     "- NEVER repeat a previous question unless the user explicitly asks you to repeat.\n"
+    "- IMPORTANT: The next question must be EXACTLY the provided 'NEXT QUESTION' line. Ask it verbatim and stop.\n"
     "- Use the provided INFORMATION only as background support for phrasing and best-practice, but NEVER mention documents, pages, sources, citations, or the word 'context'.\n"
     "- Output plain text only.\n"
 )
+
 
 def _extract_mode(payload: Dict[str, Any]) -> str:
     mode = _safe_str(payload.get("mode")) or "build_confidence"
@@ -266,11 +268,9 @@ def _make_coach_user_message(mode: str, state: Dict[str, Any], user_input: str, 
     steps = tpl["steps"]
     idx = _clamp_int(state.get("step_index"), 0, 0, len(steps))
 
-    # next question is deterministic (from steps), not "free-form"
     next_step = steps[idx] if idx < len(steps) else None
     next_q = next_step["question"] if next_step else "Summarise the plan."
 
-    # include current state answers for the model to reflect (shortly)
     answers_lines = []
     for i in range(min(idx, len(steps))):
         k = steps[i]["key"]
@@ -307,7 +307,6 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
         info = _retrieve_info_for_coach(mode, f"template {mode}", top_k)
         user_msg = _make_coach_user_message(mode, state, "", info)
     else:
-        # advance deterministically
         state = _advance_with_answer(mode, state, query)
         info = _retrieve_info_for_coach(mode, query, top_k)
         user_msg = _make_coach_user_message(mode, state, query, info)
@@ -317,7 +316,6 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
     if done:
         user_msg += "\nFINAL INSTRUCTION:\nSummarise the user’s plan in a clean, practical format and offer the next action."
 
-    # IMPORTANT: persist updated state now (so even if stream breaks, step is not lost)
     _save_state(session_id, state)
 
     if not stream:
@@ -385,6 +383,61 @@ def chat(payload: Dict = Body(...)):
     return {"answer": answer}
 
 
+# ---- SSE chat (обычный RAG Q&A) ----
+@app.post("/chat/sse")
+def chat_sse(payload: Dict = Body(...)):
+    query = (payload.get("query") or "").strip()
+    top_k = int(payload.get("top_k") or TOP_K)
+
+    def headers():
+        return {
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+
+    if not query:
+        def empty_gen():
+            yield "event: done\ndata: {}\n\n"
+        return StreamingResponse(
+            empty_gen(),
+            media_type="text/event-stream",
+            headers=headers(),
+        )
+
+    matches = get_matches(query, top_k)
+    context = build_context(matches)
+
+    user = f"QUESTION:\n{query}\n\nINFORMATION:\n{context}"
+
+    def gen():
+        yield "event: start\ndata: {}\n\n"
+
+        stream = openai.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT_QA},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
+            stream=True,
+        )
+
+        for event in stream:
+            delta = event.choices[0].delta.content
+            if delta:
+                data = json.dumps({"text": delta}, ensure_ascii=False)
+                yield f"event: chunk\ndata: {data}\n\n"
+
+        yield "event: done\ndata: {}\n\n"
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers=headers(),
+    )
+
+
 # =========================
 # COACH ENDPOINTS (server-stored sessions)
 # =========================
@@ -403,8 +456,14 @@ def coach_sse(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
     chunks, meta = coach_turn_server_state(payload, session_id=session_id, stream=True)
 
+    def headers():
+        return {
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+
     def gen():
-        # start: отдаём session_id (Bubble сохранит как текст)
         start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
         yield f"event: start\ndata: {start_payload}\n\n"
 
@@ -418,7 +477,7 @@ def coach_sse(payload: Dict = Body(...)):
     return StreamingResponse(
         gen(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        headers=headers(),
     )
 
 
