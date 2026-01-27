@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import uuid
 from typing import List, Dict, Any, Tuple, Optional
 
 from fastapi import FastAPI, Body
@@ -118,7 +119,7 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
             {"key": "relationship", "question": "About the relationship: what do you know about the other person’s priorities or pressures?"},
             {"key": "myself", "question": "About you: what strengths or skills do you bring that will help you handle this well?"},
             {"key": "why_confident", "question": "Great. Now list 3–5 reasons you *should* feel confident going into this."},
-            {"key": "summary", "question": "Want me to summarise your confidence plan in 5–7 bullet points you can read right before the call?"}
+            {"key": "summary", "question": "Want me to summarise your confidence plan in 5–7 bullet points you can read right before the call?"},
         ],
     },
 
@@ -132,7 +133,7 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
             {"key": "response_bullet", "question": "Let’s craft your response. What’s the one key point you must hold your ground on? (One sentence)"},
             {"key": "move_on_air", "question": "Now write a short linking phrase to steer back on track (e.g., “That’s helpful—so to move this forward…”). What’s your version?"},
             {"key": "rehearse", "question": "Do you want a 2-turn rehearsal? I’ll play them once, you reply, then I’ll improve your wording."},
-            {"key": "summary", "question": "Want the final ‘cheat sheet’ (their likely line → your bullet → your steer-back phrase) in a clean format?"}
+            {"key": "summary", "question": "Want the final ‘cheat sheet’ (their likely line → your bullet → your steer-back phrase) in a clean format?"},
         ],
     },
 }
@@ -176,9 +177,6 @@ def _extract_mode(payload: Dict[str, Any]) -> str:
 
 
 def _next_step(mode: str, state: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], bool]:
-    """
-    returns (state, step, done)
-    """
     tpl = TEMPLATES[mode]
     steps = tpl["steps"]
     idx = _clamp_int(state.get("step_index"), 0, 0, len(steps))
@@ -188,9 +186,6 @@ def _next_step(mode: str, state: Dict[str, Any]) -> Tuple[Dict[str, Any], Option
 
 
 def _update_state_with_user_answer(mode: str, state: Dict[str, Any], user_input: str) -> Dict[str, Any]:
-    """
-    Save answer for current step, then advance step_index.
-    """
     tpl = TEMPLATES[mode]
     steps = tpl["steps"]
     idx = _clamp_int(state.get("step_index"), 0, 0, max(len(steps) - 1, 0))
@@ -206,14 +201,10 @@ def _update_state_with_user_answer(mode: str, state: Dict[str, Any], user_input:
 
 
 def _make_coach_user_message(mode: str, state: Dict[str, Any], user_input: str, information: str) -> str:
-    """
-    Provide template + what we have so far + current user input + (optional) info from docs.
-    """
     tpl = TEMPLATES[mode]
     steps = tpl["steps"]
     idx = _clamp_int(state.get("step_index"), 0, 0, len(steps))
 
-    # We reflect previous answers briefly; model will decide how to reflect.
     answers = state.get("answers") or {}
     answers_lines = []
     for s in steps[:idx]:
@@ -237,61 +228,40 @@ def _make_coach_user_message(mode: str, state: Dict[str, Any], user_input: str, 
 
 
 def _retrieve_info_for_coach(mode: str, query: str, top_k: int) -> str:
-    """
-    RAG запрос делаем умнее: добавляем mode, чтобы искать именно релевантные куски.
-    """
     rag_query = f"{mode}: {query}"
     matches = get_matches(rag_query, top_k)
     return build_context(matches)
 
 
 def coach_turn(payload: Dict[str, Any], stream: bool = False):
-    """
-    Guided coach turn:
-    - mode: build_confidence / prepare_difficult_behaviours
-    - state: object persisted in Bubble (optional)
-    - query: current user message (string)
-    """
     mode = _extract_mode(payload)
-    query = _safe_str(payload.get("query"))
 
-    # allow separate field name if you like
+    query = _safe_str(payload.get("query"))
     if not query:
         query = _safe_str(payload.get("user_input"))
 
     top_k = _clamp_int(payload.get("top_k"), TOP_K, 1, 30)
 
-    # state from client
     state = payload.get("state")
     if not isinstance(state, dict):
         state = _default_state(mode)
     else:
-        # ensure mode is consistent
         state["mode"] = mode
         if "answers" not in state or not isinstance(state["answers"], dict):
             state["answers"] = {}
         if "step_index" not in state:
             state["step_index"] = 0
 
-    # If this is the first call and query is empty: just ask first question
     if not query and state.get("step_index", 0) == 0:
         information = _retrieve_info_for_coach(mode, f"template {mode}", top_k)
         user_msg = _make_coach_user_message(mode, state, "", information)
     else:
-        # save user's answer into current step, then advance
-        prev_state = dict(state)
         state = _update_state_with_user_answer(mode, state, query)
-
-        # retrieve info based on user's last answer (helps phrasing)
         information = _retrieve_info_for_coach(mode, query, top_k)
-
-        # build user message for the model (includes next step instruction)
         user_msg = _make_coach_user_message(mode, state, query, information)
 
-    # Determine done after we advanced
-    _, step, done = _next_step(mode, state)
+    _, _, done = _next_step(mode, state)
 
-    # If done, instruct to summarise instead of asking a new question
     if done:
         user_msg += "\nFINAL INSTRUCTION:\nSummarise the user’s plan in a clean, practical format and offer the next action."
 
@@ -442,50 +412,41 @@ def chat_sse(payload: Dict = Body(...)):
 # ---- Coach JSON (best for Bubble state) ----
 @app.post("/coach/chat")
 def coach_chat(payload: Dict = Body(...)):
-    """
-    Request example:
-    {
-      "mode": "build_confidence",
-      "query": "They keep saying our price is too high",
-      "state": {...optional...}
-    }
-
-    Response:
-    {
-      "text": "...",
-      "state": {...},
-      "done": false
-    }
-    """
     out = coach_turn(payload, stream=False)
     return JSONResponse(out)
 
 
-# ---- Coach text/plain stream (no state in stream; state returned at end only if you use /coach/sse) ----
+# ---- Coach text/plain stream ----
 @app.post("/coach/stream")
 def coach_stream(payload: Dict = Body(...)):
-    chunks, meta = coach_turn(payload, stream=True)
-
-    # plain text streaming
+    chunks, _meta = coach_turn(payload, stream=True)
     return StreamingResponse(chunks, media_type="text/plain; charset=utf-8")
 
 
-# ---- Coach SSE stream (recommended for Bubble: chunks + final state in done event) ----
+# ---- Coach SSE stream: session_id в event:start, text в event:chunk, done пустой ----
 @app.post("/coach/sse")
 def coach_sse(payload: Dict = Body(...)):
+    # session_id можно передать с клиента, либо создаём новый
+    session_id = (payload.get("session_id") or "").strip()
+    if not session_id:
+        session_id = uuid.uuid4().hex
+
     chunks, meta = coach_turn(payload, stream=True)
 
     def gen():
-        yield "event: start\ndata: {}\n\n"
+        # START: отдаём session_id отдельным полем (Bubble сможет сохранить)
+        start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
+        yield f"event: start\ndata: {start_payload}\n\n"
+
+        # CHUNK: только текст
         for delta in chunks:
+            if not delta:
+                continue
             data = json.dumps({"text": delta}, ensure_ascii=False)
             yield f"event: chunk\ndata: {data}\n\n"
-        # IMPORTANT: send state at the end so Bubble can store it
-        done_payload = json.dumps(
-            {"state": meta.get("state"), "done": bool(meta.get("done"))},
-            ensure_ascii=False
-        )
-        yield f"event: done\ndata: {done_payload}\n\n"
+
+        # DONE: пустой (без state, чтобы Bubble не плодил поля)
+        yield "event: done\ndata: {}\n\n"
 
     return StreamingResponse(
         gen(),
