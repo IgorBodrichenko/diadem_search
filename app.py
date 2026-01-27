@@ -62,7 +62,7 @@ def embed_query(text: str) -> List[float]:
 
 def build_context(matches: List[Dict]) -> str:
     """
-    Берём только metadata.text, без file/page. Нам в промпте это ок,
+    Берём только metadata.text, без file/page. В промпте ок,
     но модель НЕ должна это упоминать пользователю.
     """
     parts: List[str] = []
@@ -115,11 +115,12 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
         "title": "Build my confidence",
         "steps": [
             {"key": "company", "question": "Let’s start with your company. What about your company gives you a strong position here?"},
-            {"key": "situation", "question": "Now the situation itself. What’s the most important thing you want to achieve in this conversation?"},
+            {"key": "situation", "question": "Thanks. In one sentence, what is your primary goal for this conversation?"},
+            {"key": "outcome", "question": "Good. If this goes well, what has *actually happened* by the end (e.g. approval, clear next steps, signed proposal)?"},
             {"key": "relationship", "question": "About the relationship: what do you know about the other person’s priorities or pressures?"},
             {"key": "myself", "question": "About you: what strengths or skills do you bring that will help you handle this well?"},
             {"key": "why_confident", "question": "Great. Now list 3–5 reasons you *should* feel confident going into this."},
-            {"key": "summary", "question": "Want me to summarise your confidence plan in 5–7 bullet points you can read right before the call?"},
+            {"key": "summary", "question": "Do you want me to summarise your confidence plan in 5–7 bullet points you can read right before the call? (yes/no)"},
         ],
     },
 
@@ -132,21 +133,24 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
             {"key": "purpose", "question": "What do you think their purpose is with that move—pressure, delay, anchoring, saving face, something else?"},
             {"key": "response_bullet", "question": "Let’s craft your response. What’s the one key point you must hold your ground on? (One sentence)"},
             {"key": "move_on_air", "question": "Now write a short linking phrase to steer back on track (e.g., “That’s helpful—so to move this forward…”). What’s your version?"},
-            {"key": "rehearse", "question": "Do you want a 2-turn rehearsal? I’ll play them once, you reply, then I’ll improve your wording."},
-            {"key": "summary", "question": "Want the final ‘cheat sheet’ (their likely line → your bullet → your steer-back phrase) in a clean format?"},
+            {"key": "rehearse", "question": "Do you want a 2-turn rehearsal? (yes/no)"},
+            {"key": "summary", "question": "Want the final ‘cheat sheet’ (their likely line → your bullet → your steer-back phrase) in a clean format? (yes/no)"},
         ],
     },
 }
 
+# ВАЖНО: модель НЕ задаёт вопросы — только коротко отражает ответ
 SYSTEM_PROMPT_COACH = (
-    "You are a professional negotiation coach running a structured guided dialogue.\n"
-    "You must follow the selected TEMPLATE and step-by-step flow.\n"
+    "You are a professional negotiation coach.\n"
+    "You are running a structured guided dialogue, but you must NOT choose the next step.\n"
+    "\n"
     "Rules:\n"
-    "- Keep it interactive: ask ONE clear question or give ONE short instruction at a time.\n"
-    "- If the user answers, briefly reflect it in 1–2 lines, then move to the next step.\n"
-    "- Do NOT lecture. Do NOT dump long explanations.\n"
-    "- Use the provided INFORMATION only as background support for phrasing and best-practice, but NEVER mention documents, pages, sources, citations, or the word 'context'.\n"
-    "- Output plain text only.\n"
+    "- Output MUST be plain text.\n"
+    "- Output MUST be 1–2 short sentences maximum.\n"
+    "- Do NOT ask questions.\n"
+    "- Do NOT include numbered lists or long explanations.\n"
+    "- Do NOT mention documents, pages, sources, citations, or the word 'context'.\n"
+    "- Your job is ONLY to acknowledge/refine what the user just said.\n"
 )
 
 def _safe_str(x: Any) -> str:
@@ -176,18 +180,19 @@ def _extract_mode(payload: Dict[str, Any]) -> str:
     return mode
 
 
-def _next_step(mode: str, state: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], bool]:
-    tpl = TEMPLATES[mode]
-    steps = tpl["steps"]
-    idx = _clamp_int(state.get("step_index"), 0, 0, len(steps))
-    if idx >= len(steps):
-        return state, None, True
-    return state, steps[idx], False
+def _get_step(mode: str, step_index: int) -> Optional[Dict[str, Any]]:
+    steps = TEMPLATES[mode]["steps"]
+    if step_index < 0 or step_index >= len(steps):
+        return None
+    return steps[step_index]
+
+
+def _is_done(mode: str, step_index: int) -> bool:
+    return _get_step(mode, step_index) is None
 
 
 def _update_state_with_user_answer(mode: str, state: Dict[str, Any], user_input: str) -> Dict[str, Any]:
-    tpl = TEMPLATES[mode]
-    steps = tpl["steps"]
+    steps = TEMPLATES[mode]["steps"]
     idx = _clamp_int(state.get("step_index"), 0, 0, max(len(steps) - 1, 0))
 
     step_key = steps[idx]["key"] if steps else "step"
@@ -200,46 +205,45 @@ def _update_state_with_user_answer(mode: str, state: Dict[str, Any], user_input:
     return state
 
 
-def _make_coach_user_message(mode: str, state: Dict[str, Any], user_input: str, information: str) -> str:
-    tpl = TEMPLATES[mode]
-    steps = tpl["steps"]
-    idx = _clamp_int(state.get("step_index"), 0, 0, len(steps))
-
-    answers = state.get("answers") or {}
-    answers_lines = []
-    for s in steps[:idx]:
-        k = s["key"]
-        if k in answers:
-            answers_lines.append(f"- {k}: {answers[k]}")
-
-    answers_block = "\n".join(answers_lines) if answers_lines else "(none yet)"
-
-    next_step = steps[idx] if idx < len(steps) else None
-    next_q = next_step["question"] if next_step else "Summarise the plan."
-
-    return (
-        f"TEMPLATE: {tpl['title']} ({mode})\n"
-        f"PROGRESS: step {idx+1} of {len(steps)}\n\n"
-        f"WHAT USER SAID NOW:\n{user_input.strip()}\n\n"
-        f"WHAT WE HAVE SO FAR:\n{answers_block}\n\n"
-        f"NEXT STEP QUESTION/INSTRUCTION:\n{next_q}\n\n"
-        f"INFORMATION (background support):\n{information}\n"
-    )
-
-
 def _retrieve_info_for_coach(mode: str, query: str, top_k: int) -> str:
+    # background retrieval
     rag_query = f"{mode}: {query}"
     matches = get_matches(rag_query, top_k)
     return build_context(matches)
 
 
+def _coach_llm_ack(mode: str, state: Dict[str, Any], user_input: str, information: str) -> str:
+    """
+    LLM делает только ACK/рефрейм последнего ответа (без вопросов).
+    """
+    tpl = TEMPLATES[mode]
+    last_key = ""
+    # последний заполненный ключ = тот, что только что сохранили
+    # (он на шаг позади текущего step_index)
+    last_idx = max(0, int(state.get("step_index", 0)) - 1)
+    last_step = _get_step(mode, last_idx)
+    if last_step:
+        last_key = last_step.get("key", "")
+
+    answers = state.get("answers") or {}
+    last_value = answers.get(last_key, "")
+
+    return (
+        f"MODE: {mode}\n"
+        f"TEMPLATE: {tpl['title']}\n"
+        f"LAST_STEP_KEY: {last_key}\n"
+        f"USER_INPUT: {user_input}\n"
+        f"LAST_SAVED_VALUE: {last_value}\n\n"
+        f"INFORMATION:\n{information}\n"
+        "\n"
+        "Write a short acknowledgement/refinement of the user's last answer (1–2 sentences)."
+    )
+
+
 def coach_turn(payload: Dict[str, Any], stream: bool = False):
     mode = _extract_mode(payload)
 
-    query = _safe_str(payload.get("query"))
-    if not query:
-        query = _safe_str(payload.get("user_input"))
-
+    query = _safe_str(payload.get("query")) or _safe_str(payload.get("user_input"))
     top_k = _clamp_int(payload.get("top_k"), TOP_K, 1, 30)
 
     state = payload.get("state")
@@ -252,45 +256,58 @@ def coach_turn(payload: Dict[str, Any], stream: bool = False):
         if "step_index" not in state:
             state["step_index"] = 0
 
-    if not query and state.get("step_index", 0) == 0:
-        information = _retrieve_info_for_coach(mode, f"template {mode}", top_k)
-        user_msg = _make_coach_user_message(mode, state, "", information)
-    else:
-        state = _update_state_with_user_answer(mode, state, query)
-        information = _retrieve_info_for_coach(mode, query, top_k)
-        user_msg = _make_coach_user_message(mode, state, query, information)
+    # 1) Если это старт и текста нет — просто отдаём первый вопрос (без LLM)
+    if not query and int(state.get("step_index", 0)) == 0:
+        first = _get_step(mode, 0)
+        text = first["question"] if first else ""
+        done = _is_done(mode, 0)
+        return {"text": text, "state": state, "done": done} if not stream else (iter([text]), {"state": state, "done": done})
 
-    _, _, done = _next_step(mode, state)
+    # 2) Сохраняем ответ пользователя в текущий шаг и двигаем step_index вперёд
+    state = _update_state_with_user_answer(mode, state, query)
 
-    if done:
-        user_msg += "\nFINAL INSTRUCTION:\nSummarise the user’s plan in a clean, practical format and offer the next action."
+    done = _is_done(mode, int(state.get("step_index", 0)))
+
+    # 3) Генерим короткий ACK через LLM (без вопросов)
+    information = _retrieve_info_for_coach(mode, query, top_k)
+    llm_user_msg = _coach_llm_ack(mode, state, query, information)
+
+    # 4) Следующий вопрос берём ЖЁСТКО из шаблона (а не из LLM)
+    next_step = _get_step(mode, int(state.get("step_index", 0)))
+    next_q = next_step["question"] if next_step else ""
 
     if not stream:
         resp = openai.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT_COACH},
-                {"role": "user", "content": user_msg},
+                {"role": "user", "content": llm_user_msg},
             ],
             temperature=0.2,
         )
-        text = (resp.choices[0].message.content or "").strip()
-        return {"text": text, "state": state, "done": done}
+        ack = (resp.choices[0].message.content or "").strip()
+        # склеиваем: ACK + следующий вопрос
+        out_text = (ack + "\n\n" + next_q).strip() if next_q else ack
+        return {"text": out_text, "state": state, "done": done}
 
     def gen_text_chunks():
         stream_resp = openai.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT_COACH},
-                {"role": "user", "content": user_msg},
+                {"role": "user", "content": llm_user_msg},
             ],
             temperature=0.2,
             stream=True,
         )
+        # сначала стримим ack
         for event in stream_resp:
             delta = event.choices[0].delta.content
             if delta:
                 yield delta
+        # затем ДОКИДЫВАЕМ следующий вопрос (жёстко)
+        if next_q:
+            yield "\n\n" + next_q
 
     return gen_text_chunks(), {"state": state, "done": done}
 
@@ -406,17 +423,15 @@ def chat_sse(payload: Dict = Body(...)):
 
 
 # =========================
-# NEW: COACH ENDPOINTS (guided dialogue)
+# COACH ENDPOINTS
 # =========================
 
-# ---- Coach JSON (best for Bubble state) ----
 @app.post("/coach/chat")
 def coach_chat(payload: Dict = Body(...)):
     out = coach_turn(payload, stream=False)
     return JSONResponse(out)
 
 
-# ---- Coach text/plain stream ----
 @app.post("/coach/stream")
 def coach_stream(payload: Dict = Body(...)):
     chunks, _meta = coach_turn(payload, stream=True)
@@ -426,26 +441,22 @@ def coach_stream(payload: Dict = Body(...)):
 # ---- Coach SSE stream: session_id в event:start, text в event:chunk, done пустой ----
 @app.post("/coach/sse")
 def coach_sse(payload: Dict = Body(...)):
-    # session_id можно передать с клиента, либо создаём новый
     session_id = (payload.get("session_id") or "").strip()
     if not session_id:
         session_id = uuid.uuid4().hex
 
-    chunks, meta = coach_turn(payload, stream=True)
+    chunks, _meta = coach_turn(payload, stream=True)
 
     def gen():
-        # START: отдаём session_id отдельным полем (Bubble сможет сохранить)
         start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
         yield f"event: start\ndata: {start_payload}\n\n"
 
-        # CHUNK: только текст
         for delta in chunks:
             if not delta:
                 continue
             data = json.dumps({"text": delta}, ensure_ascii=False)
             yield f"event: chunk\ndata: {data}\n\n"
 
-        # DONE: пустой (без state, чтобы Bubble не плодил поля)
         yield "event: done\ndata: {}\n\n"
 
     return StreamingResponse(
