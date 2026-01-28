@@ -120,15 +120,22 @@ def get_matches(query: str, top_k: int) -> List[Dict]:
     return res.get("matches") or []
 
 # =========================
-# BASE (RAG Q&A) PROMPT
+# BASE (RAG Q&A) PROMPT  ✅ UPDATED (soft + ends with question)
 # =========================
 SYSTEM_PROMPT_QA = (
-    "You are a helpful assistant answering ONLY using the provided information.\n"
-    "Rules:\n"
+    "You are a friendly, helpful assistant.\n"
+    "You must answer ONLY using the provided INFORMATION.\n\n"
+    "Hard rules:\n"
     "- Do NOT mention document names, page numbers, sources, citations, or the word 'context'.\n"
     "- Write a natural chatbot answer as plain text.\n"
-    "- If the answer is not present, say: \"I can't find this in the provided documents.\".\n"
-    "- Be concise and practical.\n"
+    "- If the answer is not present in the INFORMATION, you MUST say exactly:\n"
+    "  \"I can't find this in the provided documents.\".\n"
+    "- Keep it concise and practical.\n\n"
+    "Tone rules:\n"
+    "- Start softly (1 short supportive sentence) when appropriate.\n"
+    "- Never sound dry or robotic.\n"
+    "- Always end your message with a question to keep the conversation going.\n"
+    "- If the user request is vague, end with 2–3 quick options (A/B/C).\n"
 )
 
 # =========================
@@ -257,15 +264,12 @@ def _make_coach_user_message(mode: str, state: Dict[str, Any], user_input: str, 
     )
 
 def _is_template_invocation_text(mode: str, query: str) -> bool:
-    """Если Bubble отправил текст кнопки (или mode) — это НЕ ответ, это 'start'."""
     q = (query or "").strip().lower()
     if not q:
         return False
 
     title = (TEMPLATES[mode]["title"] or "").strip().lower()
     mode_key = (mode or "").strip().lower()
-
-    # типовые варианты: "Build my confidence", "build_confidence"
     return q == title or q == mode_key
 
 def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bool = False):
@@ -276,18 +280,15 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
 
     _cleanup_sessions()
 
-    # 1) если пришёл reset — сбрасываем
     if reset:
         SESSIONS.pop(session_id, None)
 
-    # 2) если Bubble прислал текст кнопки — трактуем как старт: сбросить и показать 1й вопрос
     if _is_template_invocation_text(mode, query):
         SESSIONS.pop(session_id, None)
-        query = ""  # чтобы не считалось ответом
+        query = ""
 
     state = _load_state(session_id, mode)
 
-    # 3) если query пустой — НИКОГДА не advance. Просто спрашиваем текущий вопрос.
     if not query:
         info = _retrieve_info_for_coach(mode, f"template {mode}", top_k)
         user_msg = _make_coach_user_message(mode, state, "", info)
