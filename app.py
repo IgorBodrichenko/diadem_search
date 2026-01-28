@@ -2,7 +2,9 @@ import os
 import json
 import uuid
 import time
-from typing import List, Dict, Any, Optional
+import random
+import re
+from typing import List, Dict, Any, Optional, Iterator
 
 from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,11 +18,17 @@ from pinecone import Pinecone
 # =========================
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
-TOP_K = int(os.getenv("TOP_K", "10"))
+TOP_K = int(os.getenv("TOP_K", "10"))  # final chunks passed to LLM
+PINECONE_TOPK_RAW = int(os.getenv("PINECONE_TOPK_RAW", "30"))  # raw candidates from pinecone
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "14000"))
 EMBED_DIM = int(os.getenv("EMBED_DIM", "512"))
 
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))  # 24h default
+
+# Retrieval quality knobs
+MIN_MATCH_SCORE = float(os.getenv("MIN_MATCH_SCORE", "0.35"))
+MIN_CONTEXT_CHARS = int(os.getenv("MIN_CONTEXT_CHARS", "700"))
+MIN_OVERLAP_SCORE = float(os.getenv("MIN_OVERLAP_SCORE", "1.3"))  # if below -> treat as not found
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
@@ -81,6 +89,119 @@ def _clamp_int(v: Any, default: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, n))
 
 # =========================
+# USER NAME (optional)
+# =========================
+def _extract_user_name(payload: Dict[str, Any]) -> str:
+    raw = _safe_str(payload.get("user_name")) or _safe_str(payload.get("name"))
+    return raw[:40].strip()
+
+# =========================
+# TEXT CLEANUP (NO MARKDOWN)
+# =========================
+def strip_markdown_chars(text: str) -> str:
+    if not text:
+        return ""
+    return (
+        text.replace("*", "")
+            .replace("`", "")
+            .replace("_", "")
+    )
+
+# =========================
+# VARIATION (avoid same opener every time)
+# =========================
+SOFT_OPENERS = [
+    "Glad you’re thinking about this ahead of time.",
+    "That makes sense — getting prepared early helps a lot.",
+    "Good call to tackle this before the meeting.",
+    "Nice — planning this now will make the conversation easier.",
+    "Totally doable. Let’s get you set up for it.",
+    "Okay, let’s make this straightforward and calm.",
+    "Makes sense. Let’s work through it step by step.",
+    "Alright — we can make this feel a lot more manageable.",
+]
+
+_BAD_START_RE = re.compile(r"^\s*(it['’]s\s+(great|wonderful)|great)\b", flags=re.IGNORECASE)
+
+def _session_entry(session_id: str) -> Dict[str, Any]:
+    entry = SESSIONS.get(session_id)
+    if not isinstance(entry, dict):
+        entry = {}
+        SESSIONS[session_id] = entry
+    entry["updated_at"] = _now()
+    return entry
+
+def _pick_opener(session_id: str, user_name: str, field: str) -> str:
+    entry = _session_entry(session_id)
+    last = _safe_str(entry.get(field))
+    options = [o for o in SOFT_OPENERS if o != last] or SOFT_OPENERS[:]
+    opener = random.choice(options)
+    if user_name and random.random() < 0.55:
+        opener = f"{opener} {user_name}."
+    entry[field] = opener
+    return opener
+
+def _rewrite_bad_opening(full_text: str, opener: str) -> str:
+    t = (full_text or "").strip()
+    if not t:
+        return ""
+    if not _BAD_START_RE.match(t):
+        return t
+    m = re.search(r"[.!?]\s+", t)
+    if m:
+        rest = t[m.end():].strip()
+        return f"{opener} {rest}".strip() if rest else opener
+    return opener
+
+def _stream_opening_variation(
+    deltas: Iterator[str],
+    session_id: str,
+    user_name: str,
+    field: str
+) -> Iterator[str]:
+    opener = _pick_opener(session_id, user_name, field)
+    buf = ""
+    decided = False
+    for d in deltas:
+        if not decided:
+            buf += d
+            if len(buf) >= 140 or re.search(r"[.!?]\s+", buf):
+                yield _rewrite_bad_opening(buf, opener)
+                decided = True
+                buf = ""
+        else:
+            yield d
+    if not decided and buf:
+        yield _rewrite_bad_opening(buf, opener)
+
+# =========================
+# SEARCH HINTS (Most common questions)
+# =========================
+def _norm_q(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+SEARCH_HINTS = [
+    {"match_any": ["balance the power in a negotiation", "balance power in a negotiation", "balance the power"],
+     "hint": "confident mindset pages 9-11"},
+    {"match_any": ["push back without upsetting the relationship", "push back without upsetting", "push back"],
+     "hint": "tactics prepared to respond pages 65-74 slides 7 8 15"},
+    {"match_any": ["difference between selling and negotiation", "selling vs negotiation", "selling and negotiation"],
+     "hint": "introduction to negotiation book page xii-vii slide 11"},
+    {"match_any": ["deal with difficult questions", "handle difficult questions", "difficult questions"],
+     "hint": "slides 28-34 difficult questions"},
+]
+
+def _hint_for_question(question: str) -> str:
+    qn = _norm_q(question)
+    for item in SEARCH_HINTS:
+        for key in item["match_any"]:
+            if key in qn:
+                return item["hint"]
+    return ""
+
+# =========================
 # RAG HELPERS
 # =========================
 def embed_query(text: str) -> List[float]:
@@ -90,6 +211,90 @@ def embed_query(text: str) -> List[float]:
         dimensions=EMBED_DIM,
     )
     return resp.data[0].embedding
+
+def _filter_matches_by_score(matches: List[Dict]) -> List[Dict]:
+    out: List[Dict] = []
+    for m in matches or []:
+        try:
+            score = float(m.get("score") or 0.0)
+        except Exception:
+            score = 0.0
+        if score >= MIN_MATCH_SCORE:
+            out.append(m)
+    return out
+
+_STOPWORDS = {
+    "the","a","an","and","or","to","of","in","on","for","with","without","is","are","was","were","be",
+    "do","does","did","how","what","why","when","where","between","into","from","as","at","by","it","this","that",
+}
+
+_GENERIC_PHRASES = [
+    "key techniques to consider",
+    "negotiation techniques",
+    "emotional intelligence",
+    "win-win outcomes",
+    "face-to-face negotiations",
+    "self-awareness is crucial",
+]
+
+def _tokenize(s: str) -> List[str]:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    toks = [t for t in s.split() if t and t not in _STOPWORDS and len(t) > 2]
+    return toks
+
+def _hint_keywords(question: str) -> List[str]:
+    hint = _hint_for_question(question)
+    if not hint:
+        return []
+    return _tokenize(hint)
+
+def select_matches_rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
+    """
+    ✅ KEY FIX:
+    - DO NOT put hints into embedding (that collapses vectors and returns the same generic chunk)
+    - Use hints ONLY for rerank
+    - Stronger lexical overlap + hint overlap + generic penalty
+    """
+    qt = set(_tokenize(query))
+    hint_toks = set(_hint_keywords(query))
+
+    scored = []
+
+    for m in matches or []:
+        md = m.get("metadata") or {}
+        text = (md.get("text") or "").strip()
+        if not text:
+            continue
+
+        tlow = text.lower()
+        ttoks = _tokenize(text)
+
+        overlap_q = sum(1.0 for t in ttoks if t in qt)
+        overlap_hint = sum(1.2 for t in ttoks if t in hint_toks) if hint_toks else 0.0
+
+        # small phrase bonus if query contains phrase and it appears in text
+        bonus = 0.0
+        qlow = (query or "").lower()
+        for phrase in ["balance", "power", "selling", "negotiation", "difficult questions", "push back", "relationship", "tactics", "mindset"]:
+            if phrase in qlow and phrase in tlow:
+                bonus += 0.6
+
+        penalty = 0.0
+        for gp in _GENERIC_PHRASES:
+            if gp in tlow:
+                penalty += 1.0
+
+        try:
+            pscore = float(m.get("score") or 0.0)
+        except Exception:
+            pscore = 0.0
+
+        final = (overlap_q * 1.2) + (overlap_hint * 1.5) + bonus + (pscore * 0.3) - penalty
+        scored.append((final, overlap_q, overlap_hint, pscore, m))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [x[-1] for x in scored[:final_k]]
 
 def build_context(matches: List[Dict]) -> str:
     parts: List[str] = []
@@ -114,25 +319,67 @@ def build_context(matches: List[Dict]) -> str:
 
     return "\n---\n".join(parts)
 
-def get_matches(query: str, top_k: int) -> List[Dict]:
+def is_context_relevant(query: str, matches: List[Dict]) -> bool:
+    if not matches:
+        return False
+
+    top = matches[0]
+    text = ((top.get("metadata") or {}).get("text") or "").strip()
+    if not text:
+        return False
+
+    qt = set(_tokenize(query))
+    tt = _tokenize(text)
+    overlap = sum(1.0 for t in tt if t in qt)
+
+    ctx = build_context(matches)
+    if len(ctx.strip()) < MIN_CONTEXT_CHARS and overlap < MIN_OVERLAP_SCORE:
+        return False
+
+    return overlap >= MIN_OVERLAP_SCORE or len(ctx.strip()) >= MIN_CONTEXT_CHARS
+
+def get_matches(query: str, top_k_final: int) -> List[Dict]:
+    """
+    ✅ FIXED retrieval:
+    1) Embedding is ONLY the clean user query (no SEARCH_HINTS appended)
+    2) Pinecone returns RAW candidates
+    3) Filter by score
+    4) Rerank using lexical overlap + hint overlap + generic penalty
+    5) If irrelevant -> []
+    """
     qvec = embed_query(query)
-    res = index.query(vector=qvec, top_k=top_k, include_metadata=True)
-    return res.get("matches") or []
+    res = index.query(vector=qvec, top_k=PINECONE_TOPK_RAW, include_metadata=True)
+
+    raw = _filter_matches_by_score(res.get("matches") or [])
+    reranked = select_matches_rerank(query, raw, top_k_final)
+
+    if not is_context_relevant(query, reranked):
+        return []
+
+    return reranked
 
 # =========================
-# BASE (RAG Q&A) PROMPT
+# BASE (RAG Q&A) PROMPT (stronger grounding)
 # =========================
 SYSTEM_PROMPT_QA = (
-    "You are a helpful assistant answering ONLY using the provided information.\n"
-    "Rules:\n"
+    "You are a friendly, helpful assistant.\n"
+    "You must answer ONLY using the provided INFORMATION.\n\n"
+    "Hard rules:\n"
     "- Do NOT mention document names, page numbers, sources, citations, or the word 'context'.\n"
-    "- Write a natural chatbot answer as plain text.\n"
-    "- If the answer is not present, say: \"I can't find this in the provided documents.\".\n"
-    "- Be concise and practical.\n"
+    "- Output plain text only. NO markdown. Do not use *, **, _, `, #, or markdown lists.\n"
+    "- Do NOT use placeholders like \"A/B/C?\". If you give options, write them out as A), B), C).\n"
+    "- If the answer is not clearly present in the INFORMATION (or INFORMATION is generic/not about the question), say exactly:\n"
+    "  \"I can't find this in the provided documents.\".\n"
+    "- Keep it concise and practical.\n\n"
+    "Tone rules:\n"
+    "- Start softly (one short supportive sentence) when appropriate.\n"
+    "- Avoid starting with the same phrase every time.\n"
+    "- If USER_NAME is provided, you MAY naturally mention it 0–2 times.\n"
+    "- Always end your message with a question.\n"
 )
 
 # =========================
-# COACH / TEMPLATE ENGINE
+# COACH / TEMPLATE ENGINE (unchanged)
 # =========================
 TEMPLATES: Dict[str, Dict[str, Any]] = {
     "build_confidence": {
@@ -142,7 +389,7 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
             {"key": "situation", "question": "Now the situation itself. What’s the most important thing you want to achieve in this conversation?"},
             {"key": "relationship", "question": "About the relationship: what do you know about the other person’s priorities or pressures?"},
             {"key": "myself", "question": "About you: what strengths or skills do you bring that will help you handle this well?"},
-            {"key": "why_confident", "question": "Great. Now list 3–5 reasons you *should* feel confident going into this."},
+            {"key": "why_confident", "question": "Great. Now list 3–5 reasons you should feel confident going into this."},
             {"key": "summary", "question": "Want me to summarise your confidence plan in 5–7 bullet points you can read right before the call?"},
         ],
     },
@@ -150,7 +397,7 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
         "title": "Prepare for difficult behaviours",
         "steps": [
             {"key": "scenario", "question": "What’s the situation—who are you speaking to, and what decision are you trying to influence? (1–2 sentences)"},
-            {"key": "anticipate_tactics", "question": "What is the *first* difficult thing they are likely to say or do? Write it as a direct quote if you can."},
+            {"key": "anticipate_tactics", "question": "What is the first difficult thing they are likely to say or do? Write it as a direct quote if you can."},
             {"key": "purpose", "question": "What do you think their purpose is with that move—pressure, delay, anchoring, saving face, something else?"},
             {"key": "response_bullet", "question": "Let’s craft your response. What’s the one key point you must hold your ground on? (One sentence)"},
             {"key": "move_on_air", "question": "Now write a short linking phrase to steer back on track (e.g., “That’s helpful—so to move this forward…”). What’s your version?"},
@@ -169,8 +416,10 @@ SYSTEM_PROMPT_COACH = (
     "- Do NOT lecture. Do NOT dump long explanations.\n"
     "- NEVER repeat a previous question unless the user explicitly asks you to repeat.\n"
     "- IMPORTANT: The next question must be EXACTLY the provided 'NEXT QUESTION' line. Ask it verbatim and stop.\n"
-    "- Use the provided INFORMATION only as background support for phrasing and best-practice, but NEVER mention documents, pages, sources, citations, or the word 'context'.\n"
-    "- Output plain text only.\n"
+    "- Use the provided INFORMATION only as background support, but NEVER mention documents, pages, sources, citations, or the word 'context'.\n"
+    "- Output plain text only. NO markdown.\n"
+    "- Avoid starting with the same phrase every time.\n"
+    "- If USER_NAME is provided, you MAY naturally mention it once.\n"
 )
 
 def _extract_mode(payload: Dict[str, Any]) -> str:
@@ -192,7 +441,8 @@ def _load_state(session_id: str, mode: str) -> Dict[str, Any]:
     st = entry["state"]
     if st.get("mode") != mode:
         st = _default_state(mode)
-        SESSIONS[session_id] = {"state": st, "updated_at": _now()}
+        entry["state"] = st
+        entry["updated_at"] = _now()
         return st
 
     if "answers" not in st or not isinstance(st["answers"], dict):
@@ -200,10 +450,13 @@ def _load_state(session_id: str, mode: str) -> Dict[str, Any]:
     if "step_index" not in st:
         st["step_index"] = 0
     st["mode"] = mode
+    entry["updated_at"] = _now()
     return st
 
 def _save_state(session_id: str, state: Dict[str, Any]) -> None:
-    SESSIONS[session_id] = {"state": state, "updated_at": _now()}
+    entry = _session_entry(session_id)
+    entry["state"] = state
+    entry["updated_at"] = _now()
 
 def _steps(mode: str) -> List[Dict[str, Any]]:
     return TEMPLATES[mode]["steps"]
@@ -231,7 +484,7 @@ def _retrieve_info_for_coach(mode: str, query: str, top_k: int) -> str:
     matches = get_matches(rag_query, top_k)
     return build_context(matches)
 
-def _make_coach_user_message(mode: str, state: Dict[str, Any], user_input: str, info: str) -> str:
+def _make_coach_user_message(mode: str, state: Dict[str, Any], user_input: str, info: str, user_name: str) -> str:
     tpl = TEMPLATES[mode]
     steps = tpl["steps"]
     idx = _clamp_int(state.get("step_index"), 0, 0, len(steps))
@@ -246,8 +499,10 @@ def _make_coach_user_message(mode: str, state: Dict[str, Any], user_input: str, 
             answers_lines.append(f"- {k}: {state['answers'][k]}")
 
     answers_block = "\n".join(answers_lines) if answers_lines else "(none yet)"
+    name_line = user_name if user_name else ""
 
     return (
+        f"USER_NAME:\n{name_line}\n\n"
         f"TEMPLATE: {tpl['title']} ({mode})\n"
         f"STEP_INDEX (0-based): {idx}\n\n"
         f"LAST USER MESSAGE:\n{user_input.strip()}\n\n"
@@ -257,15 +512,11 @@ def _make_coach_user_message(mode: str, state: Dict[str, Any], user_input: str, 
     )
 
 def _is_template_invocation_text(mode: str, query: str) -> bool:
-    """Если Bubble отправил текст кнопки (или mode) — это НЕ ответ, это 'start'."""
     q = (query or "").strip().lower()
     if not q:
         return False
-
     title = (TEMPLATES[mode]["title"] or "").strip().lower()
     mode_key = (mode or "").strip().lower()
-
-    # типовые варианты: "Build my confidence", "build_confidence"
     return q == title or q == mode_key
 
 def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bool = False):
@@ -273,28 +524,26 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
     query = _safe_str(payload.get("query")) or _safe_str(payload.get("user_input"))
     top_k = _clamp_int(payload.get("top_k"), TOP_K, 1, 30)
     reset = bool(payload.get("reset"))
+    user_name = _extract_user_name(payload)
 
     _cleanup_sessions()
 
-    # 1) если пришёл reset — сбрасываем
     if reset:
         SESSIONS.pop(session_id, None)
 
-    # 2) если Bubble прислал текст кнопки — трактуем как старт: сбросить и показать 1й вопрос
     if _is_template_invocation_text(mode, query):
         SESSIONS.pop(session_id, None)
-        query = ""  # чтобы не считалось ответом
+        query = ""
 
     state = _load_state(session_id, mode)
 
-    # 3) если query пустой — НИКОГДА не advance. Просто спрашиваем текущий вопрос.
     if not query:
         info = _retrieve_info_for_coach(mode, f"template {mode}", top_k)
-        user_msg = _make_coach_user_message(mode, state, "", info)
+        user_msg = _make_coach_user_message(mode, state, "", info, user_name=user_name)
     else:
         state = _advance_with_answer(mode, state, query)
         info = _retrieve_info_for_coach(mode, query, top_k)
-        user_msg = _make_coach_user_message(mode, state, query, info)
+        user_msg = _make_coach_user_message(mode, state, query, info, user_name=user_name)
 
     done = _current_step(mode, state) is None
     if done:
@@ -311,7 +560,9 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
             ],
             temperature=0.2,
         )
-        text = (resp.choices[0].message.content or "").strip()
+        text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
+        opener = _pick_opener(session_id, user_name, "coach_last_opener")
+        text = _rewrite_bad_opening(text, opener)
         return {"text": text, "session_id": session_id, "done": done}
 
     def gen_text_chunks():
@@ -324,10 +575,19 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
             temperature=0.2,
             stream=True,
         )
-        for event in stream_resp:
-            delta = event.choices[0].delta.content
-            if delta:
-                yield delta
+
+        def raw_deltas():
+            for event in stream_resp:
+                delta = event.choices[0].delta.content
+                if delta:
+                    yield strip_markdown_chars(delta)
+
+        yield from _stream_opening_variation(
+            raw_deltas(),
+            session_id=session_id,
+            user_name=user_name,
+            field="coach_last_opener",
+        )
 
     return gen_text_chunks(), {"session_id": session_id, "done": done}
 
@@ -342,13 +602,22 @@ def health():
 def chat(payload: Dict = Body(...)):
     query = (payload.get("query") or "").strip()
     top_k = int(payload.get("top_k") or TOP_K)
+    user_name = _extract_user_name(payload)
+
+    session_id = _get_or_create_session_id(payload)
+    _cleanup_sessions()
 
     if not query:
         return JSONResponse({"answer": ""})
 
     matches = get_matches(query, top_k)
     context = build_context(matches)
-    user = f"QUESTION:\n{query}\n\nINFORMATION:\n{context}"
+
+    user = (
+        f"USER_NAME:\n{user_name}\n\n"
+        f"QUESTION:\n{query}\n\n"
+        f"INFORMATION:\n{context}"
+    )
 
     resp = openai.chat.completions.create(
         model=CHAT_MODEL,
@@ -359,13 +628,20 @@ def chat(payload: Dict = Body(...)):
         temperature=0.2,
     )
 
-    answer = (resp.choices[0].message.content or "").strip()
-    return {"answer": answer}
+    answer = strip_markdown_chars((resp.choices[0].message.content or "").strip())
+    opener = _pick_opener(session_id, user_name, "qa_last_opener")
+    answer = _rewrite_bad_opening(answer, opener)
+
+    return {"answer": answer, "session_id": session_id}
 
 @app.post("/chat/sse")
 def chat_sse(payload: Dict = Body(...)):
     query = (payload.get("query") or "").strip()
     top_k = int(payload.get("top_k") or TOP_K)
+    user_name = _extract_user_name(payload)
+
+    session_id = _get_or_create_session_id(payload)
+    _cleanup_sessions()
 
     def headers():
         return {
@@ -381,10 +657,17 @@ def chat_sse(payload: Dict = Body(...)):
 
     matches = get_matches(query, top_k)
     context = build_context(matches)
-    user = f"QUESTION:\n{query}\n\nINFORMATION:\n{context}"
+
+    user = (
+        f"USER_NAME:\n{user_name}\n\n"
+        f"QUESTION:\n{query}\n\n"
+        f"INFORMATION:\n{context}"
+    )
 
     def gen():
-        yield "event: start\ndata: {}\n\n"
+        start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
+        yield f"event: start\ndata: {start_payload}\n\n"
+
         stream = openai.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
@@ -394,11 +677,22 @@ def chat_sse(payload: Dict = Body(...)):
             temperature=0.2,
             stream=True,
         )
-        for event in stream:
-            delta = event.choices[0].delta.content
-            if delta:
-                data = json.dumps({"text": delta}, ensure_ascii=False)
-                yield f"event: chunk\ndata: {data}\n\n"
+
+        def raw_deltas():
+            for event in stream:
+                delta = event.choices[0].delta.content
+                if delta:
+                    yield strip_markdown_chars(delta)
+
+        for delta in _stream_opening_variation(
+            raw_deltas(),
+            session_id=session_id,
+            user_name=user_name,
+            field="qa_last_opener",
+        ):
+            data = json.dumps({"text": delta}, ensure_ascii=False)
+            yield f"event: chunk\ndata: {data}\n\n"
+
         yield "event: done\ndata: {}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers())
