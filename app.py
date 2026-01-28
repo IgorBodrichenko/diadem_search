@@ -22,6 +22,10 @@ TOP_K = int(os.getenv("TOP_K", "10"))
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "14000"))
 EMBED_DIM = int(os.getenv("EMBED_DIM", "512"))
 
+# ✅ retrieval quality knobs
+MIN_MATCH_SCORE = float(os.getenv("MIN_MATCH_SCORE", "0.45"))  # raise if too generic, lower if too strict
+MIN_CONTEXT_CHARS = int(os.getenv("MIN_CONTEXT_CHARS", "700"))  # if context too short -> fallback retrieval
+
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))  # 24h default
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -123,7 +127,6 @@ SOFT_OPENERS = [
     "Alright — we can make this feel a lot more manageable.",
 ]
 
-# ✅ расширили ловушку: "It's wonderful..." тоже
 _BAD_START_RE = re.compile(
     r"^\s*(it['’]s\s+(great|wonderful)|great)\b",
     flags=re.IGNORECASE,
@@ -166,7 +169,6 @@ def _rewrite_bad_opening(full_text: str, opener: str) -> str:
     if not _BAD_START_RE.match(t):
         return t
 
-    # drop first sentence (up to first . ! ?)
     m = re.search(r"[.!?]\s+", t)
     if m:
         rest = t[m.end():].strip()
@@ -203,6 +205,70 @@ def _stream_opening_variation(
         yield _rewrite_bad_opening(buf, opener)
 
 # =========================
+# SEARCH HINTS (Most common questions) ✅
+# =========================
+def _norm_q(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+SEARCH_HINTS = [
+    {
+        "match_any": [
+            "balance the power in a negotiation",
+            "balance power in a negotiation",
+            "balance the power",
+        ],
+        "hint": "confident mindset pages 9-11",
+    },
+    {
+        "match_any": [
+            "push back without upsetting the relationship",
+            "push back without upsetting",
+            "push back",
+            "upsetting the relationship",
+        ],
+        "hint": "tactics prepared to respond pages 65-74 slides 7 8 15",
+    },
+    {
+        "match_any": [
+            "difference between selling and negotiation",
+            "selling vs negotiation",
+            "selling and negotiation",
+        ],
+        "hint": "introduction to negotiation book page xii-vii slide 11",
+    },
+    {
+        "match_any": [
+            "deal with difficult questions",
+            "handle difficult questions",
+            "difficult questions",
+        ],
+        "hint": "slides 28-34 difficult questions",
+    },
+]
+
+def _hint_for_question(question: str) -> str:
+    qn = _norm_q(question)
+    for item in SEARCH_HINTS:
+        for key in item["match_any"]:
+            if key in qn:
+                return item["hint"]
+    return ""
+
+def _has_enough_context(context: str) -> bool:
+    # simple heuristic: enough chars, not just separators
+    c = (context or "").strip()
+    if not c:
+        return False
+    if len(c) < MIN_CONTEXT_CHARS:
+        return False
+    # if it’s basically one tiny snippet, it's usually too generic
+    if c.count("---") == 0 and len(c) < (MIN_CONTEXT_CHARS + 250):
+        return False
+    return True
+
+# =========================
 # RAG HELPERS
 # =========================
 def embed_query(text: str) -> List[float]:
@@ -236,10 +302,56 @@ def build_context(matches: List[Dict]) -> str:
 
     return "\n---\n".join(parts)
 
+def _filter_matches_by_score(matches: List[Dict]) -> List[Dict]:
+    out: List[Dict] = []
+    for m in matches or []:
+        try:
+            score = float(m.get("score") or 0.0)
+        except Exception:
+            score = 0.0
+        if score >= MIN_MATCH_SCORE:
+            out.append(m)
+    return out
+
 def get_matches(query: str, top_k: int) -> List[Dict]:
-    qvec = embed_query(query)
+    """
+    ✅ Improved retrieval:
+    - Add SEARCH_HINTS for common questions to steer Pinecone away from generic chunks
+    - Filter low-score matches (avoids 'one-size-fits-all' answers)
+    - Fallback query if context is too thin/generic
+    """
+    hint = _hint_for_question(query)
+    rag_query = query if not hint else f"{query}\nSEARCH_HINTS: {hint}"
+
+    qvec = embed_query(rag_query)
     res = index.query(vector=qvec, top_k=top_k, include_metadata=True)
-    return res.get("matches") or []
+    matches = _filter_matches_by_score(res.get("matches") or [])
+
+    # Fallback: if we still don't have enough context, force a second retrieval
+    ctx = build_context(matches)
+    if _has_enough_context(ctx):
+        return matches
+
+    # fallback query tries to "pull" the relevant section harder
+    if hint:
+        forced_query = (
+            f"{query}\n"
+            f"FORCE_RETRIEVE: {hint}\n"
+            f"Focus: direct answer, examples, practical steps."
+        )
+    else:
+        forced_query = (
+            f"{query}\n"
+            f"FORCE_RETRIEVE: direct answer, examples, practical steps, key concepts."
+        )
+
+    qvec2 = embed_query(forced_query)
+    res2 = index.query(vector=qvec2, top_k=top_k, include_metadata=True)
+    matches2 = _filter_matches_by_score(res2.get("matches") or [])
+
+    # if second is better (more context), use it; otherwise keep first
+    ctx2 = build_context(matches2)
+    return matches2 if len(ctx2) > len(ctx) else matches
 
 # =========================
 # BASE (RAG Q&A) PROMPT ✅ + name usage + anti-repeat
