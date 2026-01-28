@@ -81,6 +81,19 @@ def _clamp_int(v: Any, default: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, n))
 
 # =========================
+# USER NAME (optional) ✅
+# =========================
+def _extract_user_name(payload: Dict[str, Any]) -> str:
+    """
+    Expected payload field: user_name (or name).
+    We keep it safe and short to avoid prompt injection / weird formatting.
+    """
+    raw = _safe_str(payload.get("user_name")) or _safe_str(payload.get("name"))
+    # keep only reasonable length
+    raw = raw[:40].strip()
+    return raw
+
+# =========================
 # TEXT CLEANUP (NO MARKDOWN) ✅
 # =========================
 def strip_markdown_chars(text: str) -> str:
@@ -136,7 +149,7 @@ def get_matches(query: str, top_k: int) -> List[Dict]:
     return res.get("matches") or []
 
 # =========================
-# BASE (RAG Q&A) PROMPT ✅ FINAL: soft + ALWAYS ends with question + NO "A/B/C?" placeholder
+# BASE (RAG Q&A) PROMPT ✅ + name usage
 # =========================
 SYSTEM_PROMPT_QA = (
     "You are a friendly, helpful assistant.\n"
@@ -150,6 +163,7 @@ SYSTEM_PROMPT_QA = (
     "- Keep it concise and practical.\n\n"
     "Tone rules:\n"
     "- Start softly (one short supportive sentence) when appropriate.\n"
+    "- If USER_NAME is provided, you MAY naturally mention it 0–2 times (never in every sentence).\n"
     "- Always end your message with a question to keep the conversation going.\n"
     "- If the user request is vague OR the INFORMATION is high-level/generic, ask one clarifying question.\n"
     "- In that vague/generic case, you MAY add 2–3 quick options labelled A), B), C) (written out).\n"
@@ -195,6 +209,7 @@ SYSTEM_PROMPT_COACH = (
     "- IMPORTANT: The next question must be EXACTLY the provided 'NEXT QUESTION' line. Ask it verbatim and stop.\n"
     "- Use the provided INFORMATION only as background support for phrasing and best-practice, but NEVER mention documents, pages, sources, citations, or the word 'context'.\n"
     "- Output plain text only. NO markdown. Do not use *, **, _, `, #, or markdown lists.\n"
+    "- If USER_NAME is provided, you MAY naturally mention it once in a friendly way.\n"
 )
 
 def _extract_mode(payload: Dict[str, Any]) -> str:
@@ -255,7 +270,13 @@ def _retrieve_info_for_coach(mode: str, query: str, top_k: int) -> str:
     matches = get_matches(rag_query, top_k)
     return build_context(matches)
 
-def _make_coach_user_message(mode: str, state: Dict[str, Any], user_input: str, info: str) -> str:
+def _make_coach_user_message(
+    mode: str,
+    state: Dict[str, Any],
+    user_input: str,
+    info: str,
+    user_name: str,
+) -> str:
     tpl = TEMPLATES[mode]
     steps = tpl["steps"]
     idx = _clamp_int(state.get("step_index"), 0, 0, len(steps))
@@ -271,7 +292,10 @@ def _make_coach_user_message(mode: str, state: Dict[str, Any], user_input: str, 
 
     answers_block = "\n".join(answers_lines) if answers_lines else "(none yet)"
 
+    name_line = user_name if user_name else ""
+
     return (
+        f"USER_NAME:\n{name_line}\n\n"
         f"TEMPLATE: {tpl['title']} ({mode})\n"
         f"STEP_INDEX (0-based): {idx}\n\n"
         f"LAST USER MESSAGE:\n{user_input.strip()}\n\n"
@@ -294,6 +318,7 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
     query = _safe_str(payload.get("query")) or _safe_str(payload.get("user_input"))
     top_k = _clamp_int(payload.get("top_k"), TOP_K, 1, 30)
     reset = bool(payload.get("reset"))
+    user_name = _extract_user_name(payload)
 
     _cleanup_sessions()
 
@@ -308,11 +333,11 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
 
     if not query:
         info = _retrieve_info_for_coach(mode, f"template {mode}", top_k)
-        user_msg = _make_coach_user_message(mode, state, "", info)
+        user_msg = _make_coach_user_message(mode, state, "", info, user_name=user_name)
     else:
         state = _advance_with_answer(mode, state, query)
         info = _retrieve_info_for_coach(mode, query, top_k)
-        user_msg = _make_coach_user_message(mode, state, query, info)
+        user_msg = _make_coach_user_message(mode, state, query, info, user_name=user_name)
 
     done = _current_step(mode, state) is None
     if done:
@@ -361,13 +386,20 @@ def health():
 def chat(payload: Dict = Body(...)):
     query = (payload.get("query") or "").strip()
     top_k = int(payload.get("top_k") or TOP_K)
+    user_name = _extract_user_name(payload)
 
     if not query:
         return JSONResponse({"answer": ""})
 
     matches = get_matches(query, top_k)
     context = build_context(matches)
-    user = f"QUESTION:\n{query}\n\nINFORMATION:\n{context}"
+
+    # ✅ Pass USER_NAME to the model (so it can address the user naturally)
+    user = (
+        f"USER_NAME:\n{user_name}\n\n"
+        f"QUESTION:\n{query}\n\n"
+        f"INFORMATION:\n{context}"
+    )
 
     resp = openai.chat.completions.create(
         model=CHAT_MODEL,
@@ -386,6 +418,7 @@ def chat(payload: Dict = Body(...)):
 def chat_sse(payload: Dict = Body(...)):
     query = (payload.get("query") or "").strip()
     top_k = int(payload.get("top_k") or TOP_K)
+    user_name = _extract_user_name(payload)
 
     def headers():
         return {
@@ -401,7 +434,12 @@ def chat_sse(payload: Dict = Body(...)):
 
     matches = get_matches(query, top_k)
     context = build_context(matches)
-    user = f"QUESTION:\n{query}\n\nINFORMATION:\n{context}"
+
+    user = (
+        f"USER_NAME:\n{user_name}\n\n"
+        f"QUESTION:\n{query}\n\n"
+        f"INFORMATION:\n{context}"
+    )
 
     def gen():
         yield "event: start\ndata: {}\n\n"
