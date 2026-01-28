@@ -90,7 +90,6 @@ def strip_markdown_chars(text: str) -> str:
     """
     if not text:
         return ""
-    # убираем markdown символы, которые чаще всего ломают отображение
     return (
         text.replace("*", "")
             .replace("`", "")
@@ -137,7 +136,7 @@ def get_matches(query: str, top_k: int) -> List[Dict]:
     return res.get("matches") or []
 
 # =========================
-# BASE (RAG Q&A) PROMPT ✅ UPDATED: soft + ends with question + NO markdown
+# BASE (RAG Q&A) PROMPT ✅ FINAL: soft + ALWAYS ends with question + NO "A/B/C?" placeholder
 # =========================
 SYSTEM_PROMPT_QA = (
     "You are a friendly, helpful assistant.\n"
@@ -145,13 +144,15 @@ SYSTEM_PROMPT_QA = (
     "Hard rules:\n"
     "- Do NOT mention document names, page numbers, sources, citations, or the word 'context'.\n"
     "- Output plain text only. NO markdown. Do not use *, **, _, `, #, or markdown lists.\n"
+    "- Do NOT use placeholders like \"A/B/C?\". If you give options, write them out as A), B), C).\n"
     "- If the answer is not present in the INFORMATION, say exactly:\n"
     "  \"I can't find this in the provided documents.\".\n"
     "- Keep it concise and practical.\n\n"
     "Tone rules:\n"
     "- Start softly (one short supportive sentence) when appropriate.\n"
     "- Always end your message with a question to keep the conversation going.\n"
-    "- If the user request is vague, end with 2–3 quick options (A/B/C).\n"
+    "- If the user request is vague OR the INFORMATION is high-level/generic, ask one clarifying question.\n"
+    "- In that vague/generic case, you MAY add 2–3 quick options labelled A), B), C) (written out).\n"
 )
 
 # =========================
@@ -165,7 +166,6 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
             {"key": "situation", "question": "Now the situation itself. What’s the most important thing you want to achieve in this conversation?"},
             {"key": "relationship", "question": "About the relationship: what do you know about the other person’s priorities or pressures?"},
             {"key": "myself", "question": "About you: what strengths or skills do you bring that will help you handle this well?"},
-            # ✅ убрал markdown *...*
             {"key": "why_confident", "question": "Great. Now list 3–5 reasons you should feel confident going into this."},
             {"key": "summary", "question": "Want me to summarise your confidence plan in 5–7 bullet points you can read right before the call?"},
         ],
@@ -174,7 +174,6 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
         "title": "Prepare for difficult behaviours",
         "steps": [
             {"key": "scenario", "question": "What’s the situation—who are you speaking to, and what decision are you trying to influence? (1–2 sentences)"},
-            # ✅ убрал markdown *...*
             {"key": "anticipate_tactics", "question": "What is the first difficult thing they are likely to say or do? Write it as a direct quote if you can."},
             {"key": "purpose", "question": "What do you think their purpose is with that move—pressure, delay, anchoring, saving face, something else?"},
             {"key": "response_bullet", "question": "Let’s craft your response. What’s the one key point you must hold your ground on? (One sentence)"},
@@ -331,7 +330,7 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
             temperature=0.2,
         )
         text = (resp.choices[0].message.content or "").strip()
-        text = strip_markdown_chars(text)  # ✅ подчистка на всякий случай
+        text = strip_markdown_chars(text)
         return {"text": text, "session_id": session_id, "done": done}
 
     def gen_text_chunks():
@@ -347,7 +346,7 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
         for event in stream_resp:
             delta = event.choices[0].delta.content
             if delta:
-                yield strip_markdown_chars(delta)  # ✅ чистим прямо в стриме
+                yield strip_markdown_chars(delta)
 
     return gen_text_chunks(), {"session_id": session_id, "done": done}
 
@@ -380,7 +379,7 @@ def chat(payload: Dict = Body(...)):
     )
 
     answer = (resp.choices[0].message.content or "").strip()
-    answer = strip_markdown_chars(answer)  # ✅ убираем звёздочки и др.
+    answer = strip_markdown_chars(answer)
     return {"answer": answer}
 
 @app.post("/chat/sse")
@@ -418,7 +417,7 @@ def chat_sse(payload: Dict = Body(...)):
         for event in stream:
             delta = event.choices[0].delta.content
             if delta:
-                delta = strip_markdown_chars(delta)  # ✅ чистим по кускам
+                delta = strip_markdown_chars(delta)
                 data = json.dumps({"text": delta}, ensure_ascii=False)
                 yield f"event: chunk\ndata: {data}\n\n"
         yield "event: done\ndata: {}\n\n"
