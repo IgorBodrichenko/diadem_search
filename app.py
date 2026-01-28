@@ -2,7 +2,9 @@ import os
 import json
 import uuid
 import time
-from typing import List, Dict, Any, Optional
+import random
+import re
+from typing import List, Dict, Any, Optional, Iterator, Tuple
 
 from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -89,7 +91,6 @@ def _extract_user_name(payload: Dict[str, Any]) -> str:
     We keep it safe and short to avoid prompt injection / weird formatting.
     """
     raw = _safe_str(payload.get("user_name")) or _safe_str(payload.get("name"))
-    # keep only reasonable length
     raw = raw[:40].strip()
     return raw
 
@@ -99,7 +100,6 @@ def _extract_user_name(payload: Dict[str, Any]) -> str:
 def strip_markdown_chars(text: str) -> str:
     """
     Bubble часто не рендерит markdown, поэтому убираем маркеры форматирования.
-    (звёздочки — главный источник проблемы, но чистим и пару других частых)
     """
     if not text:
         return ""
@@ -108,6 +108,99 @@ def strip_markdown_chars(text: str) -> str:
             .replace("`", "")
             .replace("_", "")
     )
+
+# =========================
+# VARIATION (avoid "It's great..." every time) ✅
+# =========================
+SOFT_OPENERS = [
+    "Glad you’re thinking about this ahead of time.",
+    "That makes sense — getting prepared early helps a lot.",
+    "Good call to tackle this before the meeting.",
+    "Nice — planning this now will make the conversation easier.",
+    "Totally doable. Let’s get you set up for it.",
+    "Okay, let’s make this straightforward and calm.",
+    "Makes sense. Let’s work through it step by step.",
+    "Alright — we can make this feel a lot more manageable.",
+]
+
+_BAD_START_RE = re.compile(r"^\s*(it['’]s\s+great|great)\b", flags=re.IGNORECASE)
+
+def _session_entry(session_id: str) -> Dict[str, Any]:
+    entry = SESSIONS.get(session_id)
+    if not isinstance(entry, dict):
+        entry = {}
+        SESSIONS[session_id] = entry
+    entry["updated_at"] = _now()
+    return entry
+
+def _pick_opener(session_id: str, user_name: str, field: str) -> str:
+    """
+    Picks an opener with anti-repeat per session.
+    field can be 'qa_last_opener' or 'coach_last_opener'
+    """
+    entry = _session_entry(session_id)
+    last = _safe_str(entry.get(field))
+    options = [o for o in SOFT_OPENERS if o != last] or SOFT_OPENERS[:]
+    opener = random.choice(options)
+
+    # optionally add name (not always)
+    if user_name and random.random() < 0.55:
+        opener = f"{opener} {user_name}."
+
+    entry[field] = opener
+    return opener
+
+def _rewrite_bad_opening(full_text: str, opener: str) -> str:
+    """
+    If the text starts with "It's great..." / "Great ...", replace the first sentence with opener.
+    """
+    t = (full_text or "").strip()
+    if not t:
+        return ""
+
+    if not _BAD_START_RE.match(t):
+        return t
+
+    # drop first sentence (up to first . ! ?)
+    m = re.search(r"[.!?]\s+", t)
+    if m:
+        rest = t[m.end():].strip()
+        return f"{opener} {rest}".strip() if rest else opener
+    return opener
+
+def _stream_opening_variation(
+    deltas: Iterator[str],
+    session_id: str,
+    user_name: str,
+    field: str,
+) -> Iterator[str]:
+    """
+    Streaming-safe opener variation:
+    Buffer early deltas until we can decide if the answer starts with "It's great/Great".
+    Then emit either:
+      - unchanged prefix, or
+      - opener + rest (dropping first sentence)
+    After decision, pass-through.
+    """
+    opener = _pick_opener(session_id, user_name, field)
+    buf = ""
+    decided = False
+
+    for d in deltas:
+        if not decided:
+            buf += d
+            # decide when we have enough
+            if len(buf) >= 140 or re.search(r"[.!?]\s+", buf):
+                rewritten = _rewrite_bad_opening(buf, opener)
+                yield rewritten
+                decided = True
+                buf = ""
+        else:
+            yield d
+
+    # flush remaining if stream ended before decision
+    if not decided and buf:
+        yield _rewrite_bad_opening(buf, opener)
 
 # =========================
 # RAG HELPERS
@@ -149,7 +242,7 @@ def get_matches(query: str, top_k: int) -> List[Dict]:
     return res.get("matches") or []
 
 # =========================
-# BASE (RAG Q&A) PROMPT ✅ + name usage
+# BASE (RAG Q&A) PROMPT ✅ + name usage + anti-repeat
 # =========================
 SYSTEM_PROMPT_QA = (
     "You are a friendly, helpful assistant.\n"
@@ -163,6 +256,7 @@ SYSTEM_PROMPT_QA = (
     "- Keep it concise and practical.\n\n"
     "Tone rules:\n"
     "- Start softly (one short supportive sentence) when appropriate.\n"
+    "- Avoid starting with the same phrase every time (do NOT always start with 'It's great' or 'Great').\n"
     "- If USER_NAME is provided, you MAY naturally mention it 0–2 times (never in every sentence).\n"
     "- Always end your message with a question to keep the conversation going.\n"
     "- If the user request is vague OR the INFORMATION is high-level/generic, ask one clarifying question.\n"
@@ -209,6 +303,7 @@ SYSTEM_PROMPT_COACH = (
     "- IMPORTANT: The next question must be EXACTLY the provided 'NEXT QUESTION' line. Ask it verbatim and stop.\n"
     "- Use the provided INFORMATION only as background support for phrasing and best-practice, but NEVER mention documents, pages, sources, citations, or the word 'context'.\n"
     "- Output plain text only. NO markdown. Do not use *, **, _, `, #, or markdown lists.\n"
+    "- Avoid starting with the same phrase every time (do NOT always start with 'It's great' or 'Great').\n"
     "- If USER_NAME is provided, you MAY naturally mention it once in a friendly way.\n"
 )
 
@@ -231,7 +326,8 @@ def _load_state(session_id: str, mode: str) -> Dict[str, Any]:
     st = entry["state"]
     if st.get("mode") != mode:
         st = _default_state(mode)
-        SESSIONS[session_id] = {"state": st, "updated_at": _now()}
+        entry["state"] = st
+        entry["updated_at"] = _now()
         return st
 
     if "answers" not in st or not isinstance(st["answers"], dict):
@@ -239,10 +335,13 @@ def _load_state(session_id: str, mode: str) -> Dict[str, Any]:
     if "step_index" not in st:
         st["step_index"] = 0
     st["mode"] = mode
+    entry["updated_at"] = _now()
     return st
 
 def _save_state(session_id: str, state: Dict[str, Any]) -> None:
-    SESSIONS[session_id] = {"state": state, "updated_at": _now()}
+    entry = _session_entry(session_id)
+    entry["state"] = state
+    entry["updated_at"] = _now()
 
 def _steps(mode: str) -> List[Dict[str, Any]]:
     return TEMPLATES[mode]["steps"]
@@ -291,7 +390,6 @@ def _make_coach_user_message(
             answers_lines.append(f"- {k}: {state['answers'][k]}")
 
     answers_block = "\n".join(answers_lines) if answers_lines else "(none yet)"
-
     name_line = user_name if user_name else ""
 
     return (
@@ -356,6 +454,11 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
         )
         text = (resp.choices[0].message.content or "").strip()
         text = strip_markdown_chars(text)
+
+        # ✅ variability: replace "It's great/Great ..." start if it happens
+        opener = _pick_opener(session_id, user_name, "coach_last_opener")
+        text = _rewrite_bad_opening(text, opener)
+
         return {"text": text, "session_id": session_id, "done": done}
 
     def gen_text_chunks():
@@ -368,10 +471,20 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
             temperature=0.2,
             stream=True,
         )
-        for event in stream_resp:
-            delta = event.choices[0].delta.content
-            if delta:
-                yield strip_markdown_chars(delta)
+
+        def raw_deltas():
+            for event in stream_resp:
+                delta = event.choices[0].delta.content
+                if delta:
+                    yield strip_markdown_chars(delta)
+
+        # ✅ variability in streaming (buffer early deltas, then decide)
+        yield from _stream_opening_variation(
+            raw_deltas(),
+            session_id=session_id,
+            user_name=user_name,
+            field="coach_last_opener",
+        )
 
     return gen_text_chunks(), {"session_id": session_id, "done": done}
 
@@ -388,13 +501,16 @@ def chat(payload: Dict = Body(...)):
     top_k = int(payload.get("top_k") or TOP_K)
     user_name = _extract_user_name(payload)
 
+    # ✅ allow optional session_id so we can keep anti-repeat openers for QA too
+    session_id = _get_or_create_session_id(payload)
+    _cleanup_sessions()
+
     if not query:
         return JSONResponse({"answer": ""})
 
     matches = get_matches(query, top_k)
     context = build_context(matches)
 
-    # ✅ Pass USER_NAME to the model (so it can address the user naturally)
     user = (
         f"USER_NAME:\n{user_name}\n\n"
         f"QUESTION:\n{query}\n\n"
@@ -412,13 +528,21 @@ def chat(payload: Dict = Body(...)):
 
     answer = (resp.choices[0].message.content or "").strip()
     answer = strip_markdown_chars(answer)
-    return {"answer": answer}
+
+    # ✅ variability: replace "It's great/Great ..." start if it happens
+    opener = _pick_opener(session_id, user_name, "qa_last_opener")
+    answer = _rewrite_bad_opening(answer, opener)
+
+    return {"answer": answer, "session_id": session_id}
 
 @app.post("/chat/sse")
 def chat_sse(payload: Dict = Body(...)):
     query = (payload.get("query") or "").strip()
     top_k = int(payload.get("top_k") or TOP_K)
     user_name = _extract_user_name(payload)
+
+    session_id = _get_or_create_session_id(payload)
+    _cleanup_sessions()
 
     def headers():
         return {
@@ -442,7 +566,9 @@ def chat_sse(payload: Dict = Body(...)):
     )
 
     def gen():
-        yield "event: start\ndata: {}\n\n"
+        start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
+        yield f"event: start\ndata: {start_payload}\n\n"
+
         stream = openai.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
@@ -452,12 +578,23 @@ def chat_sse(payload: Dict = Body(...)):
             temperature=0.2,
             stream=True,
         )
-        for event in stream:
-            delta = event.choices[0].delta.content
-            if delta:
-                delta = strip_markdown_chars(delta)
-                data = json.dumps({"text": delta}, ensure_ascii=False)
-                yield f"event: chunk\ndata: {data}\n\n"
+
+        def raw_deltas():
+            for event in stream:
+                delta = event.choices[0].delta.content
+                if delta:
+                    yield strip_markdown_chars(delta)
+
+        # ✅ variability in streaming (buffer early deltas, then decide)
+        for delta in _stream_opening_variation(
+            raw_deltas(),
+            session_id=session_id,
+            user_name=user_name,
+            field="qa_last_opener",
+        ):
+            data = json.dumps({"text": delta}, ensure_ascii=False)
+            yield f"event: chunk\ndata: {data}\n\n"
+
         yield "event: done\ndata: {}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers())
