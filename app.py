@@ -20,6 +20,7 @@ TOP_K = int(os.getenv("TOP_K", "10"))
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "14000"))
 EMBED_DIM = int(os.getenv("EMBED_DIM", "512"))
 
+# in-memory session store (Variant B)
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))  # 24h default
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -44,7 +45,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # потом ограничишь доменом Bubble
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -53,16 +54,24 @@ app.add_middleware(
 # =========================
 # SIMPLE SESSION STORE (in-memory)
 # =========================
+# session_id -> {"state": {...}, "updated_at": epoch}
 SESSIONS: Dict[str, Dict[str, Any]] = {}
+
 
 def _now() -> int:
     return int(time.time())
 
+
 def _cleanup_sessions():
+    """Lazy cleanup on each request to avoid growing forever."""
     cutoff = _now() - SESSION_TTL_SECONDS
+    to_delete = []
     for sid, entry in list(SESSIONS.items()):
         if int(entry.get("updated_at", 0)) < cutoff:
-            SESSIONS.pop(sid, None)
+            to_delete.append(sid)
+    for sid in to_delete:
+        SESSIONS.pop(sid, None)
+
 
 def _get_or_create_session_id(payload: Dict[str, Any]) -> str:
     sid = str(payload.get("session_id") or "").strip()
@@ -70,8 +79,10 @@ def _get_or_create_session_id(payload: Dict[str, Any]) -> str:
         sid = uuid.uuid4().hex
     return sid
 
+
 def _safe_str(x: Any) -> str:
     return (x or "").strip() if isinstance(x, str) else ""
+
 
 def _clamp_int(v: Any, default: int, lo: int, hi: int) -> int:
     try:
@@ -79,6 +90,7 @@ def _clamp_int(v: Any, default: int, lo: int, hi: int) -> int:
     except Exception:
         return default
     return max(lo, min(hi, n))
+
 
 # =========================
 # RAG HELPERS
@@ -91,7 +103,12 @@ def embed_query(text: str) -> List[float]:
     )
     return resp.data[0].embedding
 
+
 def build_context(matches: List[Dict]) -> str:
+    """
+    Берём только metadata.text, без file/page. Нам в промпте это ок,
+    но модель НЕ должна это упоминать пользователю.
+    """
     parts: List[str] = []
     total = 0
 
@@ -114,28 +131,23 @@ def build_context(matches: List[Dict]) -> str:
 
     return "\n---\n".join(parts)
 
+
 def get_matches(query: str, top_k: int) -> List[Dict]:
     qvec = embed_query(query)
     res = index.query(vector=qvec, top_k=top_k, include_metadata=True)
     return res.get("matches") or []
 
+
 # =========================
-# BASE (RAG Q&A) PROMPT  ✅ UPDATED (soft + ends with question)
+# BASE (RAG Q&A) PROMPT
 # =========================
 SYSTEM_PROMPT_QA = (
-    "You are a friendly, helpful assistant.\n"
-    "You must answer ONLY using the provided INFORMATION.\n\n"
-    "Hard rules:\n"
+    "You are a helpful assistant answering ONLY using the provided information.\n"
+    "Rules:\n"
     "- Do NOT mention document names, page numbers, sources, citations, or the word 'context'.\n"
     "- Write a natural chatbot answer as plain text.\n"
-    "- If the answer is not present in the INFORMATION, you MUST say exactly:\n"
-    "  \"I can't find this in the provided documents.\".\n"
-    "- Keep it concise and practical.\n\n"
-    "Tone rules:\n"
-    "- Start softly (1 short supportive sentence) when appropriate.\n"
-    "- Never sound dry or robotic.\n"
-    "- Always end your message with a question to keep the conversation going.\n"
-    "- If the user request is vague, end with 2–3 quick options (A/B/C).\n"
+    "- If the answer is not present, say: \"I can't find this in the provided documents.\".\n"
+    "- Be concise and practical.\n"
 )
 
 # =========================
@@ -153,6 +165,7 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
             {"key": "summary", "question": "Want me to summarise your confidence plan in 5–7 bullet points you can read right before the call?"},
         ],
     },
+
     "prepare_difficult_behaviours": {
         "title": "Prepare for difficult behaviours",
         "steps": [
@@ -180,16 +193,20 @@ SYSTEM_PROMPT_COACH = (
     "- Output plain text only.\n"
 )
 
+
 def _extract_mode(payload: Dict[str, Any]) -> str:
     mode = _safe_str(payload.get("mode")) or "build_confidence"
     if mode not in TEMPLATES:
         mode = "build_confidence"
     return mode
 
+
 def _default_state(mode: str) -> Dict[str, Any]:
     return {"mode": mode, "step_index": 0, "answers": {}}
 
+
 def _load_state(session_id: str, mode: str) -> Dict[str, Any]:
+    """Load from server memory; if missing, create new."""
     entry = SESSIONS.get(session_id)
     if not entry or not isinstance(entry.get("state"), dict):
         st = _default_state(mode)
@@ -197,11 +214,13 @@ def _load_state(session_id: str, mode: str) -> Dict[str, Any]:
         return st
 
     st = entry["state"]
+    # if user changed shortcut/mode, reset state
     if st.get("mode") != mode:
         st = _default_state(mode)
         SESSIONS[session_id] = {"state": st, "updated_at": _now()}
         return st
 
+    # ensure fields exist
     if "answers" not in st or not isinstance(st["answers"], dict):
         st["answers"] = {}
     if "step_index" not in st:
@@ -209,11 +228,14 @@ def _load_state(session_id: str, mode: str) -> Dict[str, Any]:
     st["mode"] = mode
     return st
 
+
 def _save_state(session_id: str, state: Dict[str, Any]) -> None:
     SESSIONS[session_id] = {"state": state, "updated_at": _now()}
 
+
 def _steps(mode: str) -> List[Dict[str, Any]]:
     return TEMPLATES[mode]["steps"]
+
 
 def _current_step(mode: str, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     steps = _steps(mode)
@@ -222,21 +244,29 @@ def _current_step(mode: str, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
     return steps[idx]
 
+
+# ✅ FIX: НЕ продвигаем step_index если user_input пустой
 def _advance_with_answer(mode: str, state: Dict[str, Any], user_input: str) -> Dict[str, Any]:
+    # no answer -> do not advance
+    if not user_input.strip():
+        return state
+
     steps = _steps(mode)
     idx = _clamp_int(state.get("step_index"), 0, 0, max(len(steps) - 1, 0))
 
-    if user_input.strip() and steps:
+    if steps:
         key = steps[idx]["key"]
         state["answers"][key] = user_input.strip()
 
     state["step_index"] = idx + 1
     return state
 
+
 def _retrieve_info_for_coach(mode: str, query: str, top_k: int) -> str:
     rag_query = f"{mode}: {query}"
     matches = get_matches(rag_query, top_k)
     return build_context(matches)
+
 
 def _make_coach_user_message(mode: str, state: Dict[str, Any], user_input: str, info: str) -> str:
     tpl = TEMPLATES[mode]
@@ -263,14 +293,6 @@ def _make_coach_user_message(mode: str, state: Dict[str, Any], user_input: str, 
         f"INFORMATION (background support):\n{info}\n"
     )
 
-def _is_template_invocation_text(mode: str, query: str) -> bool:
-    q = (query or "").strip().lower()
-    if not q:
-        return False
-
-    title = (TEMPLATES[mode]["title"] or "").strip().lower()
-    mode_key = (mode or "").strip().lower()
-    return q == title or q == mode_key
 
 def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bool = False):
     mode = _extract_mode(payload)
@@ -283,13 +305,11 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
     if reset:
         SESSIONS.pop(session_id, None)
 
-    if _is_template_invocation_text(mode, query):
-        SESSIONS.pop(session_id, None)
-        query = ""
-
     state = _load_state(session_id, mode)
 
+    # ✅ FIX: если query пустой — НЕ двигаем шаг, просто задаём текущий вопрос
     if not query:
+        # ask current question
         info = _retrieve_info_for_coach(mode, f"template {mode}", top_k)
         user_msg = _make_coach_user_message(mode, state, "", info)
     else:
@@ -298,6 +318,7 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
         user_msg = _make_coach_user_message(mode, state, query, info)
 
     done = _current_step(mode, state) is None
+
     if done:
         user_msg += "\nFINAL INSTRUCTION:\nSummarise the user’s plan in a clean, practical format and offer the next action."
 
@@ -332,6 +353,7 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
 
     return gen_text_chunks(), {"session_id": session_id, "done": done}
 
+
 # =========================
 # ROUTES
 # =========================
@@ -339,6 +361,8 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
 def health():
     return {"ok": True}
 
+
+# ---- JSON chat (обычный RAG Q&A) ----
 @app.post("/chat")
 def chat(payload: Dict = Body(...)):
     query = (payload.get("query") or "").strip()
@@ -349,6 +373,7 @@ def chat(payload: Dict = Body(...)):
 
     matches = get_matches(query, top_k)
     context = build_context(matches)
+
     user = f"QUESTION:\n{query}\n\nINFORMATION:\n{context}"
 
     resp = openai.chat.completions.create(
@@ -363,6 +388,8 @@ def chat(payload: Dict = Body(...)):
     answer = (resp.choices[0].message.content or "").strip()
     return {"answer": answer}
 
+
+# ---- SSE chat (обычный RAG Q&A) ----
 @app.post("/chat/sse")
 def chat_sse(payload: Dict = Body(...)):
     query = (payload.get("query") or "").strip()
@@ -378,14 +405,20 @@ def chat_sse(payload: Dict = Body(...)):
     if not query:
         def empty_gen():
             yield "event: done\ndata: {}\n\n"
-        return StreamingResponse(empty_gen(), media_type="text/event-stream", headers=headers())
+        return StreamingResponse(
+            empty_gen(),
+            media_type="text/event-stream",
+            headers=headers(),
+        )
 
     matches = get_matches(query, top_k)
     context = build_context(matches)
+
     user = f"QUESTION:\n{query}\n\nINFORMATION:\n{context}"
 
     def gen():
         yield "event: start\ndata: {}\n\n"
+
         stream = openai.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
@@ -395,24 +428,35 @@ def chat_sse(payload: Dict = Body(...)):
             temperature=0.2,
             stream=True,
         )
+
         for event in stream:
             delta = event.choices[0].delta.content
             if delta:
                 data = json.dumps({"text": delta}, ensure_ascii=False)
                 yield f"event: chunk\ndata: {data}\n\n"
+
         yield "event: done\ndata: {}\n\n"
 
-    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers())
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers=headers(),
+    )
+
 
 # =========================
-# COACH ENDPOINTS
+# COACH ENDPOINTS (server-stored sessions)
 # =========================
+
+# ---- Coach JSON ----
 @app.post("/coach/chat")
 def coach_chat(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
     out = coach_turn_server_state(payload, session_id=session_id, stream=False)
     return JSONResponse(out)
 
+
+# ---- Coach SSE stream: session_id в event:start, text в event:chunk, done в event:done ----
 @app.post("/coach/sse")
 def coach_sse(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
@@ -436,8 +480,14 @@ def coach_sse(payload: Dict = Body(...)):
         done_payload = json.dumps({"done": bool(meta.get("done"))}, ensure_ascii=False)
         yield f"event: done\ndata: {done_payload}\n\n"
 
-    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers())
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers=headers(),
+    )
 
+
+# ---- Optional: reset session explicitly ----
 @app.post("/coach/reset")
 def coach_reset(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
