@@ -81,6 +81,23 @@ def _clamp_int(v: Any, default: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, n))
 
 # =========================
+# TEXT CLEANUP (NO MARKDOWN) ✅
+# =========================
+def strip_markdown_chars(text: str) -> str:
+    """
+    Bubble часто не рендерит markdown, поэтому убираем маркеры форматирования.
+    (звёздочки — главный источник проблемы, но чистим и пару других частых)
+    """
+    if not text:
+        return ""
+    # убираем markdown символы, которые чаще всего ломают отображение
+    return (
+        text.replace("*", "")
+            .replace("`", "")
+            .replace("_", "")
+    )
+
+# =========================
 # RAG HELPERS
 # =========================
 def embed_query(text: str) -> List[float]:
@@ -120,20 +137,19 @@ def get_matches(query: str, top_k: int) -> List[Dict]:
     return res.get("matches") or []
 
 # =========================
-# BASE (RAG Q&A) PROMPT  ✅ UPDATED (soft + ends with question)
+# BASE (RAG Q&A) PROMPT ✅ UPDATED: soft + ends with question + NO markdown
 # =========================
 SYSTEM_PROMPT_QA = (
     "You are a friendly, helpful assistant.\n"
     "You must answer ONLY using the provided INFORMATION.\n\n"
     "Hard rules:\n"
     "- Do NOT mention document names, page numbers, sources, citations, or the word 'context'.\n"
-    "- Write a natural chatbot answer as plain text.\n"
-    "- If the answer is not present in the INFORMATION, you MUST say exactly:\n"
+    "- Output plain text only. NO markdown. Do not use *, **, _, `, #, or markdown lists.\n"
+    "- If the answer is not present in the INFORMATION, say exactly:\n"
     "  \"I can't find this in the provided documents.\".\n"
     "- Keep it concise and practical.\n\n"
     "Tone rules:\n"
-    "- Start softly (1 short supportive sentence) when appropriate.\n"
-    "- Never sound dry or robotic.\n"
+    "- Start softly (one short supportive sentence) when appropriate.\n"
     "- Always end your message with a question to keep the conversation going.\n"
     "- If the user request is vague, end with 2–3 quick options (A/B/C).\n"
 )
@@ -149,7 +165,8 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
             {"key": "situation", "question": "Now the situation itself. What’s the most important thing you want to achieve in this conversation?"},
             {"key": "relationship", "question": "About the relationship: what do you know about the other person’s priorities or pressures?"},
             {"key": "myself", "question": "About you: what strengths or skills do you bring that will help you handle this well?"},
-            {"key": "why_confident", "question": "Great. Now list 3–5 reasons you *should* feel confident going into this."},
+            # ✅ убрал markdown *...*
+            {"key": "why_confident", "question": "Great. Now list 3–5 reasons you should feel confident going into this."},
             {"key": "summary", "question": "Want me to summarise your confidence plan in 5–7 bullet points you can read right before the call?"},
         ],
     },
@@ -157,7 +174,8 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
         "title": "Prepare for difficult behaviours",
         "steps": [
             {"key": "scenario", "question": "What’s the situation—who are you speaking to, and what decision are you trying to influence? (1–2 sentences)"},
-            {"key": "anticipate_tactics", "question": "What is the *first* difficult thing they are likely to say or do? Write it as a direct quote if you can."},
+            # ✅ убрал markdown *...*
+            {"key": "anticipate_tactics", "question": "What is the first difficult thing they are likely to say or do? Write it as a direct quote if you can."},
             {"key": "purpose", "question": "What do you think their purpose is with that move—pressure, delay, anchoring, saving face, something else?"},
             {"key": "response_bullet", "question": "Let’s craft your response. What’s the one key point you must hold your ground on? (One sentence)"},
             {"key": "move_on_air", "question": "Now write a short linking phrase to steer back on track (e.g., “That’s helpful—so to move this forward…”). What’s your version?"},
@@ -177,7 +195,7 @@ SYSTEM_PROMPT_COACH = (
     "- NEVER repeat a previous question unless the user explicitly asks you to repeat.\n"
     "- IMPORTANT: The next question must be EXACTLY the provided 'NEXT QUESTION' line. Ask it verbatim and stop.\n"
     "- Use the provided INFORMATION only as background support for phrasing and best-practice, but NEVER mention documents, pages, sources, citations, or the word 'context'.\n"
-    "- Output plain text only.\n"
+    "- Output plain text only. NO markdown. Do not use *, **, _, `, #, or markdown lists.\n"
 )
 
 def _extract_mode(payload: Dict[str, Any]) -> str:
@@ -313,6 +331,7 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
             temperature=0.2,
         )
         text = (resp.choices[0].message.content or "").strip()
+        text = strip_markdown_chars(text)  # ✅ подчистка на всякий случай
         return {"text": text, "session_id": session_id, "done": done}
 
     def gen_text_chunks():
@@ -328,7 +347,7 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
         for event in stream_resp:
             delta = event.choices[0].delta.content
             if delta:
-                yield delta
+                yield strip_markdown_chars(delta)  # ✅ чистим прямо в стриме
 
     return gen_text_chunks(), {"session_id": session_id, "done": done}
 
@@ -361,6 +380,7 @@ def chat(payload: Dict = Body(...)):
     )
 
     answer = (resp.choices[0].message.content or "").strip()
+    answer = strip_markdown_chars(answer)  # ✅ убираем звёздочки и др.
     return {"answer": answer}
 
 @app.post("/chat/sse")
@@ -398,6 +418,7 @@ def chat_sse(payload: Dict = Body(...)):
         for event in stream:
             delta = event.choices[0].delta.content
             if delta:
+                delta = strip_markdown_chars(delta)  # ✅ чистим по кускам
                 data = json.dumps({"text": delta}, ensure_ascii=False)
                 yield f"event: chunk\ndata: {data}\n\n"
         yield "event: done\ndata: {}\n\n"
