@@ -4,7 +4,7 @@ import uuid
 import time
 import random
 import re
-from typing import List, Dict, Any, Optional, Iterator
+from typing import List, Dict, Any, Optional, Iterator, Tuple
 
 from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,8 +18,9 @@ from pinecone import Pinecone
 # =========================
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
-TOP_K = int(os.getenv("TOP_K", "10"))  # final chunks passed to LLM
-PINECONE_TOPK_RAW = int(os.getenv("PINECONE_TOPK_RAW", "30"))  # raw candidates from pinecone
+
+TOP_K = int(os.getenv("TOP_K", "10"))                 # final chunks passed to LLM
+PINECONE_TOPK_RAW = int(os.getenv("PINECONE_TOPK_RAW", "30"))  # per-query raw candidates
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "14000"))
 EMBED_DIM = int(os.getenv("EMBED_DIM", "512"))
 
@@ -29,6 +30,10 @@ SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))  # 24h defa
 MIN_MATCH_SCORE = float(os.getenv("MIN_MATCH_SCORE", "0.35"))
 MIN_CONTEXT_CHARS = int(os.getenv("MIN_CONTEXT_CHARS", "700"))
 MIN_OVERLAP_SCORE = float(os.getenv("MIN_OVERLAP_SCORE", "1.3"))  # if below -> treat as not found
+
+# extra: retrieval diversity
+MULTI_QUERY_K = int(os.getenv("MULTI_QUERY_K", "3"))  # number of pinecone queries to run (max 3 in this impl)
+DIVERSITY_SAME_SOURCE_CAP = int(os.getenv("DIVERSITY_SAME_SOURCE_CAP", "3"))  # max chunks from same source
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
@@ -189,7 +194,7 @@ SEARCH_HINTS = [
      "hint": "tactics prepared to respond pages 65-74 slides 7 8 15"},
     {"match_any": ["difference between selling and negotiation", "selling vs negotiation", "selling and negotiation"],
      "hint": "introduction to negotiation book page xii-vii slide 11"},
-    {"match_any": ["deal with difficult questions", "handle difficult questions", "difficult questions"],
+    {"match_any": ["deal with difficult questions", "handle difficult questions", "difficult questions", "deal with difficult question"],
      "hint": "slides 28-34 difficult questions"},
 ]
 
@@ -235,6 +240,7 @@ _GENERIC_PHRASES = [
     "win-win outcomes",
     "face-to-face negotiations",
     "self-awareness is crucial",
+    "prepare thoroughly",
 ]
 
 def _tokenize(s: str) -> List[str]:
@@ -243,23 +249,75 @@ def _tokenize(s: str) -> List[str]:
     toks = [t for t in s.split() if t and t not in _STOPWORDS and len(t) > 2]
     return toks
 
-def _hint_keywords(question: str) -> List[str]:
-    hint = _hint_for_question(question)
-    if not hint:
-        return []
-    return _tokenize(hint)
-
-def select_matches_rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
+def _keyword_query(query: str) -> str:
     """
-    ✅ KEY FIX:
-    - DO NOT put hints into embedding (that collapses vectors and returns the same generic chunk)
-    - Use hints ONLY for rerank
-    - Stronger lexical overlap + hint overlap + generic penalty
+    Build a sparse-ish keyword string (still embedded, but it reduces "generic" embedding drift).
+    """
+    toks = _tokenize(query)
+    # keep up to 18 “sharp” tokens
+    toks = toks[:18]
+    return " ".join(toks)
+
+def _source_id(md: Dict[str, Any]) -> str:
+    """
+    Try to group chunks by source to enforce diversity.
+    Adjust keys if you have different metadata names.
+    """
+    for k in ["source", "doc_id", "document_id", "file", "filename", "title"]:
+        v = md.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    # fallback: use namespace-like chunk id if present
+    for k in ["chunk_id", "id"]:
+        v = md.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+def _merge_dedup_matches(list_of_lists: List[List[Dict]]) -> List[Dict]:
+    """
+    Deduplicate by Pinecone match id (or by text hash fallback).
+    Keep the best (highest score) occurrence.
+    """
+    best: Dict[str, Dict] = {}
+    for matches in list_of_lists:
+        for m in matches or []:
+            mid = str(m.get("id") or "").strip()
+            md = m.get("metadata") or {}
+            txt = (md.get("text") or "").strip()
+            if not mid:
+                mid = f"txth:{hash(txt)}"
+            if mid not in best:
+                best[mid] = m
+            else:
+                try:
+                    s_new = float(m.get("score") or 0.0)
+                except Exception:
+                    s_new = 0.0
+                try:
+                    s_old = float(best[mid].get("score") or 0.0)
+                except Exception:
+                    s_old = 0.0
+                if s_new > s_old:
+                    best[mid] = m
+    return list(best.values())
+
+def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
+    """
+    Stronger rerank:
+    - lexical overlap with query tokens
+    - lexical overlap with hint tokens (if any)
+    - penalty for generic boilerplate
+    - keep pinecone score as weak signal
+    - enforce diversity: cap per source
     """
     qt = set(_tokenize(query))
-    hint_toks = set(_hint_keywords(query))
+    hint = _hint_for_question(query)
+    hint_toks = set(_tokenize(hint)) if hint else set()
 
-    scored = []
+    scored: List[Tuple[float, Dict]] = []
+
+    qlow = (query or "").lower()
 
     for m in matches or []:
         md = m.get("metadata") or {}
@@ -273,28 +331,49 @@ def select_matches_rerank(query: str, matches: List[Dict], final_k: int) -> List
         overlap_q = sum(1.0 for t in ttoks if t in qt)
         overlap_hint = sum(1.2 for t in ttoks if t in hint_toks) if hint_toks else 0.0
 
-        # small phrase bonus if query contains phrase and it appears in text
+        # phrase bonus when BOTH query phrase and text contain it
         bonus = 0.0
-        qlow = (query or "").lower()
-        for phrase in ["balance", "power", "selling", "negotiation", "difficult questions", "push back", "relationship", "tactics", "mindset"]:
+        for phrase in [
+            "balance", "power", "selling", "negotiation",
+            "difficult questions", "push back", "relationship",
+            "tactics", "mindset"
+        ]:
             if phrase in qlow and phrase in tlow:
-                bonus += 0.6
+                bonus += 0.7
 
         penalty = 0.0
         for gp in _GENERIC_PHRASES:
             if gp in tlow:
-                penalty += 1.0
+                penalty += 1.1
 
         try:
             pscore = float(m.get("score") or 0.0)
         except Exception:
             pscore = 0.0
 
-        final = (overlap_q * 1.2) + (overlap_hint * 1.5) + bonus + (pscore * 0.3) - penalty
-        scored.append((final, overlap_q, overlap_hint, pscore, m))
+        # final ranking score
+        final = (overlap_q * 1.25) + (overlap_hint * 1.6) + bonus + (pscore * 0.25) - penalty
+
+        scored.append((final, m))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [x[-1] for x in scored[:final_k]]
+
+    # diversity: cap per source
+    out: List[Dict] = []
+    per_source: Dict[str, int] = {}
+
+    for _, m in scored:
+        md = m.get("metadata") or {}
+        sid = _source_id(md) or "_"
+        per_source[sid] = per_source.get(sid, 0)
+        if per_source[sid] >= DIVERSITY_SAME_SOURCE_CAP:
+            continue
+        out.append(m)
+        per_source[sid] += 1
+        if len(out) >= final_k:
+            break
+
+    return out
 
 def build_context(matches: List[Dict]) -> str:
     parts: List[str] = []
@@ -340,26 +419,54 @@ def is_context_relevant(query: str, matches: List[Dict]) -> bool:
 
 def get_matches(query: str, top_k_final: int) -> List[Dict]:
     """
-    ✅ FIXED retrieval:
-    1) Embedding is ONLY the clean user query (no SEARCH_HINTS appended)
-    2) Pinecone returns RAW candidates
-    3) Filter by score
-    4) Rerank using lexical overlap + hint overlap + generic penalty
-    5) If irrelevant -> []
+    ✅ Better retrieval:
+    - run up to 3 pinecone queries:
+      1) clean question
+      2) question + hint (ONLY if hint exists)
+      3) keyword-only version of the question
+    - merge + dedup
+    - filter by score
+    - rerank (query overlap + hint overlap + generic penalty) + diversity
+    - if irrelevant -> []
     """
-    qvec = embed_query(query)
-    res = index.query(vector=qvec, top_k=PINECONE_TOPK_RAW, include_metadata=True)
+    q_clean = (query or "").strip()
+    if not q_clean:
+        return []
 
-    raw = _filter_matches_by_score(res.get("matches") or [])
-    reranked = select_matches_rerank(query, raw, top_k_final)
+    hint = _hint_for_question(q_clean)
+    q_hint = f"{q_clean}\n{hint}".strip() if hint else ""
+    q_kw = _keyword_query(q_clean)
 
-    if not is_context_relevant(query, reranked):
+    # build the list of queries to run
+    queries: List[str] = [q_clean]
+    if hint and len(queries) < MULTI_QUERY_K:
+        queries.append(q_hint)
+    if len(queries) < MULTI_QUERY_K and q_kw:
+        queries.append(q_kw)
+
+    all_results: List[List[Dict]] = []
+
+    for q in queries:
+        try:
+            vec = embed_query(q)
+            res = index.query(vector=vec, top_k=PINECONE_TOPK_RAW, include_metadata=True)
+            all_results.append(res.get("matches") or [])
+        except Exception:
+            # don't crash the whole request because one query failed
+            continue
+
+    merged = _merge_dedup_matches(all_results)
+    merged = _filter_matches_by_score(merged)
+
+    reranked = _rerank(q_clean, merged, top_k_final)
+
+    if not is_context_relevant(q_clean, reranked):
         return []
 
     return reranked
 
 # =========================
-# BASE (RAG Q&A) PROMPT (stronger grounding)
+# BASE (RAG Q&A) PROMPT (FORCE SPECIFICITY)
 # =========================
 SYSTEM_PROMPT_QA = (
     "You are a friendly, helpful assistant.\n"
@@ -367,15 +474,16 @@ SYSTEM_PROMPT_QA = (
     "Hard rules:\n"
     "- Do NOT mention document names, page numbers, sources, citations, or the word 'context'.\n"
     "- Output plain text only. NO markdown. Do not use *, **, _, `, #, or markdown lists.\n"
-    "- Do NOT use placeholders like \"A/B/C?\". If you give options, write them out as A), B), C).\n"
-    "- If the answer is not clearly present in the INFORMATION (or INFORMATION is generic/not about the question), say exactly:\n"
+    "- Do NOT add general negotiation advice that is not explicitly supported by INFORMATION.\n"
+    "- Your answer MUST include 2–4 short direct quotes from INFORMATION in double quotes (each quote 3–12 words).\n"
+    "- If you cannot include those quotes because INFORMATION is missing or generic/not about the question, say exactly:\n"
     "  \"I can't find this in the provided documents.\".\n"
     "- Keep it concise and practical.\n\n"
     "Tone rules:\n"
     "- Start softly (one short supportive sentence) when appropriate.\n"
     "- Avoid starting with the same phrase every time.\n"
     "- If USER_NAME is provided, you MAY naturally mention it 0–2 times.\n"
-    "- Always end your message with a question.\n"
+    "- If you answered (not the 'can't find' case), end your message with one short question.\n"
 )
 
 # =========================
@@ -611,6 +719,11 @@ def chat(payload: Dict = Body(...)):
         return JSONResponse({"answer": ""})
 
     matches = get_matches(query, top_k)
+
+    # hard fail fast: if retrieval empty -> don't let model hallucinate
+    if not matches:
+        return {"answer": "I can't find this in the provided documents.", "session_id": session_id}
+
     context = build_context(matches)
 
     user = (
@@ -629,8 +742,11 @@ def chat(payload: Dict = Body(...)):
     )
 
     answer = strip_markdown_chars((resp.choices[0].message.content or "").strip())
-    opener = _pick_opener(session_id, user_name, "qa_last_opener")
-    answer = _rewrite_bad_opening(answer, opener)
+
+    # keep the "can't find" exact if model produced it
+    if answer.strip() != "I can't find this in the provided documents.":
+        opener = _pick_opener(session_id, user_name, "qa_last_opener")
+        answer = _rewrite_bad_opening(answer, opener)
 
     return {"answer": answer, "session_id": session_id}
 
@@ -656,6 +772,16 @@ def chat_sse(payload: Dict = Body(...)):
         return StreamingResponse(empty_gen(), media_type="text/event-stream", headers=headers())
 
     matches = get_matches(query, top_k)
+
+    if not matches:
+        def gen_nf():
+            start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
+            yield f"event: start\ndata: {start_payload}\n\n"
+            data = json.dumps({"text": "I can't find this in the provided documents."}, ensure_ascii=False)
+            yield f"event: chunk\ndata: {data}\n\n"
+            yield "event: done\ndata: {}\n\n"
+        return StreamingResponse(gen_nf(), media_type="text/event-stream", headers=headers())
+
     context = build_context(matches)
 
     user = (
