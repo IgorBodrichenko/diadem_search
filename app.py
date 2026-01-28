@@ -4,7 +4,7 @@ import uuid
 import time
 import random
 import re
-from typing import List, Dict, Any, Optional, Iterator, Tuple
+from typing import List, Dict, Any, Optional, Iterator
 
 from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -110,7 +110,7 @@ def strip_markdown_chars(text: str) -> str:
     )
 
 # =========================
-# VARIATION (avoid "It's great..." every time) ✅
+# VARIATION (avoid same opener every time) ✅
 # =========================
 SOFT_OPENERS = [
     "Glad you’re thinking about this ahead of time.",
@@ -123,7 +123,11 @@ SOFT_OPENERS = [
     "Alright — we can make this feel a lot more manageable.",
 ]
 
-_BAD_START_RE = re.compile(r"^\s*(it['’]s\s+great|great)\b", flags=re.IGNORECASE)
+# ✅ расширили ловушку: "It's wonderful..." тоже
+_BAD_START_RE = re.compile(
+    r"^\s*(it['’]s\s+(great|wonderful)|great)\b",
+    flags=re.IGNORECASE,
+)
 
 def _session_entry(session_id: str) -> Dict[str, Any]:
     entry = SESSIONS.get(session_id)
@@ -152,7 +156,8 @@ def _pick_opener(session_id: str, user_name: str, field: str) -> str:
 
 def _rewrite_bad_opening(full_text: str, opener: str) -> str:
     """
-    If the text starts with "It's great..." / "Great ...", replace the first sentence with opener.
+    If the text starts with "It's great/It's wonderful/Great ...",
+    replace the first sentence with opener.
     """
     t = (full_text or "").strip()
     if not t:
@@ -176,11 +181,8 @@ def _stream_opening_variation(
 ) -> Iterator[str]:
     """
     Streaming-safe opener variation:
-    Buffer early deltas until we can decide if the answer starts with "It's great/Great".
-    Then emit either:
-      - unchanged prefix, or
-      - opener + rest (dropping first sentence)
-    After decision, pass-through.
+    Buffer early deltas until we can decide if the answer starts with bad opener.
+    Then emit rewritten prefix once, then pass-through.
     """
     opener = _pick_opener(session_id, user_name, field)
     buf = ""
@@ -189,7 +191,6 @@ def _stream_opening_variation(
     for d in deltas:
         if not decided:
             buf += d
-            # decide when we have enough
             if len(buf) >= 140 or re.search(r"[.!?]\s+", buf):
                 rewritten = _rewrite_bad_opening(buf, opener)
                 yield rewritten
@@ -198,7 +199,6 @@ def _stream_opening_variation(
         else:
             yield d
 
-    # flush remaining if stream ended before decision
     if not decided and buf:
         yield _rewrite_bad_opening(buf, opener)
 
@@ -256,7 +256,7 @@ SYSTEM_PROMPT_QA = (
     "- Keep it concise and practical.\n\n"
     "Tone rules:\n"
     "- Start softly (one short supportive sentence) when appropriate.\n"
-    "- Avoid starting with the same phrase every time (do NOT always start with 'It's great' or 'Great').\n"
+    "- Avoid starting with the same phrase every time (do NOT always start with 'It's great', 'It's wonderful', or 'Great').\n"
     "- If USER_NAME is provided, you MAY naturally mention it 0–2 times (never in every sentence).\n"
     "- Always end your message with a question to keep the conversation going.\n"
     "- If the user request is vague OR the INFORMATION is high-level/generic, ask one clarifying question.\n"
@@ -303,7 +303,7 @@ SYSTEM_PROMPT_COACH = (
     "- IMPORTANT: The next question must be EXACTLY the provided 'NEXT QUESTION' line. Ask it verbatim and stop.\n"
     "- Use the provided INFORMATION only as background support for phrasing and best-practice, but NEVER mention documents, pages, sources, citations, or the word 'context'.\n"
     "- Output plain text only. NO markdown. Do not use *, **, _, `, #, or markdown lists.\n"
-    "- Avoid starting with the same phrase every time (do NOT always start with 'It's great' or 'Great').\n"
+    "- Avoid starting with the same phrase every time (do NOT always start with 'It's great', 'It's wonderful', or 'Great').\n"
     "- If USER_NAME is provided, you MAY naturally mention it once in a friendly way.\n"
 )
 
@@ -455,7 +455,6 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
         text = (resp.choices[0].message.content or "").strip()
         text = strip_markdown_chars(text)
 
-        # ✅ variability: replace "It's great/Great ..." start if it happens
         opener = _pick_opener(session_id, user_name, "coach_last_opener")
         text = _rewrite_bad_opening(text, opener)
 
@@ -478,7 +477,6 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
                 if delta:
                     yield strip_markdown_chars(delta)
 
-        # ✅ variability in streaming (buffer early deltas, then decide)
         yield from _stream_opening_variation(
             raw_deltas(),
             session_id=session_id,
@@ -529,7 +527,6 @@ def chat(payload: Dict = Body(...)):
     answer = (resp.choices[0].message.content or "").strip()
     answer = strip_markdown_chars(answer)
 
-    # ✅ variability: replace "It's great/Great ..." start if it happens
     opener = _pick_opener(session_id, user_name, "qa_last_opener")
     answer = _rewrite_bad_opening(answer, opener)
 
@@ -585,7 +582,6 @@ def chat_sse(payload: Dict = Body(...)):
                 if delta:
                     yield strip_markdown_chars(delta)
 
-        # ✅ variability in streaming (buffer early deltas, then decide)
         for delta in _stream_opening_variation(
             raw_deltas(),
             session_id=session_id,
