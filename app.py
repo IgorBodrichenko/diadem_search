@@ -67,8 +67,10 @@ app.add_middleware(
 # =========================
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 
+
 def _now() -> int:
     return int(time.time())
+
 
 def _cleanup_sessions():
     cutoff = _now() - SESSION_TTL_SECONDS
@@ -76,11 +78,13 @@ def _cleanup_sessions():
         if int(entry.get("updated_at", 0)) < cutoff:
             SESSIONS.pop(sid, None)
 
+
 def _get_or_create_session_id(payload: Dict[str, Any]) -> str:
     sid = str(payload.get("session_id") or "").strip()
     if not sid:
         sid = uuid.uuid4().hex
     return sid
+
 
 def _safe_str(x: Any) -> str:
     # Bubble иногда шлёт boolean/number. Не превращаем это в "".
@@ -93,12 +97,31 @@ def _safe_str(x: Any) -> str:
     except Exception:
         return ""
 
+
+def _as_bool(v: Any) -> bool:
+    # Bubble часто шлёт "false"/"true" строкой -> bool("false")==True (это и ломает флоу)
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    if isinstance(v, (int, float)):
+        return v != 0
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "1", "yes", "y", "on"):
+            return True
+        if s in ("false", "0", "no", "n", "off", "", "null", "none", "undefined"):
+            return False
+    return False
+
+
 def _clamp_int(v: Any, default: int, lo: int, hi: int) -> int:
     try:
         n = int(v)
     except Exception:
         return default
     return max(lo, min(hi, n))
+
 
 # =========================
 # USER NAME (optional)
@@ -110,6 +133,7 @@ def _extract_user_name(payload: Dict[str, Any]) -> str:
         return ""
     return raw
 
+
 # =========================
 # TEXT CLEANUP (NO MARKDOWN)
 # =========================
@@ -117,6 +141,7 @@ def strip_markdown_chars(text: str) -> str:
     if not text:
         return ""
     return text.replace("*", "").replace("`", "").replace("_", "")
+
 
 # =========================
 # SMALL TALK / CASUAL CHAT
@@ -128,6 +153,7 @@ _SMALLTALK_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+
 def _is_smalltalk(q: str) -> bool:
     q = (q or "").strip()
     if not q:
@@ -136,11 +162,13 @@ def _is_smalltalk(q: str) -> bool:
         return True
     return False
 
+
 def _smalltalk_reply(user_name: str) -> str:
     name = (user_name or "").strip()
     if name:
         return f"Hi {name}. How can I help?"
     return "Hi. How can I help?"
+
 
 # =========================
 # VARIATION (avoid same opener every time)
@@ -158,6 +186,7 @@ SOFT_OPENERS = [
 
 _BAD_START_RE = re.compile(r"^\s*(it['’]s\s+(great|wonderful)|great)\b", flags=re.IGNORECASE)
 
+
 def _session_entry(session_id: str) -> Dict[str, Any]:
     entry = SESSIONS.get(session_id)
     if not isinstance(entry, dict):
@@ -165,6 +194,7 @@ def _session_entry(session_id: str) -> Dict[str, Any]:
         SESSIONS[session_id] = entry
     entry["updated_at"] = _now()
     return entry
+
 
 def _pick_opener(session_id: str, user_name: str, field: str) -> str:
     entry = _session_entry(session_id)
@@ -175,6 +205,7 @@ def _pick_opener(session_id: str, user_name: str, field: str) -> str:
         opener = f"{opener} {user_name}."
     entry[field] = opener
     return opener
+
 
 def _rewrite_bad_opening(full_text: str, opener: str) -> str:
     t = (full_text or "").strip()
@@ -187,6 +218,7 @@ def _rewrite_bad_opening(full_text: str, opener: str) -> str:
         rest = t[m.end():].strip()
         return f"{opener} {rest}".strip() if rest else opener
     return opener
+
 
 def _stream_opening_variation(
     deltas: Iterator[str],
@@ -209,6 +241,7 @@ def _stream_opening_variation(
     if not decided and buf:
         yield _rewrite_bad_opening(buf, opener)
 
+
 # =========================
 # SEARCH HINTS (Most common questions)
 # =========================
@@ -216,6 +249,7 @@ def _norm_q(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"\s+", " ", s)
     return s
+
 
 SEARCH_HINTS = [
     {"match_any": ["balance the power in a negotiation", "balance power in a negotiation", "balance the power"],
@@ -228,6 +262,7 @@ SEARCH_HINTS = [
      "hint": "slides 28-34 difficult questions"},
 ]
 
+
 def _hint_for_question(question: str) -> str:
     qn = _norm_q(question)
     for item in SEARCH_HINTS:
@@ -235,6 +270,7 @@ def _hint_for_question(question: str) -> str:
             if key in qn:
                 return item["hint"]
     return ""
+
 
 # =========================
 # RAG HELPERS
@@ -247,6 +283,7 @@ def embed_query(text: str) -> List[float]:
     )
     return resp.data[0].embedding
 
+
 def _filter_matches_by_score(matches: List[Dict]) -> List[Dict]:
     out: List[Dict] = []
     for m in matches or []:
@@ -257,6 +294,7 @@ def _filter_matches_by_score(matches: List[Dict]) -> List[Dict]:
         if score >= MIN_MATCH_SCORE:
             out.append(m)
     return out
+
 
 _STOPWORDS = {
     "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with", "without", "is", "are", "was", "were", "be",
@@ -272,16 +310,19 @@ _GENERIC_PHRASES = [
     "prepare thoroughly",
 ]
 
+
 def _tokenize(s: str) -> List[str]:
     s = (s or "").lower()
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     toks = [t for t in s.split() if t and t not in _STOPWORDS and len(t) > 2]
     return toks
 
+
 def _keyword_query(query: str) -> str:
     toks = _tokenize(query)
     toks = toks[:18]
     return " ".join(toks)
+
 
 def _source_id(md: Dict[str, Any]) -> str:
     for k in ["source", "doc_id", "document_id", "file", "filename", "title"]:
@@ -293,6 +334,7 @@ def _source_id(md: Dict[str, Any]) -> str:
         if isinstance(v, str) and v.strip():
             return v.strip()
     return ""
+
 
 def _merge_dedup_matches(list_of_lists: List[List[Dict]]) -> List[Dict]:
     best: Dict[str, Dict] = {}
@@ -317,6 +359,7 @@ def _merge_dedup_matches(list_of_lists: List[List[Dict]]) -> List[Dict]:
                 if s_new > s_old:
                     best[mid] = m
     return list(best.values())
+
 
 def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
     qt = set(_tokenize(query))
@@ -378,6 +421,7 @@ def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
 
     return out
 
+
 def build_context(matches: List[Dict]) -> str:
     parts: List[str] = []
     total = 0
@@ -401,6 +445,7 @@ def build_context(matches: List[Dict]) -> str:
 
     return "\n---\n".join(parts)
 
+
 def is_context_relevant(query: str, matches: List[Dict]) -> bool:
     if not matches:
         return False
@@ -419,6 +464,7 @@ def is_context_relevant(query: str, matches: List[Dict]) -> bool:
         return False
 
     return overlap >= MIN_OVERLAP_SCORE or len(ctx.strip()) >= MIN_CONTEXT_CHARS
+
 
 def get_matches(query: str, top_k_final: int) -> List[Dict]:
     q_clean = (query or "").strip()
@@ -454,6 +500,7 @@ def get_matches(query: str, top_k_final: int) -> List[Dict]:
         return []
 
     return reranked
+
 
 # =========================
 # PROMPTS
@@ -532,8 +579,10 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
 
 _YES_RE = re.compile(r"^\s*(yes|y|yeah|yep|sure|ok|okay|да|ага|ок|добре|звісно)\s*[!.?]*\s*$", re.IGNORECASE)
 
+
 def _is_yes(s: str) -> bool:
     return bool(_YES_RE.match((s or "").strip()))
+
 
 def _extract_mode(payload: Dict[str, Any], fallback_text: str = "") -> str:
     m = _safe_str(payload.get("mode"))
@@ -546,8 +595,10 @@ def _extract_mode(payload: Dict[str, Any], fallback_text: str = "") -> str:
         return "build_confidence"
     return "build_confidence"
 
+
 def _default_state(mode: str) -> Dict[str, Any]:
     return {"mode": mode, "step_index": 0, "answers": {}}
+
 
 def _load_state(session_id: str, mode: str) -> Tuple[Dict[str, Any], bool]:
     entry = SESSIONS.get(session_id)
@@ -569,13 +620,16 @@ def _load_state(session_id: str, mode: str) -> Tuple[Dict[str, Any], bool]:
     entry["updated_at"] = _now()
     return st, True
 
+
 def _save_state(session_id: str, state: Dict[str, Any]) -> None:
     entry = _session_entry(session_id)
     entry["state"] = state
     entry["updated_at"] = _now()
 
+
 def _steps(mode: str) -> List[Dict[str, Any]]:
     return TEMPLATES[mode]["steps"]
+
 
 def _current_step(mode: str, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     steps = _steps(mode)
@@ -586,10 +640,12 @@ def _current_step(mode: str, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
     return steps[idx]
 
+
 def _retrieve_info_for_coach(mode: str, query: str, top_k: int) -> str:
     rag_query = f"{mode}: {query}"
     matches = get_matches(rag_query, top_k)
     return build_context(matches)
+
 
 def _make_final_user_message(mode: str, state: Dict[str, Any], info: str, user_name: str) -> str:
     tpl = TEMPLATES[mode]
@@ -611,9 +667,11 @@ def _make_final_user_message(mode: str, state: Dict[str, Any], info: str, user_n
         f"- If template is 'Prepare for difficult behaviours': create a final cheat sheet.\n"
     )
 
+
 def _reflect_line() -> str:
     opts = ["Got it.", "Okay.", "Thanks — noted.", "Understood.", "That helps."]
     return random.choice(opts)
+
 
 # =========================
 # COACH CORE (DETERMINISTIC QUESTIONS)
@@ -621,12 +679,12 @@ def _reflect_line() -> str:
 def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bool = False):
     raw_query = _safe_str(payload.get("query")) or _safe_str(payload.get("user_input"))
     # защита от "false"/"true" строкой (бывает при кривом маппинге в Bubble)
-    if raw_query.lower() in {"false", "true"}:
+    if raw_query.lower() in {"false", "true", "null", "none", "undefined"}:
         raw_query = ""
 
     top_k = _clamp_int(payload.get("top_k"), TOP_K, 1, 30)
-    reset = bool(payload.get("reset"))
-    start_template = bool(payload.get("start_template"))
+    reset = _as_bool(payload.get("reset"))
+    start_template = _as_bool(payload.get("start_template"))
     user_name = _extract_user_name(payload)
 
     _cleanup_sessions()
@@ -728,12 +786,14 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
         return {"text": text, "session_id": session_id, "done": False}
     return iter([text]), {"session_id": session_id, "done": False}
 
+
 # =========================
 # ROUTES
 # =========================
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 # =========================
 # CHAT (RAG)
@@ -798,6 +858,7 @@ def chat(payload: Dict = Body(...)):
         answer = _rewrite_bad_opening(answer, opener)
 
     return {"answer": answer, "session_id": session_id}
+
 
 # =========================
 # CHAT SSE
@@ -914,6 +975,7 @@ def chat_sse(payload: Dict = Body(...)):
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers())
 
+
 # =========================
 # COACH ENDPOINTS
 # =========================
@@ -922,6 +984,7 @@ def coach_chat(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
     out = coach_turn_server_state(payload, session_id=session_id, stream=False)
     return JSONResponse(out)
+
 
 @app.post("/coach/sse")
 def coach_sse(payload: Dict = Body(...)):
@@ -947,6 +1010,7 @@ def coach_sse(payload: Dict = Body(...)):
         yield f"event: done\ndata: {done_payload}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers())
+
 
 @app.post("/coach/reset")
 def coach_reset(payload: Dict = Body(...)):
