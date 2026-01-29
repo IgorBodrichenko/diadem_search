@@ -5,14 +5,38 @@ import time
 import random
 import re
 import sqlite3
+import logging
 from typing import List, Dict, Any, Optional, Iterator, Tuple
 
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from openai import OpenAI
 from pinecone import Pinecone
+
+# =========================
+# DEBUG / LOGGING
+# =========================
+DEBUG = os.getenv("DEBUG", "0").strip().lower() in ("1", "true", "yes", "y", "on")
+
+logging.basicConfig(
+    level=logging.DEBUG if DEBUG else logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger("coach")
+
+def _jlog(event: str, **fields):
+    payload = {"event": event, **fields}
+    try:
+        log.info(json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        log.info(f"{event} | {fields}")
+
+def _with_debug(resp: Dict[str, Any], **dbg):
+    if DEBUG:
+        resp["debug"] = dbg
+    return resp
 
 # =========================
 # CONFIG
@@ -62,11 +86,25 @@ app.add_middleware(
 )
 
 # =========================
+# REQUEST LOG (optional)
+# =========================
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    if DEBUG:
+        try:
+            body = await request.body()
+            preview = body.decode("utf-8", errors="ignore")[:800]
+        except Exception:
+            preview = ""
+        _jlog("http_in", method=request.method, path=str(request.url.path), body_preview=preview)
+    resp = await call_next(request)
+    return resp
+
+# =========================
 # SESSION STORE (SQLite, survives restarts/workers on same host)
 # =========================
 SESSION_DB_PATH = os.getenv("SESSION_DB_PATH", "sessions.sqlite3")
 _DB: Optional[sqlite3.Connection] = None
-
 
 def _db() -> sqlite3.Connection:
     global _DB
@@ -84,10 +122,8 @@ def _db() -> sqlite3.Connection:
         _DB.commit()
     return _DB
 
-
 def _now() -> int:
     return int(time.time())
-
 
 def _db_get(session_id: str) -> Optional[Dict[str, Any]]:
     if not session_id:
@@ -102,7 +138,6 @@ def _db_get(session_id: str) -> Optional[Dict[str, Any]]:
         return json.loads(row[0])
     except Exception:
         return None
-
 
 def _db_set(session_id: str, entry: Dict[str, Any]) -> None:
     entry = entry or {}
@@ -120,24 +155,20 @@ def _db_set(session_id: str, entry: Dict[str, Any]) -> None:
     )
     _db().commit()
 
-
 def _db_delete(session_id: str) -> None:
     _db().execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
     _db().commit()
-
 
 def _cleanup_sessions() -> None:
     cutoff = _now() - SESSION_TTL_SECONDS
     _db().execute("DELETE FROM sessions WHERE updated_at < ?", (cutoff,))
     _db().commit()
 
-
 def _get_or_create_session_id(payload: Dict[str, Any]) -> str:
     sid = str(payload.get("session_id") or "").strip()
     if not sid:
         sid = uuid.uuid4().hex
     return sid
-
 
 def _safe_str(x: Any) -> str:
     if x is None:
@@ -148,7 +179,6 @@ def _safe_str(x: Any) -> str:
         return str(x).strip()
     except Exception:
         return ""
-
 
 def _as_bool(v: Any) -> bool:
     if isinstance(v, bool):
@@ -165,14 +195,12 @@ def _as_bool(v: Any) -> bool:
             return False
     return False
 
-
 def _clamp_int(v: Any, default: int, lo: int, hi: int) -> int:
     try:
         n = int(v)
     except Exception:
         return default
     return max(lo, min(hi, n))
-
 
 # =========================
 # USER NAME (optional)
@@ -184,22 +212,18 @@ def _extract_user_name(payload: Dict[str, Any]) -> str:
         return ""
     return raw
 
-
 # =========================
 # USER TEXT (IMPORTANT FIX)
 # =========================
 _FALSEY_STRS = {"false", "true", "null", "none", "undefined", ""}
 
-
 def _extract_user_text(payload: Dict[str, Any]) -> str:
-    # Bubble sometimes sends query=false while real text is in another field.
     for key in ("query", "user_input", "text", "message", "input", "answer", "content"):
         v = payload.get(key)
         s = _safe_str(v)
         if s and s.lower() not in _FALSEY_STRS:
             return s
     return ""
-
 
 # =========================
 # TEXT CLEANUP (NO MARKDOWN)
@@ -208,7 +232,6 @@ def strip_markdown_chars(text: str) -> str:
     if not text:
         return ""
     return text.replace("*", "").replace("`", "").replace("_", "")
-
 
 # =========================
 # SMALL TALK
@@ -220,18 +243,15 @@ _SMALLTALK_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
-
 def _is_smalltalk(q: str) -> bool:
     q = (q or "").strip()
     return bool(q and len(q) <= 30 and _SMALLTALK_RE.match(q))
-
 
 def _smalltalk_reply(user_name: str) -> str:
     name = (user_name or "").strip()
     if name:
         return f"Hi {name}. How can I help?"
     return "Hi. How can I help?"
-
 
 # =========================
 # VARIATION
@@ -249,7 +269,6 @@ SOFT_OPENERS = [
 
 _BAD_START_RE = re.compile(r"^\s*(it['’]s\s+(great|wonderful)|great)\b", flags=re.IGNORECASE)
 
-
 def _session_entry(session_id: str) -> Dict[str, Any]:
     entry = _db_get(session_id)
     if not isinstance(entry, dict):
@@ -257,7 +276,6 @@ def _session_entry(session_id: str) -> Dict[str, Any]:
     entry["updated_at"] = _now()
     _db_set(session_id, entry)
     return entry
-
 
 def _pick_opener(session_id: str, user_name: str, field: str) -> str:
     entry = _session_entry(session_id)
@@ -270,7 +288,6 @@ def _pick_opener(session_id: str, user_name: str, field: str) -> str:
     _db_set(session_id, entry)
     return opener
 
-
 def _rewrite_bad_opening(full_text: str, opener: str) -> str:
     t = (full_text or "").strip()
     if not t or not _BAD_START_RE.match(t):
@@ -280,7 +297,6 @@ def _rewrite_bad_opening(full_text: str, opener: str) -> str:
         rest = t[m.end():].strip()
         return f"{opener} {rest}".strip() if rest else opener
     return opener
-
 
 def _stream_opening_variation(
     deltas: Iterator[str],
@@ -303,7 +319,6 @@ def _stream_opening_variation(
     if not decided and buf:
         yield _rewrite_bad_opening(buf, opener)
 
-
 # =========================
 # SEARCH HINTS
 # =========================
@@ -311,7 +326,6 @@ def _norm_q(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"\s+", " ", s)
     return s
-
 
 SEARCH_HINTS = [
     {"match_any": ["balance the power in a negotiation", "balance power in a negotiation", "balance the power"],
@@ -324,7 +338,6 @@ SEARCH_HINTS = [
      "hint": "slides 28-34 difficult questions"},
 ]
 
-
 def _hint_for_question(question: str) -> str:
     qn = _norm_q(question)
     for item in SEARCH_HINTS:
@@ -332,7 +345,6 @@ def _hint_for_question(question: str) -> str:
             if key in qn:
                 return item["hint"]
     return ""
-
 
 # =========================
 # RAG HELPERS
@@ -345,7 +357,6 @@ def embed_query(text: str) -> List[float]:
     )
     return resp.data[0].embedding
 
-
 def _filter_matches_by_score(matches: List[Dict]) -> List[Dict]:
     out: List[Dict] = []
     for m in matches or []:
@@ -356,7 +367,6 @@ def _filter_matches_by_score(matches: List[Dict]) -> List[Dict]:
         if score >= MIN_MATCH_SCORE:
             out.append(m)
     return out
-
 
 _STOPWORDS = {
     "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with", "without", "is", "are", "was", "were", "be",
@@ -372,18 +382,15 @@ _GENERIC_PHRASES = [
     "prepare thoroughly",
 ]
 
-
 def _tokenize(s: str) -> List[str]:
     s = (s or "").lower()
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     toks = [t for t in s.split() if t and t not in _STOPWORDS and len(t) > 2]
     return toks
 
-
 def _keyword_query(query: str) -> str:
     toks = _tokenize(query)[:18]
     return " ".join(toks)
-
 
 def _source_id(md: Dict[str, Any]) -> str:
     for k in ["source", "doc_id", "document_id", "file", "filename", "title"]:
@@ -395,7 +402,6 @@ def _source_id(md: Dict[str, Any]) -> str:
         if isinstance(v, str) and v.strip():
             return v.strip()
     return ""
-
 
 def _merge_dedup_matches(list_of_lists: List[List[Dict]]) -> List[Dict]:
     best: Dict[str, Dict] = {}
@@ -420,7 +426,6 @@ def _merge_dedup_matches(list_of_lists: List[List[Dict]]) -> List[Dict]:
                 if s_new > s_old:
                     best[mid] = m
     return list(best.values())
-
 
 def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
     qt = set(_tokenize(query))
@@ -482,7 +487,6 @@ def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
 
     return out
 
-
 def build_context(matches: List[Dict]) -> str:
     parts: List[str] = []
     total = 0
@@ -502,7 +506,6 @@ def build_context(matches: List[Dict]) -> str:
 
     return "\n---\n".join(parts)
 
-
 def is_context_relevant(query: str, matches: List[Dict]) -> bool:
     if not matches:
         return False
@@ -520,7 +523,6 @@ def is_context_relevant(query: str, matches: List[Dict]) -> bool:
         return False
 
     return overlap >= MIN_OVERLAP_SCORE or len(ctx.strip()) >= MIN_CONTEXT_CHARS
-
 
 def get_matches(query: str, top_k_final: int) -> List[Dict]:
     q_clean = (query or "").strip()
@@ -554,7 +556,6 @@ def get_matches(query: str, top_k_final: int) -> List[Dict]:
         return []
 
     return reranked
-
 
 # =========================
 # PROMPTS
@@ -631,7 +632,6 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
     },
 }
 
-
 def _extract_mode(payload: Dict[str, Any], fallback_text: str = "") -> str:
     m = _safe_str(payload.get("mode"))
     if m in TEMPLATES:
@@ -643,10 +643,8 @@ def _extract_mode(payload: Dict[str, Any], fallback_text: str = "") -> str:
         return "build_confidence"
     return "build_confidence"
 
-
 def _default_state(mode: str) -> Dict[str, Any]:
     return {"mode": mode, "step_index": 0, "answers": {}}
-
 
 def _load_state(session_id: str, mode: str) -> Tuple[Dict[str, Any], bool]:
     entry = _db_get(session_id) or {}
@@ -674,16 +672,13 @@ def _load_state(session_id: str, mode: str) -> Tuple[Dict[str, Any], bool]:
     _db_set(session_id, entry)
     return st, True
 
-
 def _save_state(session_id: str, state: Dict[str, Any]) -> None:
     entry = _db_get(session_id) or {}
     entry["state"] = state
     _db_set(session_id, entry)
 
-
 def _steps(mode: str) -> List[Dict[str, Any]]:
     return TEMPLATES[mode]["steps"]
-
 
 def _current_step(mode: str, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     steps = _steps(mode)
@@ -694,12 +689,10 @@ def _current_step(mode: str, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
     return steps[idx]
 
-
 def _retrieve_info_for_coach(mode: str, query: str, top_k: int) -> str:
     rag_query = f"{mode}: {query}"
     matches = get_matches(rag_query, top_k)
     return build_context(matches)
-
 
 def _make_final_user_message(mode: str, state: Dict[str, Any], info: str, user_name: str) -> str:
     tpl = TEMPLATES[mode]
@@ -721,13 +714,11 @@ def _make_final_user_message(mode: str, state: Dict[str, Any], info: str, user_n
         f"- If template is 'Prepare for difficult behaviours': create a final cheat sheet.\n"
     )
 
-
 def _reflect_line() -> str:
     return random.choice(["Got it.", "Okay.", "Thanks — noted.", "Understood.", "That helps."])
 
-
 # =========================
-# COACH CORE
+# COACH CORE (with logs + fix for start_template loop)
 # =========================
 def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bool = False):
     raw_query = _extract_user_text(payload)
@@ -737,47 +728,86 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
     start_template = _as_bool(payload.get("start_template"))
     user_name = _extract_user_name(payload)
 
+    _jlog(
+        "coach_in",
+        session_id=session_id,
+        stream=bool(stream),
+        mode=_safe_str(payload.get("mode")),
+        start_template=start_template,
+        reset=reset,
+        raw_query_len=len(raw_query or ""),
+        raw_query_preview=(raw_query or "")[:160],
+        payload_keys=sorted(list(payload.keys()))[:60],
+    )
+
     _cleanup_sessions()
 
     if reset:
+        _jlog("coach_reset", session_id=session_id)
         _db_delete(session_id)
 
     if _is_smalltalk(raw_query):
         text = _smalltalk_reply(user_name) + " Choose a shortcut: Build my confidence or Prepare for difficult behaviours."
-        if not stream:
-            return {"text": text, "session_id": session_id, "done": False}
-        return iter([text]), {"session_id": session_id, "done": False}
+        resp = {"text": text, "session_id": session_id, "done": False}
+        return _with_debug(resp, case="smalltalk")
 
     mode = _extract_mode(payload, fallback_text=raw_query)
     state, existed = _load_state(session_id, mode)
 
+    _jlog(
+        "state_loaded",
+        session_id=session_id,
+        mode=mode,
+        existed=existed,
+        step_index=int(state.get("step_index") or 0),
+        answers_keys=sorted(list((state.get("answers") or {}).keys()))[:30],
+    )
+
+    # IMPORTANT: if user already sent an answer, ignore start_template (Bubble often sends it every time)
+    if raw_query:
+        if start_template:
+            _jlog("start_template_ignored_due_to_answer", session_id=session_id, mode=mode)
+        start_template = False
+
     # START only if explicitly requested OR session newly created
     if start_template or (not existed):
+        _jlog(
+            "template_started",
+            session_id=session_id,
+            mode=mode,
+            reason=("start_template" if start_template else "new_session"),
+        )
         state = _default_state(mode)
         _save_state(session_id, state)
         first = _current_step(mode, state)
         q_text = first["question"] if first else "Choose a shortcut: Build my confidence or Prepare for difficult behaviours."
         opener = _pick_opener(session_id, user_name, "coach_last_opener")
         text = f"{opener} {q_text}".strip()
-        if not stream:
-            return {"text": text, "session_id": session_id, "done": False}
-        return iter([text]), {"session_id": session_id, "done": False}
+        resp = {"text": text, "session_id": session_id, "done": False}
+        return _with_debug(resp, mode=mode, step_index=0, existed=existed, started=True)
 
     # If user didn't send an answer, just repeat current question without advancing
     if not raw_query:
         cur = _current_step(mode, state)
+        _jlog(
+            "no_answer_repeat_question",
+            session_id=session_id,
+            mode=mode,
+            step_index=int(state.get("step_index") or 0),
+            cur_key=(cur.get("key") if cur else None),
+        )
         q_text = cur["question"] if cur else "Choose a shortcut: Build my confidence or Prepare for difficult behaviours."
-        if not stream:
-            return {"text": q_text, "session_id": session_id, "done": False}
-        return iter([q_text]), {"session_id": session_id, "done": False}
+        resp = {"text": q_text, "session_id": session_id, "done": False}
+        return _with_debug(resp, mode=mode, step_index=int(state.get("step_index") or 0), empty_answer=True)
 
     cur = _current_step(mode, state)
 
     # If already finished, return final
     if cur is None:
+        _jlog("final_generate", session_id=session_id, mode=mode)
         info = _retrieve_info_for_coach(mode, "final summary", top_k)
         final_user = _make_final_user_message(mode, state, info, user_name=user_name)
-        resp = openai.chat.completions.create(
+        resp_llm = openai.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT_COACH_FINAL},
@@ -785,12 +815,20 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
             ],
             temperature=0.2,
         )
-        text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
+        text = strip_markdown_chars((resp_llm.choices[0].message.content or "").strip())
         opener = _pick_opener(session_id, user_name, "coach_last_opener")
         text = _rewrite_bad_opening(text, opener)
-        if not stream:
-            return {"text": text, "session_id": session_id, "done": True}
-        return iter([text]), {"session_id": session_id, "done": True}
+        resp = {"text": text, "session_id": session_id, "done": True}
+        return _with_debug(resp, mode=mode, done=True)
+
+    _jlog(
+        "answer_received",
+        session_id=session_id,
+        mode=mode,
+        step_index_before=int(state.get("step_index") or 0),
+        cur_key=cur.get("key"),
+        answer_preview=raw_query[:160],
+    )
 
     # Save answer for CURRENT step, then advance
     cur_key = cur["key"]
@@ -800,11 +838,20 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
 
     nxt = _current_step(mode, state)
 
+    _jlog(
+        "state_advanced",
+        session_id=session_id,
+        mode=mode,
+        step_index_after=int(state.get("step_index") or 0),
+        next_key=(nxt.get("key") if nxt else None),
+    )
+
     # If next is None -> finished => final
     if nxt is None:
+        _jlog("final_generate_after_last_answer", session_id=session_id, mode=mode)
         info = _retrieve_info_for_coach(mode, "final summary", top_k)
         final_user = _make_final_user_message(mode, state, info, user_name=user_name)
-        resp = openai.chat.completions.create(
+        resp_llm = openai.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT_COACH_FINAL},
@@ -812,30 +859,26 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
             ],
             temperature=0.2,
         )
-        text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
+        text = strip_markdown_chars((resp_llm.choices[0].message.content or "").strip())
         opener = _pick_opener(session_id, user_name, "coach_last_opener")
         text = _rewrite_bad_opening(text, opener)
-        if not stream:
-            return {"text": text, "session_id": session_id, "done": True}
-        return iter([text]), {"session_id": session_id, "done": True}
+        resp = {"text": text, "session_id": session_id, "done": True}
+        return _with_debug(resp, mode=mode, done=True)
 
     # Otherwise ask next question deterministically
     text = f"{_reflect_line()} {nxt['question']}".strip()
     opener = _pick_opener(session_id, user_name, "coach_last_opener")
     text = _rewrite_bad_opening(text, opener)
 
-    if not stream:
-        return {"text": text, "session_id": session_id, "done": False}
-    return iter([text]), {"session_id": session_id, "done": False}
-
+    resp = {"text": text, "session_id": session_id, "done": False}
+    return _with_debug(resp, mode=mode, step_index=int(state.get("step_index") or 0), next_key=nxt.get("key"))
 
 # =========================
 # ROUTES
 # =========================
 @app.get("/health")
 def health():
-    return {"ok": True}
-
+    return {"ok": True, "debug": DEBUG}
 
 # =========================
 # CHAT (RAG)
@@ -900,7 +943,6 @@ def chat(payload: Dict = Body(...)):
 
     return {"answer": answer, "session_id": session_id}
 
-
 # =========================
 # COACH ENDPOINTS
 # =========================
@@ -910,11 +952,24 @@ def coach_chat(payload: Dict = Body(...)):
     out = coach_turn_server_state(payload, session_id=session_id, stream=False)
     return JSONResponse(out)
 
-
 @app.post("/coach/sse")
 def coach_sse(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
-    chunks, meta = coach_turn_server_state(payload, session_id=session_id, stream=True)
+
+    # log payload quick
+    if DEBUG:
+        _jlog(
+            "coach_sse_in",
+            session_id=session_id,
+            mode=_safe_str(payload.get("mode")),
+            start_template=_as_bool(payload.get("start_template")),
+            reset=_as_bool(payload.get("reset")),
+            raw_query_preview=_extract_user_text(payload)[:120],
+        )
+
+    # We keep SSE simple: generate full text once, then stream it as one chunk.
+    # (Your previous version streamed already; we keep your event format.)
+    result = coach_turn_server_state(payload, session_id=session_id, stream=False)
 
     def headers():
         return {
@@ -927,18 +982,17 @@ def coach_sse(payload: Dict = Body(...)):
         start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
         yield f"event: start\ndata: {start_payload}\n\n"
 
-        for delta in chunks:
-            data = json.dumps({"text": delta}, ensure_ascii=False)
-            yield f"event: chunk\ndata: {data}\n\n"
+        data = json.dumps({"text": result.get("text", "")}, ensure_ascii=False)
+        yield f"event: chunk\ndata: {data}\n\n"
 
-        done_payload = json.dumps({"done": bool(meta.get("done"))}, ensure_ascii=False)
+        done_payload = json.dumps({"done": bool(result.get("done"))}, ensure_ascii=False)
         yield f"event: done\ndata: {done_payload}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers())
 
-
 @app.post("/coach/reset")
 def coach_reset(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
+    _jlog("coach_reset_endpoint", session_id=session_id)
     _db_delete(session_id)
     return JSONResponse({"ok": True, "session_id": session_id})
