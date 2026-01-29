@@ -113,6 +113,31 @@ def strip_markdown_chars(text: str) -> str:
     )
 
 # =========================
+# SMALL TALK / CASUAL CHAT
+# =========================
+_SMALLTALK_RE = re.compile(
+    r"^\s*(hi|hey|hello|yo|sup|good\s*(morning|afternoon|evening)|"
+    r"привет|привіт|здарова|здраст[вуйте]*|добрий\s*(день|ранок|вечір)|"
+    r"как\s*дела|як\s*справи|що\s*нового|thanks|thank\s*you)\s*[!.?]*\s*$",
+    flags=re.IGNORECASE
+)
+
+def _is_smalltalk(q: str) -> bool:
+    q = (q or "").strip()
+    if not q:
+        return False
+    # greetings / short casual messages
+    if len(q) <= 30 and _SMALLTALK_RE.match(q):
+        return True
+    return False
+
+def _smalltalk_reply(user_name: str) -> str:
+    name = (user_name or "").strip()
+    if name:
+        return f"Hi {name}. How can I help?"
+    return "Hi. How can I help?"
+
+# =========================
 # VARIATION (avoid same opener every time)
 # =========================
 SOFT_OPENERS = [
@@ -250,24 +275,15 @@ def _tokenize(s: str) -> List[str]:
     return toks
 
 def _keyword_query(query: str) -> str:
-    """
-    Build a sparse-ish keyword string (still embedded, but it reduces "generic" embedding drift).
-    """
     toks = _tokenize(query)
-    # keep up to 18 “sharp” tokens
     toks = toks[:18]
     return " ".join(toks)
 
 def _source_id(md: Dict[str, Any]) -> str:
-    """
-    Try to group chunks by source to enforce diversity.
-    Adjust keys if you have different metadata names.
-    """
     for k in ["source", "doc_id", "document_id", "file", "filename", "title"]:
         v = md.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
-    # fallback: use namespace-like chunk id if present
     for k in ["chunk_id", "id"]:
         v = md.get(k)
         if isinstance(v, str) and v.strip():
@@ -275,10 +291,6 @@ def _source_id(md: Dict[str, Any]) -> str:
     return ""
 
 def _merge_dedup_matches(list_of_lists: List[List[Dict]]) -> List[Dict]:
-    """
-    Deduplicate by Pinecone match id (or by text hash fallback).
-    Keep the best (highest score) occurrence.
-    """
     best: Dict[str, Dict] = {}
     for matches in list_of_lists:
         for m in matches or []:
@@ -303,14 +315,6 @@ def _merge_dedup_matches(list_of_lists: List[List[Dict]]) -> List[Dict]:
     return list(best.values())
 
 def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
-    """
-    Stronger rerank:
-    - lexical overlap with query tokens
-    - lexical overlap with hint tokens (if any)
-    - penalty for generic boilerplate
-    - keep pinecone score as weak signal
-    - enforce diversity: cap per source
-    """
     qt = set(_tokenize(query))
     hint = _hint_for_question(query)
     hint_toks = set(_tokenize(hint)) if hint else set()
@@ -331,7 +335,6 @@ def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
         overlap_q = sum(1.0 for t in ttoks if t in qt)
         overlap_hint = sum(1.2 for t in ttoks if t in hint_toks) if hint_toks else 0.0
 
-        # phrase bonus when BOTH query phrase and text contain it
         bonus = 0.0
         for phrase in [
             "balance", "power", "selling", "negotiation",
@@ -351,14 +354,11 @@ def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
         except Exception:
             pscore = 0.0
 
-        # final ranking score
         final = (overlap_q * 1.25) + (overlap_hint * 1.6) + bonus + (pscore * 0.25) - penalty
-
         scored.append((final, m))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    # diversity: cap per source
     out: List[Dict] = []
     per_source: Dict[str, int] = {}
 
@@ -418,17 +418,6 @@ def is_context_relevant(query: str, matches: List[Dict]) -> bool:
     return overlap >= MIN_OVERLAP_SCORE or len(ctx.strip()) >= MIN_CONTEXT_CHARS
 
 def get_matches(query: str, top_k_final: int) -> List[Dict]:
-    """
-    ✅ Better retrieval:
-    - run up to 3 pinecone queries:
-      1) clean question
-      2) question + hint (ONLY if hint exists)
-      3) keyword-only version of the question
-    - merge + dedup
-    - filter by score
-    - rerank (query overlap + hint overlap + generic penalty) + diversity
-    - if irrelevant -> []
-    """
     q_clean = (query or "").strip()
     if not q_clean:
         return []
@@ -437,7 +426,6 @@ def get_matches(query: str, top_k_final: int) -> List[Dict]:
     q_hint = f"{q_clean}\n{hint}".strip() if hint else ""
     q_kw = _keyword_query(q_clean)
 
-    # build the list of queries to run
     queries: List[str] = [q_clean]
     if hint and len(queries) < MULTI_QUERY_K:
         queries.append(q_hint)
@@ -452,7 +440,6 @@ def get_matches(query: str, top_k_final: int) -> List[Dict]:
             res = index.query(vector=vec, top_k=PINECONE_TOPK_RAW, include_metadata=True)
             all_results.append(res.get("matches") or [])
         except Exception:
-            # don't crash the whole request because one query failed
             continue
 
     merged = _merge_dedup_matches(all_results)
@@ -466,7 +453,7 @@ def get_matches(query: str, top_k_final: int) -> List[Dict]:
     return reranked
 
 # =========================
-# BASE (RAG Q&A) PROMPT (FORCE SPECIFICITY)
+# PROMPTS
 # =========================
 SYSTEM_PROMPT_QA = (
     "You are a friendly, helpful assistant.\n"
@@ -484,6 +471,18 @@ SYSTEM_PROMPT_QA = (
     "- Avoid starting with the same phrase every time.\n"
     "- If USER_NAME is provided, you MAY naturally mention it 0–2 times.\n"
     "- If you answered (not the 'can't find' case), end your message with one short question.\n"
+)
+
+# For casual chat that can still use docs if available, but MUST NOT force quotes.
+SYSTEM_PROMPT_CHAT = (
+    "You are a friendly assistant.\n"
+    "If INFORMATION is provided and relevant, you should use it.\n"
+    "If INFORMATION is empty or not relevant, you can still respond normally (do not say you can't find it).\n"
+    "Rules:\n"
+    "- Output plain text only. NO markdown.\n"
+    "- Do NOT mention documents, pages, sources, citations, or the word 'context'.\n"
+    "- Keep it short and natural.\n"
+    "- If USER_NAME is provided, greet/address them naturally.\n"
 )
 
 # =========================
@@ -636,6 +635,13 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
 
     _cleanup_sessions()
 
+    # Small talk bypass for coach too (don’t poison template answers)
+    if _is_smalltalk(query):
+        text = _smalltalk_reply(user_name) + " Choose a shortcut: Build my confidence or Prepare for difficult behaviours."
+        if not stream:
+            return {"text": text, "session_id": session_id, "done": False}
+        return iter([text]), {"session_id": session_id, "done": False}
+
     if reset:
         SESSIONS.pop(session_id, None)
 
@@ -718,14 +724,36 @@ def chat(payload: Dict = Body(...)):
     if not query:
         return JSONResponse({"answer": ""})
 
+    # 1) Small talk: respond normally (optionally still try docs if you want, but not required)
+    if _is_smalltalk(query):
+        return {"answer": _smalltalk_reply(user_name), "session_id": session_id}
+
+    # 2) Retrieval
     matches = get_matches(query, top_k)
+    context = build_context(matches) if matches else ""
 
-    # hard fail fast: if retrieval empty -> don't let model hallucinate
+    # 3) If no matches -> still respond (casual chat), but do NOT hallucinate doc facts
     if not matches:
-        return {"answer": "I can't find this in the provided documents.", "session_id": session_id}
+        user = (
+            f"USER_NAME:\n{user_name}\n\n"
+            f"USER_MESSAGE:\n{query}\n\n"
+            f"INFORMATION:\n"
+        )
+        resp = openai.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT_CHAT},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.3,
+        )
+        answer = strip_markdown_chars((resp.choices[0].message.content or "").strip())
+        if answer:
+            opener = _pick_opener(session_id, user_name, "qa_last_opener")
+            answer = _rewrite_bad_opening(answer, opener)
+        return {"answer": answer, "session_id": session_id}
 
-    context = build_context(matches)
-
+    # 4) If matches exist -> strict doc-grounded QA (with quotes)
     user = (
         f"USER_NAME:\n{user_name}\n\n"
         f"QUESTION:\n{query}\n\n"
@@ -743,7 +771,6 @@ def chat(payload: Dict = Body(...)):
 
     answer = strip_markdown_chars((resp.choices[0].message.content or "").strip())
 
-    # keep the "can't find" exact if model produced it
     if answer.strip() != "I can't find this in the provided documents.":
         opener = _pick_opener(session_id, user_name, "qa_last_opener")
         answer = _rewrite_bad_opening(answer, opener)
@@ -771,28 +798,70 @@ def chat_sse(payload: Dict = Body(...)):
             yield "event: done\ndata: {}\n\n"
         return StreamingResponse(empty_gen(), media_type="text/event-stream", headers=headers())
 
-    matches = get_matches(query, top_k)
-
-    if not matches:
-        def gen_nf():
+    # Small talk in SSE
+    if _is_smalltalk(query):
+        def gen_st():
             start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
             yield f"event: start\ndata: {start_payload}\n\n"
-            data = json.dumps({"text": "I can't find this in the provided documents."}, ensure_ascii=False)
+            data = json.dumps({"text": _smalltalk_reply(user_name)}, ensure_ascii=False)
             yield f"event: chunk\ndata: {data}\n\n"
             yield "event: done\ndata: {}\n\n"
-        return StreamingResponse(gen_nf(), media_type="text/event-stream", headers=headers())
+        return StreamingResponse(gen_st(), media_type="text/event-stream", headers=headers())
 
-    context = build_context(matches)
+    matches = get_matches(query, top_k)
+    context = build_context(matches) if matches else ""
 
-    user = (
-        f"USER_NAME:\n{user_name}\n\n"
-        f"QUESTION:\n{query}\n\n"
-        f"INFORMATION:\n{context}"
-    )
+    # No matches -> normal chat SSE (no "can't find")
+    if not matches:
+        def gen_chat():
+            start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
+            yield f"event: start\ndata: {start_payload}\n\n"
 
+            user = (
+                f"USER_NAME:\n{user_name}\n\n"
+                f"USER_MESSAGE:\n{query}\n\n"
+                f"INFORMATION:\n"
+            )
+
+            stream = openai.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT_CHAT},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.3,
+                stream=True,
+            )
+
+            def raw_deltas():
+                for event in stream:
+                    delta = event.choices[0].delta.content
+                    if delta:
+                        yield strip_markdown_chars(delta)
+
+            for delta in _stream_opening_variation(
+                raw_deltas(),
+                session_id=session_id,
+                user_name=user_name,
+                field="qa_last_opener",
+            ):
+                data = json.dumps({"text": delta}, ensure_ascii=False)
+                yield f"event: chunk\ndata: {data}\n\n"
+
+            yield "event: done\ndata: {}\n\n"
+
+        return StreamingResponse(gen_chat(), media_type="text/event-stream", headers=headers())
+
+    # Matches exist -> strict RAG QA SSE
     def gen():
         start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
         yield f"event: start\ndata: {start_payload}\n\n"
+
+        user = (
+            f"USER_NAME:\n{user_name}\n\n"
+            f"QUESTION:\n{query}\n\n"
+            f"INFORMATION:\n{context}"
+        )
 
         stream = openai.chat.completions.create(
             model=CHAT_MODEL,
