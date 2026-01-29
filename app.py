@@ -514,157 +514,230 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
     },
 }
 
-SYSTEM_PROMPT_COACH = (
-    "You are a professional negotiation coach running a structured guided dialogue.\n"
-    "You must follow the selected TEMPLATE and step-by-step flow.\n"
+# =========================
+# COACH: EXTRA HELPERS (ADD)
+# =========================
+
+_YES_RE = re.compile(r"^\s*(yes|y|yeah|yep|sure|ok|okay|да|ага|ок|добре|звісно)\s*[!.?]*\s*$", re.IGNORECASE)
+
+def _is_yes(s: str) -> bool:
+    return bool(_YES_RE.match((s or "").strip()))
+
+def _resolve_template_from_text(text: str) -> Optional[str]:
+    """
+    If user types the template title or mode key, return mode key.
+    Works regardless of payload.mode.
+    """
+    q = (text or "").strip().lower()
+    if not q:
+        return None
+
+    for mode_key, tpl in TEMPLATES.items():
+        title = (tpl.get("title") or "").strip().lower()
+        if q == title or q == mode_key:
+            return mode_key
+    return None
+
+# =========================
+# COACH: FINAL PROMPT (ADD)
+# =========================
+SYSTEM_PROMPT_COACH_FINAL = (
+    "You are a professional negotiation coach.\n"
+    "The guided dialogue is complete.\n"
+    "Now produce the final output directly (do NOT ask the next question).\n"
     "Rules:\n"
-    "- Keep it interactive: ask ONE clear question or give ONE short instruction at a time.\n"
-    "- If the user answers, briefly reflect it in 1–2 lines, then move to the next step.\n"
-    "- Do NOT lecture. Do NOT dump long explanations.\n"
-    "- NEVER repeat a previous question unless the user explicitly asks you to repeat.\n"
-    "- IMPORTANT: The next question must be EXACTLY the provided 'NEXT QUESTION' line. Ask it verbatim and stop.\n"
-    "- Use the provided INFORMATION only as background support, but NEVER mention documents, pages, sources, citations, or the word 'context'.\n"
     "- Output plain text only. NO markdown.\n"
-    "- Avoid starting with the same phrase every time.\n"
-    "- If USER_NAME is provided, you MAY naturally mention it once.\n"
+    "- Do NOT mention documents, pages, sources, citations, or the word 'context'.\n"
+    "- Use the user's answers to produce a clean practical summary.\n"
+    "- If a TEMPLATE expects a 'cheat sheet', format it as: likely line -> your response -> steer-back phrase.\n"
+    "- Keep it concise but usable.\n"
+    "- If USER_NAME is provided, you may mention it once.\n"
+    "- End with one short optional next step question (e.g. rehearsal?).\n"
 )
 
-def _extract_mode(payload: Dict[str, Any]) -> str:
-    mode = _safe_str(payload.get("mode")) or "build_confidence"
-    if mode not in TEMPLATES:
-        mode = "build_confidence"
-    return mode
-
-def _default_state(mode: str) -> Dict[str, Any]:
-    return {"mode": mode, "step_index": 0, "answers": {}}
-
-def _load_state(session_id: str, mode: str) -> Dict[str, Any]:
-    entry = SESSIONS.get(session_id)
-    if not entry or not isinstance(entry.get("state"), dict):
-        st = _default_state(mode)
-        SESSIONS[session_id] = {"state": st, "updated_at": _now()}
-        return st
-
-    st = entry["state"]
-    if st.get("mode") != mode:
-        st = _default_state(mode)
-        entry["state"] = st
-        entry["updated_at"] = _now()
-        return st
-
-    if "answers" not in st or not isinstance(st["answers"], dict):
-        st["answers"] = {}
-    if "step_index" not in st:
-        st["step_index"] = 0
-    st["mode"] = mode
-    entry["updated_at"] = _now()
-    return st
-
-def _save_state(session_id: str, state: Dict[str, Any]) -> None:
-    entry = _session_entry(session_id)
-    entry["state"] = state
-    entry["updated_at"] = _now()
-
-def _steps(mode: str) -> List[Dict[str, Any]]:
-    return TEMPLATES[mode]["steps"]
-
-def _current_step(mode: str, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    steps = _steps(mode)
-    idx = _clamp_int(state.get("step_index"), 0, 0, len(steps))
-    if idx >= len(steps):
-        return None
-    return steps[idx]
-
-def _advance_with_answer(mode: str, state: Dict[str, Any], user_input: str) -> Dict[str, Any]:
-    steps = _steps(mode)
-    idx = _clamp_int(state.get("step_index"), 0, 0, max(len(steps) - 1, 0))
-
-    if user_input.strip() and steps:
-        key = steps[idx]["key"]
-        state["answers"][key] = user_input.strip()
-
-    state["step_index"] = idx + 1
-    return state
-
-def _retrieve_info_for_coach(mode: str, query: str, top_k: int) -> str:
-    rag_query = f"{mode}: {query}"
-    matches = get_matches(rag_query, top_k)
-    return build_context(matches)
-
-def _make_coach_user_message(mode: str, state: Dict[str, Any], user_input: str, info: str, user_name: str) -> str:
+def _make_final_user_message(mode: str, state: Dict[str, Any], info: str, user_name: str) -> str:
     tpl = TEMPLATES[mode]
     steps = tpl["steps"]
-    idx = _clamp_int(state.get("step_index"), 0, 0, len(steps))
-
-    next_step = steps[idx] if idx < len(steps) else None
-    next_q = next_step["question"] if next_step else "Summarise the plan."
 
     answers_lines = []
-    for i in range(min(idx, len(steps))):
-        k = steps[i]["key"]
-        if k in state["answers"]:
+    for st in steps:
+        k = st["key"]
+        if k in state.get("answers", {}):
             answers_lines.append(f"- {k}: {state['answers'][k]}")
+    answers_block = "\n".join(answers_lines) if answers_lines else "(none)"
 
-    answers_block = "\n".join(answers_lines) if answers_lines else "(none yet)"
     name_line = user_name if user_name else ""
 
     return (
         f"USER_NAME:\n{name_line}\n\n"
-        f"TEMPLATE: {tpl['title']} ({mode})\n"
-        f"STEP_INDEX (0-based): {idx}\n\n"
-        f"LAST USER MESSAGE:\n{user_input.strip()}\n\n"
-        f"ANSWERS SO FAR:\n{answers_block}\n\n"
-        f"NEXT QUESTION (must ask exactly this, then stop):\n{next_q}\n\n"
-        f"INFORMATION (background support):\n{info}\n"
+        f"TEMPLATE: {tpl['title']} ({mode})\n\n"
+        f"ANSWERS:\n{answers_block}\n\n"
+        f"INFORMATION (background support):\n{info}\n\n"
+        f"FINAL TASK:\n"
+        f"- If template is 'Build my confidence': summarise confidence plan in 5–7 short bullet points.\n"
+        f"- If template is 'Prepare for difficult behaviours': create a final cheat sheet.\n"
     )
 
-def _is_template_invocation_text(mode: str, query: str) -> bool:
-    q = (query or "").strip().lower()
-    if not q:
-        return False
-    title = (TEMPLATES[mode]["title"] or "").strip().lower()
-    mode_key = (mode or "").strip().lower()
-    return q == title or q == mode_key
-
+# =========================
+# COACH: REPLACE THIS FUNCTION ENTIRELY
+# =========================
 def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bool = False):
-    mode = _extract_mode(payload)
-    query = _safe_str(payload.get("query")) or _safe_str(payload.get("user_input"))
+    # read inputs
+    raw_query = _safe_str(payload.get("query")) or _safe_str(payload.get("user_input"))
     top_k = _clamp_int(payload.get("top_k"), TOP_K, 1, 30)
     reset = bool(payload.get("reset"))
     user_name = _extract_user_name(payload)
 
     _cleanup_sessions()
 
-    # Small talk bypass for coach too (don’t poison template answers)
-    if _is_smalltalk(query):
+    # small talk bypass for coach
+    if _is_smalltalk(raw_query):
         text = _smalltalk_reply(user_name) + " Choose a shortcut: Build my confidence or Prepare for difficult behaviours."
         if not stream:
             return {"text": text, "session_id": session_id, "done": False}
         return iter([text]), {"session_id": session_id, "done": False}
 
+    # reset requested
     if reset:
         SESSIONS.pop(session_id, None)
 
-    if _is_template_invocation_text(mode, query):
+    # 1) Resolve template from text (works even if payload.mode is missing/wrong)
+    chosen_mode = _resolve_template_from_text(raw_query)
+    if chosen_mode:
+        # user clicked/typed template title -> start fresh in that mode
         SESSIONS.pop(session_id, None)
-        query = ""
+        mode = chosen_mode
+        query = ""  # start template
+    else:
+        # normal flow: use payload.mode or default
+        mode = _extract_mode(payload)
+        query = raw_query
 
+    # load state
     state = _load_state(session_id, mode)
 
+    # If user explicitly invoked the template title for current mode (legacy behaviour)
+    # keep this, but now it's safe because chosen_mode handled the general case above
+    if query and _is_template_invocation_text(mode, query):
+        SESSIONS.pop(session_id, None)
+        state = _load_state(session_id, mode)
+        query = ""
+
+    # build info
     if not query:
         info = _retrieve_info_for_coach(mode, f"template {mode}", top_k)
         user_msg = _make_coach_user_message(mode, state, "", info, user_name=user_name)
+        done = False
     else:
+        # detect current step BEFORE advancing, to handle "yes" on summary step
+        cur = _current_step(mode, state)
+        cur_key = (cur or {}).get("key")
+
+        # advance with answer
         state = _advance_with_answer(mode, state, query)
+
+        # if user said "yes" on summary step -> finish immediately
+        if cur_key == "summary" and _is_yes(query):
+            # mark completed
+            state["step_index"] = len(_steps(mode))
+            _save_state(session_id, state)
+
+            info = _retrieve_info_for_coach(mode, "final summary", top_k)
+            final_user = _make_final_user_message(mode, state, info, user_name=user_name)
+
+            if not stream:
+                resp = openai.chat.completions.create(
+                    model=CHAT_MODEL,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT_COACH_FINAL},
+                        {"role": "user", "content": final_user},
+                    ],
+                    temperature=0.2,
+                )
+                text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
+                opener = _pick_opener(session_id, user_name, "coach_last_opener")
+                text = _rewrite_bad_opening(text, opener)
+                return {"text": text, "session_id": session_id, "done": True}
+
+            def gen_final_chunks():
+                stream_resp = openai.chat.completions.create(
+                    model=CHAT_MODEL,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT_COACH_FINAL},
+                        {"role": "user", "content": final_user},
+                    ],
+                    temperature=0.2,
+                    stream=True,
+                )
+
+                def raw_deltas():
+                    for event in stream_resp:
+                        delta = event.choices[0].delta.content
+                        if delta:
+                            yield strip_markdown_chars(delta)
+
+                yield from _stream_opening_variation(
+                    raw_deltas(),
+                    session_id=session_id,
+                    user_name=user_name,
+                    field="coach_last_opener",
+                )
+
+            return gen_final_chunks(), {"session_id": session_id, "done": True}
+
+        # normal step continuation
         info = _retrieve_info_for_coach(mode, query, top_k)
         user_msg = _make_coach_user_message(mode, state, query, info, user_name=user_name)
-
-    done = _current_step(mode, state) is None
-    if done:
-        user_msg += "\nFINAL INSTRUCTION:\nSummarise the user’s plan in a clean, practical format and offer the next action."
+        done = _current_step(mode, state) is None
 
     _save_state(session_id, state)
 
+    # 2) If steps are done (edge case) -> final summary directly (no "Summarise the plan." question)
+    if done:
+        info = _retrieve_info_for_coach(mode, "final summary", top_k)
+        final_user = _make_final_user_message(mode, state, info, user_name=user_name)
+
+        if not stream:
+            resp = openai.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT_COACH_FINAL},
+                    {"role": "user", "content": final_user},
+                ],
+                temperature=0.2,
+            )
+            text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
+            opener = _pick_opener(session_id, user_name, "coach_last_opener")
+            text = _rewrite_bad_opening(text, opener)
+            return {"text": text, "session_id": session_id, "done": True}
+
+        def gen_done_chunks():
+            stream_resp = openai.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT_COACH_FINAL},
+                    {"role": "user", "content": final_user},
+                ],
+                temperature=0.2,
+                stream=True,
+            )
+
+            def raw_deltas():
+                for event in stream_resp:
+                    delta = event.choices[0].delta.content
+                    if delta:
+                        yield strip_markdown_chars(delta)
+
+            yield from _stream_opening_variation(
+                raw_deltas(),
+                session_id=session_id,
+                user_name=user_name,
+                field="coach_last_opener",
+            )
+
+        return gen_done_chunks(), {"session_id": session_id, "done": True}
+
+    # 3) Normal coach turn (ask next question verbatim and stop)
     if not stream:
         resp = openai.chat.completions.create(
             model=CHAT_MODEL,
@@ -677,7 +750,7 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
         text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
         opener = _pick_opener(session_id, user_name, "coach_last_opener")
         text = _rewrite_bad_opening(text, opener)
-        return {"text": text, "session_id": session_id, "done": done}
+        return {"text": text, "session_id": session_id, "done": False}
 
     def gen_text_chunks():
         stream_resp = openai.chat.completions.create(
@@ -703,7 +776,7 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
             field="coach_last_opener",
         )
 
-    return gen_text_chunks(), {"session_id": session_id, "done": done}
+    return gen_text_chunks(), {"session_id": session_id, "done": False}
 
 # =========================
 # ROUTES
