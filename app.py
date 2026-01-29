@@ -83,7 +83,15 @@ def _get_or_create_session_id(payload: Dict[str, Any]) -> str:
     return sid
 
 def _safe_str(x: Any) -> str:
-    return (x or "").strip() if isinstance(x, str) else ""
+    # Bubble иногда шлёт boolean/number. Не превращаем это в "".
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x.strip()
+    try:
+        return str(x).strip()
+    except Exception:
+        return ""
 
 def _clamp_int(v: Any, default: int, lo: int, hi: int) -> int:
     try:
@@ -97,7 +105,10 @@ def _clamp_int(v: Any, default: int, lo: int, hi: int) -> int:
 # =========================
 def _extract_user_name(payload: Dict[str, Any]) -> str:
     raw = _safe_str(payload.get("user_name")) or _safe_str(payload.get("name"))
-    return raw[:40].strip()
+    raw = raw[:40].strip()
+    if raw.lower() in {"null", "none", "undefined"}:
+        return ""
+    return raw
 
 # =========================
 # TEXT CLEANUP (NO MARKDOWN)
@@ -528,7 +539,6 @@ def _extract_mode(payload: Dict[str, Any], fallback_text: str = "") -> str:
     m = _safe_str(payload.get("mode"))
     if m in TEMPLATES:
         return m
-    # fallback: try to infer from text, but DO NOT auto-reset
     q = _norm_q(fallback_text)
     if "difficult" in q or "behav" in q:
         return "prepare_difficult_behaviours"
@@ -602,13 +612,7 @@ def _make_final_user_message(mode: str, state: Dict[str, Any], info: str, user_n
     )
 
 def _reflect_line() -> str:
-    opts = [
-        "Got it.",
-        "Okay.",
-        "Thanks — noted.",
-        "Understood.",
-        "That helps.",
-    ]
+    opts = ["Got it.", "Okay.", "Thanks — noted.", "Understood.", "That helps."]
     return random.choice(opts)
 
 # =========================
@@ -616,6 +620,10 @@ def _reflect_line() -> str:
 # =========================
 def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bool = False):
     raw_query = _safe_str(payload.get("query")) or _safe_str(payload.get("user_input"))
+    # защита от "false"/"true" строкой (бывает при кривом маппинге в Bubble)
+    if raw_query.lower() in {"false", "true"}:
+        raw_query = ""
+
     top_k = _clamp_int(payload.get("top_k"), TOP_K, 1, 30)
     reset = bool(payload.get("reset"))
     start_template = bool(payload.get("start_template"))
@@ -663,6 +671,7 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
     if cur is None:
         info = _retrieve_info_for_coach(mode, "final summary", top_k)
         final_user = _make_final_user_message(mode, state, info, user_name=user_name)
+
         resp = openai.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
@@ -671,15 +680,14 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
             ],
             temperature=0.2,
         )
+
         text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
         opener = _pick_opener(session_id, user_name, "coach_last_opener")
         text = _rewrite_bad_opening(text, opener)
 
         if not stream:
             return {"text": text, "session_id": session_id, "done": True}
-        return iter([text]), {"session_id": session_id, "done": True
-
-        }
+        return iter([text]), {"session_id": session_id, "done": True}
 
     # Save answer for CURRENT step, then advance
     cur_key = cur["key"]
@@ -702,6 +710,7 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
             ],
             temperature=0.2,
         )
+
         text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
         opener = _pick_opener(session_id, user_name, "coach_last_opener")
         text = _rewrite_bad_opening(text, opener)
