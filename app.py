@@ -536,12 +536,15 @@ def _current_step(mode: str, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
     return steps[idx]
 def _advance_with_answer(mode: str, state: Dict[str, Any], user_input: str) -> Dict[str, Any]:
+    user_input = (user_input or "").strip()
+    if not user_input:  # if empty - do not advance
+        return state
     steps = _steps(mode)
-    idx = _clamp_int(state.get("step_index"), 0, 0, max(len(steps) - 1, 0))
-    if user_input.strip() and steps:
+    idx = _clamp_int(state.get("step_index"), 0, 0, len(steps) - 1)
+    if idx < len(steps):
         key = steps[idx]["key"]
-        state["answers"][key] = user_input.strip()
-    state["step_index"] = idx + 1
+        state["answers"][key] = user_input
+        state["step_index"] = idx + 1
     return state
 def _retrieve_info_for_coach(mode: str, query: str, top_k: int) -> str:
     rag_query = f"{mode}: {query}"
@@ -595,10 +598,15 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
         SESSIONS.pop(session_id, None)
         state = _load_state(session_id, mode)
         query = ""
+    # Force reset to step 0 when starting template
+    if not query.strip():
+        state["step_index"] = 0
+        state["answers"] = {}
+        _save_state(session_id, state)
     # start template (ask first question)
     if not query:
         info = _retrieve_info_for_coach(mode, f"template {mode}", top_k)
-        user_msg = _make_coach_user_message(mode, state, "0", info, user_name=user_name)
+        user_msg = _make_coach_user_message(mode, state, "", info, user_name=user_name)
         done = False
     else:
         cur = _current_step(mode, state)
