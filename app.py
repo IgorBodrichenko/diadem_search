@@ -4,6 +4,7 @@ import uuid
 import time
 import random
 import re
+import sqlite3
 from typing import List, Dict, Any, Optional, Iterator, Tuple
 
 from fastapi import FastAPI, Body
@@ -19,21 +20,19 @@ from pinecone import Pinecone
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 
-TOP_K = int(os.getenv("TOP_K", "10"))  # final chunks passed to LLM
-PINECONE_TOPK_RAW = int(os.getenv("PINECONE_TOPK_RAW", "30"))  # per-query raw candidates
+TOP_K = int(os.getenv("TOP_K", "10"))
+PINECONE_TOPK_RAW = int(os.getenv("PINECONE_TOPK_RAW", "30"))
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "14000"))
 EMBED_DIM = int(os.getenv("EMBED_DIM", "512"))
 
-SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))  # 24h default
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
 
-# Retrieval quality knobs
 MIN_MATCH_SCORE = float(os.getenv("MIN_MATCH_SCORE", "0.35"))
 MIN_CONTEXT_CHARS = int(os.getenv("MIN_CONTEXT_CHARS", "700"))
-MIN_OVERLAP_SCORE = float(os.getenv("MIN_OVERLAP_SCORE", "1.3"))  # if below -> treat as not found
+MIN_OVERLAP_SCORE = float(os.getenv("MIN_OVERLAP_SCORE", "1.3"))
 
-# extra: retrieval diversity
-MULTI_QUERY_K = int(os.getenv("MULTI_QUERY_K", "3"))  # number of pinecone queries to run (max 3 in this impl)
-DIVERSITY_SAME_SOURCE_CAP = int(os.getenv("DIVERSITY_SAME_SOURCE_CAP", "3"))  # max chunks from same source
+MULTI_QUERY_K = int(os.getenv("MULTI_QUERY_K", "3"))
+DIVERSITY_SAME_SOURCE_CAP = int(os.getenv("DIVERSITY_SAME_SOURCE_CAP", "3"))
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
@@ -63,20 +62,74 @@ app.add_middleware(
 )
 
 # =========================
-# SIMPLE SESSION STORE (in-memory)
+# SESSION STORE (SQLite, survives restarts/workers on same host)
 # =========================
-SESSIONS: Dict[str, Dict[str, Any]] = {}
+SESSION_DB_PATH = os.getenv("SESSION_DB_PATH", "sessions.sqlite3")
+_DB: Optional[sqlite3.Connection] = None
+
+
+def _db() -> sqlite3.Connection:
+    global _DB
+    if _DB is None:
+        _DB = sqlite3.connect(SESSION_DB_PATH, check_same_thread=False)
+        _DB.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+              session_id TEXT PRIMARY KEY,
+              updated_at INTEGER NOT NULL,
+              entry_json TEXT NOT NULL
+            )
+            """
+        )
+        _DB.commit()
+    return _DB
 
 
 def _now() -> int:
     return int(time.time())
 
 
-def _cleanup_sessions():
+def _db_get(session_id: str) -> Optional[Dict[str, Any]]:
+    if not session_id:
+        return None
+    row = _db().execute(
+        "SELECT entry_json FROM sessions WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return None
+
+
+def _db_set(session_id: str, entry: Dict[str, Any]) -> None:
+    entry = entry or {}
+    entry["updated_at"] = _now()
+    payload = json.dumps(entry, ensure_ascii=False)
+    _db().execute(
+        """
+        INSERT INTO sessions(session_id, updated_at, entry_json)
+        VALUES(?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+          updated_at=excluded.updated_at,
+          entry_json=excluded.entry_json
+        """,
+        (session_id, int(entry["updated_at"]), payload),
+    )
+    _db().commit()
+
+
+def _db_delete(session_id: str) -> None:
+    _db().execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+    _db().commit()
+
+
+def _cleanup_sessions() -> None:
     cutoff = _now() - SESSION_TTL_SECONDS
-    for sid, entry in list(SESSIONS.items()):
-        if int(entry.get("updated_at", 0)) < cutoff:
-            SESSIONS.pop(sid, None)
+    _db().execute("DELETE FROM sessions WHERE updated_at < ?", (cutoff,))
+    _db().commit()
 
 
 def _get_or_create_session_id(payload: Dict[str, Any]) -> str:
@@ -87,7 +140,6 @@ def _get_or_create_session_id(payload: Dict[str, Any]) -> str:
 
 
 def _safe_str(x: Any) -> str:
-    # Bubble иногда шлёт boolean/number. Не превращаем это в "".
     if x is None:
         return ""
     if isinstance(x, str):
@@ -99,7 +151,6 @@ def _safe_str(x: Any) -> str:
 
 
 def _as_bool(v: Any) -> bool:
-    # Bubble часто шлёт "false"/"true" строкой -> bool("false")==True (это и ломает флоу)
     if isinstance(v, bool):
         return v
     if v is None:
@@ -135,6 +186,22 @@ def _extract_user_name(payload: Dict[str, Any]) -> str:
 
 
 # =========================
+# USER TEXT (IMPORTANT FIX)
+# =========================
+_FALSEY_STRS = {"false", "true", "null", "none", "undefined", ""}
+
+
+def _extract_user_text(payload: Dict[str, Any]) -> str:
+    # Bubble sometimes sends query=false while real text is in another field.
+    for key in ("query", "user_input", "text", "message", "input", "answer", "content"):
+        v = payload.get(key)
+        s = _safe_str(v)
+        if s and s.lower() not in _FALSEY_STRS:
+            return s
+    return ""
+
+
+# =========================
 # TEXT CLEANUP (NO MARKDOWN)
 # =========================
 def strip_markdown_chars(text: str) -> str:
@@ -144,7 +211,7 @@ def strip_markdown_chars(text: str) -> str:
 
 
 # =========================
-# SMALL TALK / CASUAL CHAT
+# SMALL TALK
 # =========================
 _SMALLTALK_RE = re.compile(
     r"^\s*(hi|hey|hello|yo|sup|good\s*(morning|afternoon|evening)|"
@@ -156,11 +223,7 @@ _SMALLTALK_RE = re.compile(
 
 def _is_smalltalk(q: str) -> bool:
     q = (q or "").strip()
-    if not q:
-        return False
-    if len(q) <= 30 and _SMALLTALK_RE.match(q):
-        return True
-    return False
+    return bool(q and len(q) <= 30 and _SMALLTALK_RE.match(q))
 
 
 def _smalltalk_reply(user_name: str) -> str:
@@ -171,7 +234,7 @@ def _smalltalk_reply(user_name: str) -> str:
 
 
 # =========================
-# VARIATION (avoid same opener every time)
+# VARIATION
 # =========================
 SOFT_OPENERS = [
     "Glad you’re thinking about this ahead of time.",
@@ -188,11 +251,11 @@ _BAD_START_RE = re.compile(r"^\s*(it['’]s\s+(great|wonderful)|great)\b", flags
 
 
 def _session_entry(session_id: str) -> Dict[str, Any]:
-    entry = SESSIONS.get(session_id)
+    entry = _db_get(session_id)
     if not isinstance(entry, dict):
         entry = {}
-        SESSIONS[session_id] = entry
     entry["updated_at"] = _now()
+    _db_set(session_id, entry)
     return entry
 
 
@@ -204,14 +267,13 @@ def _pick_opener(session_id: str, user_name: str, field: str) -> str:
     if user_name and random.random() < 0.55:
         opener = f"{opener} {user_name}."
     entry[field] = opener
+    _db_set(session_id, entry)
     return opener
 
 
 def _rewrite_bad_opening(full_text: str, opener: str) -> str:
     t = (full_text or "").strip()
-    if not t:
-        return ""
-    if not _BAD_START_RE.match(t):
+    if not t or not _BAD_START_RE.match(t):
         return t
     m = re.search(r"[.!?]\s+", t)
     if m:
@@ -243,7 +305,7 @@ def _stream_opening_variation(
 
 
 # =========================
-# SEARCH HINTS (Most common questions)
+# SEARCH HINTS
 # =========================
 def _norm_q(s: str) -> str:
     s = (s or "").strip().lower()
@@ -319,8 +381,7 @@ def _tokenize(s: str) -> List[str]:
 
 
 def _keyword_query(query: str) -> str:
-    toks = _tokenize(query)
-    toks = toks[:18]
+    toks = _tokenize(query)[:18]
     return " ".join(toks)
 
 
@@ -432,14 +493,10 @@ def build_context(matches: List[Dict]) -> str:
         if not text:
             continue
 
-        snippet = text
-        if len(snippet) > 2500:
-            snippet = snippet[:2500] + "…"
-
+        snippet = text[:2500] + "…" if len(text) > 2500 else text
         block = snippet + "\n"
         if total + len(block) > MAX_CONTEXT_CHARS:
             break
-
         parts.append(block)
         total += len(block)
 
@@ -449,7 +506,6 @@ def build_context(matches: List[Dict]) -> str:
 def is_context_relevant(query: str, matches: List[Dict]) -> bool:
     if not matches:
         return False
-
     top = matches[0]
     text = ((top.get("metadata") or {}).get("text") or "").strip()
     if not text:
@@ -482,7 +538,6 @@ def get_matches(query: str, top_k_final: int) -> List[Dict]:
         queries.append(q_kw)
 
     all_results: List[List[Dict]] = []
-
     for q in queries:
         try:
             vec = embed_query(q)
@@ -493,7 +548,6 @@ def get_matches(query: str, top_k_final: int) -> List[Dict]:
 
     merged = _merge_dedup_matches(all_results)
     merged = _filter_matches_by_score(merged)
-
     reranked = _rerank(q_clean, merged, top_k_final)
 
     if not is_context_relevant(q_clean, reranked):
@@ -510,7 +564,7 @@ SYSTEM_PROMPT_QA = (
     "You must answer ONLY using the provided INFORMATION.\n\n"
     "Hard rules:\n"
     "- Do NOT mention document names, page numbers, sources, citations, or the word 'context'.\n"
-    "- Output plain text only. NO markdown. Do not use *, **, _, `, #, or markdown lists.\n"
+    "- Output plain text only. NO markdown.\n"
     "- Do NOT add general negotiation advice that is not explicitly supported by INFORMATION.\n"
     "- Your answer MUST include 2–4 short direct quotes from INFORMATION in double quotes (each quote 3–12 words).\n"
     "- If you cannot include those quotes because INFORMATION is missing or generic/not about the question, say exactly:\n"
@@ -526,7 +580,7 @@ SYSTEM_PROMPT_QA = (
 SYSTEM_PROMPT_CHAT = (
     "You are a friendly assistant.\n"
     "If INFORMATION is provided and relevant, you should use it.\n"
-    "If INFORMATION is empty or not relevant, you can still respond normally (do not say you can't find it).\n"
+    "If INFORMATION is empty or not relevant, you can still respond normally.\n"
     "Rules:\n"
     "- Output plain text only. NO markdown.\n"
     "- Do NOT mention documents, pages, sources, citations, or the word 'context'.\n"
@@ -545,7 +599,7 @@ SYSTEM_PROMPT_COACH_FINAL = (
     "- If a TEMPLATE expects a 'cheat sheet', format it as: likely line -> your response -> steer-back phrase.\n"
     "- Keep it concise but usable.\n"
     "- If USER_NAME is provided, you may mention it once.\n"
-    "- End with one short optional next step question (e.g. rehearsal?).\n"
+    "- End with one short optional next step question.\n"
 )
 
 # =========================
@@ -577,12 +631,6 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
     },
 }
 
-_YES_RE = re.compile(r"^\s*(yes|y|yeah|yep|sure|ok|okay|да|ага|ок|добре|звісно)\s*[!.?]*\s*$", re.IGNORECASE)
-
-
-def _is_yes(s: str) -> bool:
-    return bool(_YES_RE.match((s or "").strip()))
-
 
 def _extract_mode(payload: Dict[str, Any], fallback_text: str = "") -> str:
     m = _safe_str(payload.get("mode"))
@@ -601,30 +649,36 @@ def _default_state(mode: str) -> Dict[str, Any]:
 
 
 def _load_state(session_id: str, mode: str) -> Tuple[Dict[str, Any], bool]:
-    entry = SESSIONS.get(session_id)
-    if not entry or not isinstance(entry.get("state"), dict):
+    entry = _db_get(session_id) or {}
+    st = entry.get("state")
+
+    if not isinstance(st, dict):
         st = _default_state(mode)
-        SESSIONS[session_id] = {"state": st, "updated_at": _now()}
+        entry["state"] = st
+        _db_set(session_id, entry)
         return st, False
-    st = entry["state"]
+
     if st.get("mode") != mode:
         st = _default_state(mode)
         entry["state"] = st
-        entry["updated_at"] = _now()
+        _db_set(session_id, entry)
         return st, True
+
     if "answers" not in st or not isinstance(st["answers"], dict):
         st["answers"] = {}
     if "step_index" not in st:
         st["step_index"] = 0
     st["mode"] = mode
-    entry["updated_at"] = _now()
+
+    entry["state"] = st
+    _db_set(session_id, entry)
     return st, True
 
 
 def _save_state(session_id: str, state: Dict[str, Any]) -> None:
-    entry = _session_entry(session_id)
+    entry = _db_get(session_id) or {}
     entry["state"] = state
-    entry["updated_at"] = _now()
+    _db_set(session_id, entry)
 
 
 def _steps(mode: str) -> List[Dict[str, Any]]:
@@ -669,18 +723,14 @@ def _make_final_user_message(mode: str, state: Dict[str, Any], info: str, user_n
 
 
 def _reflect_line() -> str:
-    opts = ["Got it.", "Okay.", "Thanks — noted.", "Understood.", "That helps."]
-    return random.choice(opts)
+    return random.choice(["Got it.", "Okay.", "Thanks — noted.", "Understood.", "That helps."])
 
 
 # =========================
-# COACH CORE (DETERMINISTIC QUESTIONS)
+# COACH CORE
 # =========================
 def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bool = False):
-    raw_query = _safe_str(payload.get("query")) or _safe_str(payload.get("user_input"))
-    # защита от "false"/"true" строкой (бывает при кривом маппинге в Bubble)
-    if raw_query.lower() in {"false", "true", "null", "none", "undefined"}:
-        raw_query = ""
+    raw_query = _extract_user_text(payload)
 
     top_k = _clamp_int(payload.get("top_k"), TOP_K, 1, 30)
     reset = _as_bool(payload.get("reset"))
@@ -690,7 +740,7 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
     _cleanup_sessions()
 
     if reset:
-        SESSIONS.pop(session_id, None)
+        _db_delete(session_id)
 
     if _is_smalltalk(raw_query):
         text = _smalltalk_reply(user_name) + " Choose a shortcut: Build my confidence or Prepare for difficult behaviours."
@@ -705,12 +755,10 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
     if start_template or (not existed):
         state = _default_state(mode)
         _save_state(session_id, state)
-
         first = _current_step(mode, state)
         q_text = first["question"] if first else "Choose a shortcut: Build my confidence or Prepare for difficult behaviours."
         opener = _pick_opener(session_id, user_name, "coach_last_opener")
         text = f"{opener} {q_text}".strip()
-
         if not stream:
             return {"text": text, "session_id": session_id, "done": False}
         return iter([text]), {"session_id": session_id, "done": False}
@@ -729,7 +777,6 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
     if cur is None:
         info = _retrieve_info_for_coach(mode, "final summary", top_k)
         final_user = _make_final_user_message(mode, state, info, user_name=user_name)
-
         resp = openai.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
@@ -738,11 +785,9 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
             ],
             temperature=0.2,
         )
-
         text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
         opener = _pick_opener(session_id, user_name, "coach_last_opener")
         text = _rewrite_bad_opening(text, opener)
-
         if not stream:
             return {"text": text, "session_id": session_id, "done": True}
         return iter([text]), {"session_id": session_id, "done": True}
@@ -759,7 +804,6 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
     if nxt is None:
         info = _retrieve_info_for_coach(mode, "final summary", top_k)
         final_user = _make_final_user_message(mode, state, info, user_name=user_name)
-
         resp = openai.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
@@ -768,11 +812,9 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
             ],
             temperature=0.2,
         )
-
         text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
         opener = _pick_opener(session_id, user_name, "coach_last_opener")
         text = _rewrite_bad_opening(text, opener)
-
         if not stream:
             return {"text": text, "session_id": session_id, "done": True}
         return iter([text]), {"session_id": session_id, "done": True}
@@ -852,128 +894,11 @@ def chat(payload: Dict = Body(...)):
     )
 
     answer = strip_markdown_chars((resp.choices[0].message.content or "").strip())
-
     if answer.strip() != "I can't find this in the provided documents.":
         opener = _pick_opener(session_id, user_name, "qa_last_opener")
         answer = _rewrite_bad_opening(answer, opener)
 
     return {"answer": answer, "session_id": session_id}
-
-
-# =========================
-# CHAT SSE
-# =========================
-@app.post("/chat/sse")
-def chat_sse(payload: Dict = Body(...)):
-    query = (payload.get("query") or "").strip()
-    top_k = int(payload.get("top_k") or TOP_K)
-    user_name = _extract_user_name(payload)
-
-    session_id = _get_or_create_session_id(payload)
-    _cleanup_sessions()
-
-    def headers():
-        return {
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        }
-
-    if not query:
-        def empty_gen():
-            yield "event: done\ndata: {}\n\n"
-        return StreamingResponse(empty_gen(), media_type="text/event-stream", headers=headers())
-
-    if _is_smalltalk(query):
-        def gen_st():
-            start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
-            yield f"event: start\ndata: {start_payload}\n\n"
-            data = json.dumps({"text": _smalltalk_reply(user_name)}, ensure_ascii=False)
-            yield f"event: chunk\ndata: {data}\n\n"
-            yield "event: done\ndata: {}\n\n"
-        return StreamingResponse(gen_st(), media_type="text/event-stream", headers=headers())
-
-    matches = get_matches(query, top_k)
-    context = build_context(matches) if matches else ""
-
-    if not matches:
-        def gen_chat():
-            start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
-            yield f"event: start\ndata: {start_payload}\n\n"
-
-            user = (
-                f"USER_NAME:\n{user_name}\n\n"
-                f"USER_MESSAGE:\n{query}\n\n"
-                f"INFORMATION:\n"
-            )
-
-            stream = openai.chat.completions.create(
-                model=CHAT_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT_CHAT},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0.3,
-                stream=True,
-            )
-
-            def raw_deltas():
-                for event in stream:
-                    delta = event.choices[0].delta.content
-                    if delta:
-                        yield strip_markdown_chars(delta)
-
-            for delta in _stream_opening_variation(
-                raw_deltas(),
-                session_id=session_id,
-                user_name=user_name,
-                field="qa_last_opener",
-            ):
-                data = json.dumps({"text": delta}, ensure_ascii=False)
-                yield f"event: chunk\ndata: {data}\n\n"
-
-            yield "event: done\ndata: {}\n\n"
-
-        return StreamingResponse(gen_chat(), media_type="text/event-stream", headers=headers())
-
-    def gen():
-        start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
-        yield f"event: start\ndata: {start_payload}\n\n"
-
-        user = (
-            f"USER_NAME:\n{user_name}\n\n"
-            f"QUESTION:\n{query}\n\n"
-            f"INFORMATION:\n{context}"
-        )
-
-        stream = openai.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT_QA},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.2,
-            stream=True,
-        )
-
-        def raw_deltas():
-            for event in stream:
-                delta = event.choices[0].delta.content
-                if delta:
-                    yield strip_markdown_chars(delta)
-
-        for delta in _stream_opening_variation(
-            raw_deltas(),
-            session_id=session_id,
-            user_name=user_name,
-            field="qa_last_opener",
-        ):
-            data = json.dumps({"text": delta}, ensure_ascii=False)
-            yield f"event: chunk\ndata: {data}\n\n"
-
-        yield "event: done\ndata: {}\n\n"
-
-    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers())
 
 
 # =========================
@@ -1015,5 +940,5 @@ def coach_sse(payload: Dict = Body(...)):
 @app.post("/coach/reset")
 def coach_reset(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
-    SESSIONS.pop(session_id, None)
+    _db_delete(session_id)
     return JSONResponse({"ok": True, "session_id": session_id})
