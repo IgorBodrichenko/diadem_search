@@ -598,7 +598,7 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
     # start template (ask first question)
     if not query:
         info = _retrieve_info_for_coach(mode, f"template {mode}", top_k)
-        user_msg = _make_coach_user_message(mode, state, "", info, user_name=user_name)
+        user_msg = _make_coach_user_message(mode, state, "0", info, user_name=user_name)
         done = False
     else:
         cur = _current_step(mode, state)
