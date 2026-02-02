@@ -679,7 +679,7 @@ SYSTEM_PROMPT_QA = (
     "- If you answered (not the 'can't find' case), end your message with one short question.\n"
 )
 
-# Chat must refuse non-doc questions (e.g., apple pie).
+# Strict doc-only chat (no apple pie)
 SYSTEM_PROMPT_CHAT = (
     "You are a focused assistant specialised only in the provided materials.\n"
     "You may answer ONLY if INFORMATION is provided and clearly relevant to the user's question.\n"
@@ -697,7 +697,7 @@ SYSTEM_PROMPT_CHAT = (
     + LIMITS_POLICY
 )
 
-# Final output must be AI-written (not pasted user text) + no technical/template field names.
+# Final output must be AI-written (not pasted) and no technical keys
 SYSTEM_PROMPT_COACH_FINAL = (
     "You are a professional negotiation coach.\n"
     "The guided dialogue is complete.\n"
@@ -705,19 +705,15 @@ SYSTEM_PROMPT_COACH_FINAL = (
     "\nRules:\n"
     "- Output plain text only. NO markdown.\n"
     "- Do NOT mention documents, pages, sources, citations, or the word 'context'.\n"
-    "- Do NOT show template field keys or technical labels (no 'scenario:', no 'anticipate_tactics', no 'purpose').\n"
+    "- Do NOT show template field keys or technical labels (no 'scenario:', no 'anticipate_tactics', etc.).\n"
     "- Do NOT copy/paste the user's wording verbatim; rephrase into confident, natural negotiation language.\n"
     "- Preserve intent, but improve clarity, tone, and authority.\n"
-    "- Write as if the user could read this out loud in a real conversation.\n"
     "\nOutput format:\n"
-    "- If template is 'Build my confidence': 5–7 short bullet points the user can read right before the call.\n"
+    "- If template is 'Build my confidence': 5–7 short bullet points.\n"
     "- If template is 'Prepare for difficult behaviours': output exactly 3 parts:\n"
-    "  1) One short scenario line (rephrased).\n"
-    "  2) One cheat sheet line in the format:\n"
-    "     likely line -> your response -> steer-back phrase.\n"
+    "  1) One short scenario line.\n"
+    "  2) One cheat sheet line: likely line -> your response -> steer-back phrase.\n"
     "  3) Optional: one short line describing their intent.\n"
-    "- Keep it concise but usable.\n"
-    "- If USER_NAME is provided, you may mention it once.\n"
     "- End with one short optional next step question.\n"
     + VARIABLES_POLICY
     + TEMPLATE_FIRST_POLICY
@@ -728,8 +724,6 @@ SYSTEM_PROMPT_COACH_FINAL = (
 # =========================
 # COACH / TEMPLATE ENGINE
 # =========================
-
-# NEW: confirmation cadence (max once per 3 answers, plus one final confirm)
 CONFIRM_EVERY_N = int(os.getenv("CONFIRM_EVERY_N", "3"))
 
 TEMPLATES: Dict[str, Dict[str, Any]] = {
@@ -741,7 +735,7 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
             {"key": "relationship", "question": "About the relationship: what do you know about the other person’s priorities or pressures?"},
             {"key": "myself", "question": "About you: what strengths or skills do you bring that will help you handle this well?"},
             {"key": "why_confident", "question": "Great. Now list 3–5 reasons you should feel confident going into this."},
-            # Keep as the last step: user says yes -> then we do ONE final confirm -> then generate.
+            # summary = единственное финальное подтверждение
             {"key": "summary", "question": "Want me to pull this together into a short confidence plan you can read right before the call?"},
         ],
     },
@@ -753,7 +747,7 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
             {"key": "purpose", "question": "What do you think their purpose is with that move—pressure, delay, anchoring, saving face, something else?"},
             {"key": "response_bullet", "question": "Let’s craft your response. What’s the one key point you must hold your ground on? (One sentence)"},
             {"key": "move_on_air", "question": "Now write a short linking phrase to steer back on track (e.g., “That’s helpful—so to move this forward…”). What’s your version?"},
-            # Single “table/cheat sheet” ask. No second “ready to generate” inside templates.
+            # summary = единственное финальное подтверждение
             {"key": "summary", "question": "Want me to pull this together into a clear final cheat sheet?"},
         ],
     },
@@ -767,18 +761,6 @@ _YES_RE = re.compile(r"^\s*(yes|y|ok|okay|confirm|confirmed|sure|да|ок|уг�
 _NO_RE = re.compile(r"^\s*(no|n|nope|cancel|stop|нет|не)\s*[!.?]*\s*$", flags=re.IGNORECASE)
 
 
-def _extract_mode(payload: Dict[str, Any], fallback_text: str = "") -> str:
-    m = _safe_str(payload.get("mode"))
-    if m in TEMPLATES:
-        return m
-    q = _norm_q(fallback_text)
-    if "difficult" in q or "behav" in q:
-        return "prepare_difficult_behaviours"
-    if "confidence" in q:
-        return "build_confidence"
-    return "build_confidence"
-
-
 def _default_state(mode: str) -> Dict[str, Any]:
     return {
         "mode": mode,
@@ -786,173 +768,16 @@ def _default_state(mode: str) -> Dict[str, Any]:
         "answers": {},
         "active_section": "",
         "variables": {},
-        # batch confirmations (checkpoint + final)
+        # checkpoint confirmations only (no final confirmation state anymore)
         "awaiting_confirm": False,
-        "pending_action": None,         # "checkpoint" | "final"
-        "pending_checkpoint_upto": 0,   # step_index at time of checkpoint confirm
+        "pending_action": None,        # "checkpoint" only
+        "pending_checkpoint_upto": 0,
         "template_done": False,
         "clarify_count": 0,
     }
 
 
-def _load_state(session_id: str, mode: str) -> Tuple[Dict[str, Any], bool]:
-    entry = _db_get(session_id) or {}
-    st = entry.get("state")
-
-    if not isinstance(st, dict):
-        st = _default_state(mode)
-        entry["state"] = st
-        _db_set(session_id, entry)
-        return st, False
-
-    if st.get("mode") != mode:
-        st = _default_state(mode)
-        entry["state"] = st
-        _db_set(session_id, entry)
-        return st, True
-
-    if "answers" not in st or not isinstance(st["answers"], dict):
-        st["answers"] = {}
-    if "step_index" not in st:
-        st["step_index"] = 0
-    if "variables" not in st or not isinstance(st["variables"], dict):
-        st["variables"] = {}
-    if "active_section" not in st:
-        st["active_section"] = ""
-    if "awaiting_confirm" not in st:
-        st["awaiting_confirm"] = False
-    if "pending_action" not in st:
-        st["pending_action"] = None
-    if "pending_checkpoint_upto" not in st:
-        st["pending_checkpoint_upto"] = 0
-    if "template_done" not in st:
-        st["template_done"] = False
-    if "clarify_count" not in st:
-        st["clarify_count"] = 0
-
-    st["mode"] = mode
-    entry["state"] = st
-    _db_set(session_id, entry)
-    return st, True
-
-
-def _save_state(session_id: str, state: Dict[str, Any]) -> None:
-    entry = _db_get(session_id) or {}
-    entry["state"] = state
-    _db_set(session_id, entry)
-
-
-def _steps(mode: str) -> List[Dict[str, Any]]:
-    return TEMPLATES[mode]["steps"]
-
-
-def _key_to_index(mode: str) -> Dict[str, int]:
-    out = {}
-    for i, st in enumerate(_steps(mode)):
-        out[st["key"]] = i
-    return out
-
-
-def _current_step(mode: str, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    steps = _steps(mode)
-    idx = int(state.get("step_index") or 0)
-    if idx < 0:
-        idx = 0
-    if idx >= len(steps):
-        return None
-    return steps[idx]
-
-
-def _retrieve_info_for_coach(mode: str, query: str, top_k: int) -> str:
-    rag_query = f"{mode}: {query}"
-    matches = get_matches(rag_query, top_k)
-    return build_context(matches)
-
-
-def _make_final_user_message(mode: str, state: Dict[str, Any], info: str, user_name: str) -> str:
-    tpl = TEMPLATES[mode]
-    steps = tpl["steps"]
-    answers_lines = []
-    for st in steps:
-        k = st["key"]
-        if k in state.get("answers", {}):
-            answers_lines.append(f"- {k}: {state['answers'][k]}")
-    answers_block = "\n".join(answers_lines) if answers_lines else "(none)"
-    name_line = user_name if user_name else ""
-
-    active_section = _safe_str(state.get("active_section"))
-    vars_for_section = state.get("variables", {}).get(active_section, [])
-    vars_lines = []
-    for v in vars_for_section[:20]:
-        try:
-            vars_lines.append(
-                f"- {v.get('name','')}: low={v.get('low','')}, high={v.get('high','')}, ideal={v.get('ideal','')}, notes={v.get('notes','')}"
-            )
-        except Exception:
-            continue
-    vars_block = "\n".join(vars_lines) if vars_lines else "(none)"
-
-    return (
-        f"USER_NAME:\n{name_line}\n\n"
-        f"TEMPLATE: {tpl['title']} ({mode})\n\n"
-        f"ACTIVE_SECTION:\n{active_section}\n\n"
-        f"SECTION_VARIABLES:\n{vars_block}\n\n"
-        f"ANSWERS:\n{answers_block}\n\n"
-        f"INFORMATION (background support):\n{info}\n\n"
-        f"FINAL TASK:\n"
-        f"- Produce the final output following the system rules.\n"
-        f"- Rephrase: do not copy the user's wording verbatim.\n"
-        f"- Do not output internal field keys or technical labels.\n"
-    )
-
-
-def _reflect_line() -> str:
-    return random.choice(["Got it.", "Okay.", "Thanks — noted.", "Understood.", "That helps."])
-
-
-def _parse_yes_no(text: str) -> Optional[bool]:
-    t = (text or "").strip()
-    if not t:
-        return None
-    if _YES_RE.match(t):
-        return True
-    if _NO_RE.match(t):
-        return False
-    return None
-
-
-def _active_section_from_payload(payload: Dict[str, Any]) -> str:
-    for k in ("active_section", "active_field", "active_step", "field_key", "section_key"):
-        s = _safe_str(payload.get(k))
-        if s:
-            return s
-    return ""
-
-
-def _set_active_section(mode: str, state: Dict[str, Any], active_section: str) -> bool:
-    active_section = (active_section or "").strip()
-    prev = _safe_str(state.get("active_section"))
-    if not active_section:
-        return False
-    if active_section == prev:
-        return False
-
-    k2i = _key_to_index(mode)
-    if active_section in k2i:
-        state["step_index"] = k2i[active_section]
-
-    state["active_section"] = active_section
-
-    # field focus change -> clear confirmations + clarify counter
-    state["awaiting_confirm"] = False
-    state["pending_action"] = None
-    state["pending_checkpoint_upto"] = 0
-    state["clarify_count"] = 0
-    return True
-
-
 def _should_checkpoint_confirm(mode: str, state: Dict[str, Any]) -> bool:
-    # confirm after every N answers, not at the end, and never if already awaiting confirm
     if state.get("awaiting_confirm"):
         return False
     n = max(2, int(CONFIRM_EVERY_N or 3))
@@ -962,23 +787,41 @@ def _should_checkpoint_confirm(mode: str, state: Dict[str, Any]) -> bool:
         return False
     if step_index >= steps_len:
         return False
+    # НЕ делаем checkpoint прямо перед финалом, чтобы не мешать summary
+    next_step = _current_step(mode, state)
+    if next_step and next_step.get("key") == "summary":
+        return False
     return (step_index % n) == 0
 
 
-def _checkpoint_prompt(mode: str, state: Dict[str, Any]) -> str:
-    # Human prompt: no technical keys, no "Reply Yes or No."
+def _checkpoint_prompt() -> str:
+    # Без технички
     return "Does this feel right to lock in before we move on?"
 
 
-def _final_confirm_prompt(mode: str) -> str:
-    # Human prompt: no technical keys, no "Reply Yes or No."
-    if mode == "prepare_difficult_behaviours":
-        return "Do you want me to generate the final cheat sheet now?"
-    return "Do you want me to generate the final summary now?"
+def _generate_final(mode: str, state: Dict[str, Any], top_k: int, user_name: str, session_id: str) -> Dict[str, Any]:
+    _jlog("final_generate", session_id=session_id, mode=mode)
+    info = _retrieve_info_for_coach(mode, "final summary", top_k)
+    final_user = _make_final_user_message(mode, state, info, user_name=user_name)
+    resp_llm = openai.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT_COACH_FINAL},
+            {"role": "user", "content": final_user},
+        ],
+        temperature=0.2,
+    )
+    text = strip_markdown_chars((resp_llm.choices[0].message.content or "").strip())
+    opener = _pick_opener(session_id, user_name, "coach_last_opener")
+    text = _rewrite_bad_opening(text, opener)
+
+    state["template_done"] = True
+    _save_state(session_id, state)
+    return {"text": text, "session_id": session_id, "done": True}
 
 
 # =========================
-# COACH CORE (batch confirm)
+# COACH CORE (single final confirm via summary)
 # =========================
 def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bool = False):
     raw_query = _extract_user_text(payload)
@@ -988,226 +831,129 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
     start_template = _as_bool(payload.get("start_template"))
     user_name = _extract_user_name(payload)
 
-    # UI flags (still supported, but not required)
     confirm_write = _as_bool(payload.get("confirm_write")) or _as_bool(payload.get("write_confirmed"))
     auto_confirm = _as_bool(payload.get("auto_confirm"))
     active_section = _active_section_from_payload(payload)
 
-    _jlog(
-        "coach_in",
-        session_id=session_id,
-        stream=bool(stream),
-        mode=_safe_str(payload.get("mode")),
-        start_template=start_template,
-        reset=reset,
-        confirm_write=confirm_write,
-        auto_confirm=auto_confirm,
-        active_section=active_section,
-        raw_query_len=len(raw_query or ""),
-        raw_query_preview=(raw_query or "")[:160],
-        payload_keys=sorted(list(payload.keys()))[:60],
-    )
-
     _cleanup_sessions()
 
     if reset:
-        _jlog("coach_reset", session_id=session_id)
         _db_delete(session_id)
 
     if _is_smalltalk(raw_query):
         text = _smalltalk_reply(user_name) + " Choose a shortcut: Build my confidence or Prepare for difficult behaviours."
-        resp = {"text": text, "session_id": session_id, "done": False}
-        return _with_debug(resp, case="smalltalk")
+        return _with_debug({"text": text, "session_id": session_id, "done": False}, case="smalltalk")
 
-    # Start again command
     if raw_query and _START_AGAIN_RE.match(raw_query):
-        _jlog("coach_start_again", session_id=session_id)
         mode = _extract_mode(payload, fallback_text=raw_query)
         st = _default_state(mode)
         _save_state(session_id, st)
         first = _current_step(mode, st)
         q_text = first["question"] if first else "Choose a shortcut: Build my confidence or Prepare for difficult behaviours."
         opener = _pick_opener(session_id, user_name, "coach_last_opener")
-        text = f"{opener} {q_text}".strip()
-        resp = {"text": text, "session_id": session_id, "done": False}
-        return _with_debug(resp, mode=mode, step_index=0, started=True, start_again=True)
+        return _with_debug({"text": f"{opener} {q_text}".strip(), "session_id": session_id, "done": False}, mode=mode, step_index=0, start_again=True)
 
     mode = _extract_mode(payload, fallback_text=raw_query)
     state, existed = _load_state(session_id, mode)
 
-    # Apply active section change
     changed_section = _set_active_section(mode, state, active_section)
     if changed_section:
-        _jlog("active_section_changed", session_id=session_id, mode=mode, active_section=state.get("active_section"))
         _save_state(session_id, state)
 
-    _jlog(
-        "state_loaded",
-        session_id=session_id,
-        mode=mode,
-        existed=existed,
-        step_index=int(state.get("step_index") or 0),
-        active_section=_safe_str(state.get("active_section")),
-        awaiting_confirm=bool(state.get("awaiting_confirm")),
-        pending_action=_safe_str(state.get("pending_action")),
-        template_done=bool(state.get("template_done")),
-        answers_keys=sorted(list((state.get("answers") or {}).keys()))[:30],
-    )
-
-    # If user already sent an answer, ignore start_template (Bubble often sends it every time)
     if raw_query:
-        if start_template:
-            _jlog("start_template_ignored_due_to_answer", session_id=session_id, mode=mode)
         start_template = False
 
-    # If already done
     if state.get("template_done") and not start_template and not reset:
-        msg = "Template complete. Say 'start again' or send start_template=true to restart."
-        resp = {"text": msg, "session_id": session_id, "done": True}
-        return _with_debug(resp, mode=mode, template_done=True)
+        return _with_debug({"text": "Template complete. Say 'start again' or send start_template=true to restart.", "session_id": session_id, "done": True}, mode=mode, template_done=True)
 
-    # START only if explicitly requested OR session newly created
     if start_template or (not existed):
-        _jlog(
-            "template_started",
-            session_id=session_id,
-            mode=mode,
-            reason=("start_template" if start_template else "new_session"),
-        )
         state = _default_state(mode)
         _set_active_section(mode, state, active_section)
         _save_state(session_id, state)
         first = _current_step(mode, state)
         q_text = first["question"] if first else "Choose a shortcut: Build my confidence or Prepare for difficult behaviours."
         opener = _pick_opener(session_id, user_name, "coach_last_opener")
-        text = f"{opener} {q_text}".strip()
-        resp = {"text": text, "session_id": session_id, "done": False}
-        return _with_debug(resp, mode=mode, step_index=int(state.get("step_index") or 0), existed=existed, started=True)
+        return _with_debug({"text": f"{opener} {q_text}".strip(), "session_id": session_id, "done": False}, mode=mode, started=True)
 
-    # If no answer given, repeat current question
     if not raw_query:
         cur = _current_step(mode, state)
         q_text = cur["question"] if cur else "Choose a shortcut: Build my confidence or Prepare for difficult behaviours."
-        resp = {"text": q_text, "session_id": session_id, "done": False}
-        return _with_debug(resp, mode=mode, step_index=int(state.get("step_index") or 0), empty_answer=True)
+        return _with_debug({"text": q_text, "session_id": session_id, "done": False}, mode=mode, empty_answer=True)
 
     # =========================
-    # CONFIRMATION HANDLING (checkpoint or final)
+    # CHECKPOINT CONFIRM ONLY
     # =========================
     if state.get("awaiting_confirm"):
         yn = _parse_yes_no(raw_query)
-
-        # Accept explicit yes/no in text OR UI flags
         if yn is None and not (confirm_write or auto_confirm):
-            prompt = "Yes or no — should we lock this in and continue?"
-            return _with_debug({"text": prompt, "session_id": session_id, "done": False}, mode=mode, awaiting_confirm=True)
+            return _with_debug({"text": "Yes or no — should we lock this in and continue?", "session_id": session_id, "done": False}, mode=mode, awaiting_confirm=True)
 
-        action = _safe_str(state.get("pending_action"))
+        # clear confirm state
         state["awaiting_confirm"] = False
         state["pending_action"] = None
-        pending_upto = int(state.get("pending_checkpoint_upto") or 0)
         state["pending_checkpoint_upto"] = 0
         _save_state(session_id, state)
 
-        # If user says No, continue without locking; if final, ask what to adjust
-        if (yn is False) and not (confirm_write or auto_confirm):
-            if action == "final":
-                keys = [s["key"] for s in _steps(mode)]
-                resp_text = "No problem. Which part do you want to tweak? " + ", ".join(keys)
-                return _with_debug({"text": resp_text, "session_id": session_id, "done": False}, mode=mode, final_confirm_no=True)
-            nxt = _current_step(mode, state)
-            q_text = nxt["question"] if nxt else "Okay — tell me what you want to do next."
-            opener = _pick_opener(session_id, user_name, "coach_last_opener")
-            text = _rewrite_bad_opening(q_text, opener)
-            return _with_debug({"text": text, "session_id": session_id, "done": False}, mode=mode, checkpoint_confirm_no=True, upto=pending_upto)
-
-        # Yes -> act
-        if action == "final":
-            _jlog("final_generate_after_confirm", session_id=session_id, mode=mode)
-            info = _retrieve_info_for_coach(mode, "final summary", top_k)
-            final_user = _make_final_user_message(mode, state, info, user_name=user_name)
-            resp_llm = openai.chat.completions.create(
-                model=CHAT_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT_COACH_FINAL},
-                    {"role": "user", "content": final_user},
-                ],
-                temperature=0.2,
-            )
-            text = strip_markdown_chars((resp_llm.choices[0].message.content or "").strip())
-            opener = _pick_opener(session_id, user_name, "coach_last_opener")
-            text = _rewrite_bad_opening(text, opener)
-            state["template_done"] = True
-            _save_state(session_id, state)
-            resp = {"text": text, "session_id": session_id, "done": True}
-            return _with_debug(resp, mode=mode, done=True)
-
-        # checkpoint yes -> ask next question
+        # regardless yes/no -> continue
         nxt = _current_step(mode, state)
         q_text = nxt["question"] if nxt else "Okay — what do you want to do next?"
         text = f"{_reflect_line()} {q_text}".strip()
         opener = _pick_opener(session_id, user_name, "coach_last_opener")
         text = _rewrite_bad_opening(text, opener)
-        return _with_debug({"text": text, "session_id": session_id, "done": False}, mode=mode, checkpoint_confirm_yes=True)
+        return _with_debug({"text": text, "session_id": session_id, "done": False}, mode=mode, checkpoint_confirm_handled=True)
 
     # =========================
-    # NORMAL ANSWER PATH (no per-question confirm)
+    # NORMAL ANSWER PATH
     # =========================
     cur = _current_step(mode, state)
-
-    # If finished steps, ask FINAL confirm before generating output (single)
     if cur is None:
-        state["awaiting_confirm"] = True
-        state["pending_action"] = "final"
-        _save_state(session_id, state)
-        prompt = _final_confirm_prompt(mode)
-        opener = _pick_opener(session_id, user_name, "coach_last_opener")
-        prompt = _rewrite_bad_opening(prompt, opener)
-        return _with_debug({"text": prompt, "session_id": session_id, "done": False}, mode=mode, final_confirm=True)
+        # Safety: if we somehow overshot, just generate
+        return _with_debug(_generate_final(mode, state, top_k, user_name, session_id), mode=mode, overshot=True)
 
     cur_key = cur["key"]
-    _jlog(
-        "answer_received",
-        session_id=session_id,
-        mode=mode,
-        step_index_before=int(state.get("step_index") or 0),
-        cur_key=cur_key,
-        answer_preview=(raw_query or "")[:160],
-    )
 
-    # Store answer immediately (draft), no confirm spam
+    # SPECIAL: summary step = FINAL CONFIRM (single)
+    if cur_key == "summary":
+        yn = _parse_yes_no(raw_query)
+        if yn is None and not (confirm_write or auto_confirm):
+            opener = _pick_opener(session_id, user_name, "coach_last_opener")
+            msg = _rewrite_bad_opening("Please reply Yes or No.", opener)
+            return _with_debug({"text": msg, "session_id": session_id, "done": False}, mode=mode, need_yes_no_for_summary=True)
+
+        if (yn is False) and not (confirm_write or auto_confirm):
+            # user said no -> do not generate
+            keys = [s["key"] for s in _steps(mode) if s.get("key") != "summary"]
+            return _with_debug({"text": "No problem. Which part do you want to adjust? " + ", ".join(keys), "session_id": session_id, "done": False}, mode=mode, summary_no=True)
+
+        # yes -> lock summary as yes + generate immediately (NO second confirm)
+        state["answers"][cur_key] = "yes"
+        state["step_index"] = int(state.get("step_index") or 0) + 1
+        _save_state(session_id, state)
+        return _with_debug(_generate_final(mode, state, top_k, user_name, session_id), mode=mode, summary_yes_generate=True)
+
+    # normal steps: store answer
     state["answers"][cur_key] = raw_query.strip()
     state["step_index"] = int(state.get("step_index") or 0) + 1
     _save_state(session_id, state)
 
-    # If we just answered the last step, ask FINAL confirm (single)
-    if _current_step(mode, state) is None:
-        state["awaiting_confirm"] = True
-        state["pending_action"] = "final"
-        _save_state(session_id, state)
-        prompt = _final_confirm_prompt(mode)
-        opener = _pick_opener(session_id, user_name, "coach_last_opener")
-        prompt = _rewrite_bad_opening(prompt, opener)
-        return _with_debug({"text": prompt, "session_id": session_id, "done": False}, mode=mode, final_confirm=True, last_key=cur_key)
-
-    # Checkpoint confirm every N answers (default 3), but NOT after every answer
+    # checkpoint confirm every N answers
     if _should_checkpoint_confirm(mode, state):
         state["awaiting_confirm"] = True
         state["pending_action"] = "checkpoint"
         state["pending_checkpoint_upto"] = int(state.get("step_index") or 0)
         _save_state(session_id, state)
-        prompt = _checkpoint_prompt(mode, state)
+        prompt = _checkpoint_prompt()
         opener = _pick_opener(session_id, user_name, "coach_last_opener")
         prompt = _rewrite_bad_opening(prompt, opener)
-        return _with_debug({"text": prompt, "session_id": session_id, "done": False}, mode=mode, checkpoint_confirm=True, upto=state["pending_checkpoint_upto"])
+        return _with_debug({"text": prompt, "session_id": session_id, "done": False}, mode=mode, checkpoint_confirm=True)
 
-    # Ask next question normally
+    # ask next question
     nxt = _current_step(mode, state)
     q_text = nxt["question"] if nxt else "Okay — what do you want to do next?"
     text = f"{_reflect_line()} {q_text}".strip()
     opener = _pick_opener(session_id, user_name, "coach_last_opener")
     text = _rewrite_bad_opening(text, opener)
-    return _with_debug({"text": text, "session_id": session_id, "done": False}, mode=mode, step_index=int(state.get("step_index") or 0), next_key=(nxt.get("key") if nxt else ""))
+    return _with_debug({"text": text, "session_id": session_id, "done": False}, mode=mode, next_key=(nxt.get("key") if nxt else ""))
 
 
 # =========================
