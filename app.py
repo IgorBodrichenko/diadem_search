@@ -6,7 +6,7 @@ import random
 import re
 import sqlite3
 import logging
-from typing import List, Dict, Any, Optional, Iterator, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 
 from fastapi import FastAPI, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -331,14 +331,27 @@ def _norm_q(s: str) -> str:
 
 
 SEARCH_HINTS = [
-    {"match_any": ["balance the power in a negotiation", "balance power in a negotiation", "balance the power"],
-     "hint": "confident mindset pages 9-11"},
-    {"match_any": ["push back without upsetting the relationship", "push back without upsetting", "push back"],
-     "hint": "tactics prepared to respond pages 65-74 slides 7 8 15"},
-    {"match_any": ["difference between selling and negotiation", "selling vs negotiation", "selling and negotiation"],
-     "hint": "introduction to negotiation book page xii-vii slide 11"},
-    {"match_any": ["deal with difficult questions", "handle difficult questions", "difficult questions", "deal with difficult question"],
-     "hint": "slides 28-34 difficult questions"},
+    {
+        "match_any": ["balance the power in a negotiation", "balance power in a negotiation", "balance the power"],
+        "hint": "confident mindset pages 9-11",
+    },
+    {
+        "match_any": ["push back without upsetting the relationship", "push back without upsetting", "push back"],
+        "hint": "tactics prepared to respond pages 65-74 slides 7 8 15",
+    },
+    {
+        "match_any": ["difference between selling and negotiation", "selling vs negotiation", "selling and negotiation"],
+        "hint": "introduction to negotiation book page xii-vii slide 11",
+    },
+    {
+        "match_any": [
+            "deal with difficult questions",
+            "handle difficult questions",
+            "difficult questions",
+            "deal with difficult question",
+        ],
+        "hint": "slides 28-34 difficult questions",
+    },
 ]
 
 
@@ -376,9 +389,42 @@ def _filter_matches_by_score(matches: List[Dict]) -> List[Dict]:
 
 
 _STOPWORDS = {
-    "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with", "without", "is", "are", "was", "were", "be",
-    "do", "does", "did", "how", "what", "why", "when", "where", "between", "into", "from", "as", "at", "by", "it", "this", "that",
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "to",
+    "of",
+    "in",
+    "on",
+    "for",
+    "with",
+    "without",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "do",
+    "does",
+    "did",
+    "how",
+    "what",
+    "why",
+    "when",
+    "where",
+    "between",
+    "into",
+    "from",
+    "as",
+    "at",
+    "by",
+    "it",
+    "this",
+    "that",
 }
+
 _GENERIC_PHRASES = [
     "key techniques to consider",
     "negotiation techniques",
@@ -461,9 +507,15 @@ def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
 
         bonus = 0.0
         for phrase in [
-            "balance", "power", "selling", "negotiation",
-            "difficult questions", "push back", "relationship",
-            "tactics", "mindset",
+            "balance",
+            "power",
+            "selling",
+            "negotiation",
+            "difficult questions",
+            "push back",
+            "relationship",
+            "tactics",
+            "mindset",
         ]:
             if phrase in qlow and phrase in tlow:
                 bonus += 0.7
@@ -576,7 +628,6 @@ def get_matches(query: str, top_k_final: int) -> List[Dict]:
 # =========================
 # PROMPTS (updated to match PDF guardrails)
 # =========================
-
 VARIABLES_POLICY = (
     "\nTemplate Variables rules:\n"
     "- A Variable is a user-defined negotiation lever (e.g., price, term, volume, timing, scope, risk, concessions).\n"
@@ -665,22 +716,49 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
     "build_confidence": {
         "title": "Build my confidence",
         "steps": [
-            {"key": "company", "question": "Let’s start with your company. What about your company gives you a strong position here?"},
-            {"key": "situation", "question": "Now the situation itself. What’s the most important thing you want to achieve in this conversation?"},
-            {"key": "relationship", "question": "About the relationship: what do you know about the other person’s priorities or pressures?"},
+            {
+                "key": "company",
+                "question": "Let’s start with your company. What about your company gives you a strong position here?",
+            },
+            {
+                "key": "situation",
+                "question": "Now the situation itself. What’s the most important thing you want to achieve in this conversation?",
+            },
+            {
+                "key": "relationship",
+                "question": "About the relationship: what do you know about the other person’s priorities or pressures?",
+            },
             {"key": "myself", "question": "About you: what strengths or skills do you bring that will help you handle this well?"},
             {"key": "why_confident", "question": "Great. Now list 3–5 reasons you should feel confident going into this."},
-            {"key": "summary", "question": "Want me to summarise your confidence plan in 5–7 bullet points you can read right before the call?"},
+            {
+                "key": "summary",
+                "question": "Want me to summarise your confidence plan in 5–7 bullet points you can read right before the call?",
+            },
         ],
     },
     "prepare_difficult_behaviours": {
         "title": "Prepare for difficult behaviours",
         "steps": [
-            {"key": "scenario", "question": "What’s the situation—who are you speaking to, and what decision are you trying to influence? (1–2 sentences)"},
-            {"key": "anticipate_tactics", "question": "What is the first difficult thing they are likely to say or do? Write it as a direct quote if you can."},
-            {"key": "purpose", "question": "What do you think their purpose is with that move—pressure, delay, anchoring, saving face, something else?"},
-            {"key": "response_bullet", "question": "Let’s craft your response. What’s the one key point you must hold your ground on? (One sentence)"},
-            {"key": "move_on_air", "question": "Now write a short linking phrase to steer back on track (e.g., “That’s helpful—so to move this forward…”). What’s your version?"},
+            {
+                "key": "scenario",
+                "question": "What’s the situation—who are you speaking to, and what decision are you trying to influence? (1–2 sentences)",
+            },
+            {
+                "key": "anticipate_tactics",
+                "question": "What is the first difficult thing they are likely to say or do? Write it as a direct quote if you can.",
+            },
+            {
+                "key": "purpose",
+                "question": "What do you think their purpose is with that move—pressure, delay, anchoring, saving face, something else?",
+            },
+            {
+                "key": "response_bullet",
+                "question": "Let’s craft your response. What’s the one key point you must hold your ground on? (One sentence)",
+            },
+            {
+                "key": "move_on_air",
+                "question": "Now write a short linking phrase to steer back on track (e.g., “That’s helpful—so to move this forward…”). What’s your version?",
+            },
             {"key": "summary", "question": "Want the final ‘cheat sheet’ (their likely line → your bullet → your steer-back phrase) in a clean format?"},
         ],
     },
@@ -718,6 +796,7 @@ def _default_state(mode: str) -> Dict[str, Any]:
         "pending_write": None,  # {"key": ..., "value": ...}
         "awaiting_confirm": False,
         "clarify_count": 0,
+        "template_done": False,  # NEW: stop after final summary confirmed
     }
 
 
@@ -751,6 +830,8 @@ def _load_state(session_id: str, mode: str) -> Tuple[Dict[str, Any], bool]:
         st["awaiting_confirm"] = False
     if "clarify_count" not in st:
         st["clarify_count"] = 0
+    if "template_done" not in st:
+        st["template_done"] = False
 
     st["mode"] = mode
     entry["state"] = st
@@ -879,7 +960,7 @@ def _set_active_section(mode: str, state: Dict[str, Any], active_section: str) -
 
 
 # =========================
-# COACH CORE (with confirm write-back + active section)
+# COACH CORE (with confirm write-back + active section + template_done guard)
 # =========================
 def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bool = False):
     raw_query = _extract_user_text(payload)
@@ -954,6 +1035,7 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
         awaiting_confirm=bool(state.get("awaiting_confirm")),
         pending_key=(state.get("pending_write") or {}).get("key") if isinstance(state.get("pending_write"), dict) else None,
         answers_keys=sorted(list((state.get("answers") or {}).keys()))[:30],
+        template_done=bool(state.get("template_done")),
     )
 
     # IMPORTANT: if user already sent an answer, ignore start_template (Bubble often sends it every time)
@@ -961,6 +1043,15 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
         if start_template:
             _jlog("start_template_ignored_due_to_answer", session_id=session_id, mode=mode)
         start_template = False
+
+    # NEW: if template is already completed, do not continue asking template questions
+    if state.get("template_done") and not start_template and not reset:
+        msg = (
+            "Template complete. If you want to start again, say 'start again' or send start_template=true. "
+            "If you want to add variables, tell me which field is active."
+        )
+        resp = {"text": msg, "session_id": session_id, "done": True}
+        return _with_debug(resp, mode=mode, template_done=True)
 
     # START only if explicitly requested OR session newly created
     if start_template or (not existed):
@@ -1015,6 +1106,10 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
             cur_key = pending["key"]
             state["answers"][cur_key] = _safe_str(pending.get("value"))
             state["step_index"] = int(state.get("step_index") or 0) + 1
+
+            # NEW: if the confirmed key is the last step ('summary'), mark template as done
+            if cur_key == "summary":
+                state["template_done"] = True
 
         state["pending_write"] = None
         state["awaiting_confirm"] = False
@@ -1081,6 +1176,11 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
     if confirm_write or auto_confirm:
         state["answers"][cur_key] = raw_query.strip()
         state["step_index"] = int(state.get("step_index") or 0) + 1
+
+        # NEW: if the confirmed key is 'summary', mark template as done
+        if cur_key == "summary":
+            state["template_done"] = True
+
         _save_state(session_id, state)
 
         nxt = _current_step(mode, state)
@@ -1190,6 +1290,7 @@ def chat(payload: Dict = Body(...)):
         answer = _rewrite_bad_opening(answer, opener)
 
     return {"answer": answer, "session_id": session_id}
+
 
 @app.post("/chat/sse")
 def chat_sse(payload: Dict = Body(...)):
