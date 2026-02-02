@@ -26,6 +26,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("coach")
 
+
 def _jlog(event: str, **fields):
     payload = {"event": event, **fields}
     try:
@@ -33,10 +34,12 @@ def _jlog(event: str, **fields):
     except Exception:
         log.info(f"{event} | {fields}")
 
+
 def _with_debug(resp: Dict[str, Any], **dbg):
     if DEBUG:
         resp["debug"] = dbg
     return resp
+
 
 # =========================
 # CONFIG
@@ -100,11 +103,13 @@ async def log_requests(request: Request, call_next):
     resp = await call_next(request)
     return resp
 
+
 # =========================
-# SESSION STORE (SQLite, survives restarts/workers on same host)
+# SESSION STORE (SQLite)
 # =========================
 SESSION_DB_PATH = os.getenv("SESSION_DB_PATH", "sessions.sqlite3")
 _DB: Optional[sqlite3.Connection] = None
+
 
 def _db() -> sqlite3.Connection:
     global _DB
@@ -122,8 +127,10 @@ def _db() -> sqlite3.Connection:
         _DB.commit()
     return _DB
 
+
 def _now() -> int:
     return int(time.time())
+
 
 def _db_get(session_id: str) -> Optional[Dict[str, Any]]:
     if not session_id:
@@ -138,6 +145,7 @@ def _db_get(session_id: str) -> Optional[Dict[str, Any]]:
         return json.loads(row[0])
     except Exception:
         return None
+
 
 def _db_set(session_id: str, entry: Dict[str, Any]) -> None:
     entry = entry or {}
@@ -155,20 +163,24 @@ def _db_set(session_id: str, entry: Dict[str, Any]) -> None:
     )
     _db().commit()
 
+
 def _db_delete(session_id: str) -> None:
     _db().execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
     _db().commit()
+
 
 def _cleanup_sessions() -> None:
     cutoff = _now() - SESSION_TTL_SECONDS
     _db().execute("DELETE FROM sessions WHERE updated_at < ?", (cutoff,))
     _db().commit()
 
+
 def _get_or_create_session_id(payload: Dict[str, Any]) -> str:
     sid = str(payload.get("session_id") or "").strip()
     if not sid:
         sid = uuid.uuid4().hex
     return sid
+
 
 def _safe_str(x: Any) -> str:
     if x is None:
@@ -179,6 +191,7 @@ def _safe_str(x: Any) -> str:
         return str(x).strip()
     except Exception:
         return ""
+
 
 def _as_bool(v: Any) -> bool:
     if isinstance(v, bool):
@@ -195,6 +208,7 @@ def _as_bool(v: Any) -> bool:
             return False
     return False
 
+
 def _clamp_int(v: Any, default: int, lo: int, hi: int) -> int:
     try:
         n = int(v)
@@ -202,8 +216,9 @@ def _clamp_int(v: Any, default: int, lo: int, hi: int) -> int:
         return default
     return max(lo, min(hi, n))
 
+
 # =========================
-# USER NAME (optional)
+# USER NAME / USER TEXT
 # =========================
 def _extract_user_name(payload: Dict[str, Any]) -> str:
     raw = _safe_str(payload.get("user_name")) or _safe_str(payload.get("name"))
@@ -212,10 +227,9 @@ def _extract_user_name(payload: Dict[str, Any]) -> str:
         return ""
     return raw
 
-# =========================
-# USER TEXT (IMPORTANT FIX)
-# =========================
+
 _FALSEY_STRS = {"false", "true", "null", "none", "undefined", ""}
+
 
 def _extract_user_text(payload: Dict[str, Any]) -> str:
     for key in ("query", "user_input", "text", "message", "input", "answer", "content"):
@@ -225,6 +239,7 @@ def _extract_user_text(payload: Dict[str, Any]) -> str:
             return s
     return ""
 
+
 # =========================
 # TEXT CLEANUP (NO MARKDOWN)
 # =========================
@@ -232,6 +247,7 @@ def strip_markdown_chars(text: str) -> str:
     if not text:
         return ""
     return text.replace("*", "").replace("`", "").replace("_", "")
+
 
 # =========================
 # SMALL TALK
@@ -243,15 +259,18 @@ _SMALLTALK_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+
 def _is_smalltalk(q: str) -> bool:
     q = (q or "").strip()
     return bool(q and len(q) <= 30 and _SMALLTALK_RE.match(q))
+
 
 def _smalltalk_reply(user_name: str) -> str:
     name = (user_name or "").strip()
     if name:
         return f"Hi {name}. How can I help?"
     return "Hi. How can I help?"
+
 
 # =========================
 # VARIATION
@@ -269,6 +288,7 @@ SOFT_OPENERS = [
 
 _BAD_START_RE = re.compile(r"^\s*(it['’]s\s+(great|wonderful)|great)\b", flags=re.IGNORECASE)
 
+
 def _session_entry(session_id: str) -> Dict[str, Any]:
     entry = _db_get(session_id)
     if not isinstance(entry, dict):
@@ -276,6 +296,7 @@ def _session_entry(session_id: str) -> Dict[str, Any]:
     entry["updated_at"] = _now()
     _db_set(session_id, entry)
     return entry
+
 
 def _pick_opener(session_id: str, user_name: str, field: str) -> str:
     entry = _session_entry(session_id)
@@ -288,6 +309,7 @@ def _pick_opener(session_id: str, user_name: str, field: str) -> str:
     _db_set(session_id, entry)
     return opener
 
+
 def _rewrite_bad_opening(full_text: str, opener: str) -> str:
     t = (full_text or "").strip()
     if not t or not _BAD_START_RE.match(t):
@@ -298,26 +320,6 @@ def _rewrite_bad_opening(full_text: str, opener: str) -> str:
         return f"{opener} {rest}".strip() if rest else opener
     return opener
 
-def _stream_opening_variation(
-    deltas: Iterator[str],
-    session_id: str,
-    user_name: str,
-    field: str,
-) -> Iterator[str]:
-    opener = _pick_opener(session_id, user_name, field)
-    buf = ""
-    decided = False
-    for d in deltas:
-        if not decided:
-            buf += d
-            if len(buf) >= 140 or re.search(r"[.!?]\s+", buf):
-                yield _rewrite_bad_opening(buf, opener)
-                decided = True
-                buf = ""
-        else:
-            yield d
-    if not decided and buf:
-        yield _rewrite_bad_opening(buf, opener)
 
 # =========================
 # SEARCH HINTS
@@ -326,6 +328,7 @@ def _norm_q(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"\s+", " ", s)
     return s
+
 
 SEARCH_HINTS = [
     {"match_any": ["balance the power in a negotiation", "balance power in a negotiation", "balance the power"],
@@ -338,6 +341,7 @@ SEARCH_HINTS = [
      "hint": "slides 28-34 difficult questions"},
 ]
 
+
 def _hint_for_question(question: str) -> str:
     qn = _norm_q(question)
     for item in SEARCH_HINTS:
@@ -345,6 +349,7 @@ def _hint_for_question(question: str) -> str:
             if key in qn:
                 return item["hint"]
     return ""
+
 
 # =========================
 # RAG HELPERS
@@ -357,6 +362,7 @@ def embed_query(text: str) -> List[float]:
     )
     return resp.data[0].embedding
 
+
 def _filter_matches_by_score(matches: List[Dict]) -> List[Dict]:
     out: List[Dict] = []
     for m in matches or []:
@@ -367,6 +373,7 @@ def _filter_matches_by_score(matches: List[Dict]) -> List[Dict]:
         if score >= MIN_MATCH_SCORE:
             out.append(m)
     return out
+
 
 _STOPWORDS = {
     "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with", "without", "is", "are", "was", "were", "be",
@@ -382,15 +389,18 @@ _GENERIC_PHRASES = [
     "prepare thoroughly",
 ]
 
+
 def _tokenize(s: str) -> List[str]:
     s = (s or "").lower()
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     toks = [t for t in s.split() if t and t not in _STOPWORDS and len(t) > 2]
     return toks
 
+
 def _keyword_query(query: str) -> str:
     toks = _tokenize(query)[:18]
     return " ".join(toks)
+
 
 def _source_id(md: Dict[str, Any]) -> str:
     for k in ["source", "doc_id", "document_id", "file", "filename", "title"]:
@@ -402,6 +412,7 @@ def _source_id(md: Dict[str, Any]) -> str:
         if isinstance(v, str) and v.strip():
             return v.strip()
     return ""
+
 
 def _merge_dedup_matches(list_of_lists: List[List[Dict]]) -> List[Dict]:
     best: Dict[str, Dict] = {}
@@ -426,6 +437,7 @@ def _merge_dedup_matches(list_of_lists: List[List[Dict]]) -> List[Dict]:
                 if s_new > s_old:
                     best[mid] = m
     return list(best.values())
+
 
 def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
     qt = set(_tokenize(query))
@@ -487,6 +499,7 @@ def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
 
     return out
 
+
 def build_context(matches: List[Dict]) -> str:
     parts: List[str] = []
     total = 0
@@ -506,6 +519,7 @@ def build_context(matches: List[Dict]) -> str:
 
     return "\n---\n".join(parts)
 
+
 def is_context_relevant(query: str, matches: List[Dict]) -> bool:
     if not matches:
         return False
@@ -523,6 +537,7 @@ def is_context_relevant(query: str, matches: List[Dict]) -> bool:
         return False
 
     return overlap >= MIN_OVERLAP_SCORE or len(ctx.strip()) >= MIN_CONTEXT_CHARS
+
 
 def get_matches(query: str, top_k_final: int) -> List[Dict]:
     q_clean = (query or "").strip()
@@ -557,8 +572,9 @@ def get_matches(query: str, top_k_final: int) -> List[Dict]:
 
     return reranked
 
+
 # =========================
-# PROMPTS
+# PROMPTS (updated to match PDF guardrails)
 # =========================
 
 VARIABLES_POLICY = (
@@ -569,6 +585,25 @@ VARIABLES_POLICY = (
     "- You may suggest example Variables to consider.\n"
     "- You must never insert Variables, infer values, or overwrite existing Variables without explicit user confirmation.\n"
     "- Variables are part of the template structure, not your memory or internal state.\n"
+)
+
+TEMPLATE_FIRST_POLICY = (
+    "\nTemplate-First Writing Contract:\n"
+    "- Your output must map 1:1 to the template field(s) you are writing.\n"
+    "- Prefer bullets / short lines. No narrative paragraphs unless the field explicitly requires them.\n"
+    "- Output must be paste-ready, not advisory.\n"
+)
+
+ACTIVE_SECTION_POLICY = (
+    "\nActive Section rules:\n"
+    "- By default, write only for the currently active section/field.\n"
+    "- If you are unsure which section is active, ask one short question to confirm.\n"
+)
+
+LIMITS_POLICY = (
+    "\nInteraction limits:\n"
+    "- Keep responses <= 150 words unless the user asks for more.\n"
+    "- Ask at most 2 clarifying questions before producing a best-effort paste-ready output.\n"
 )
 
 SYSTEM_PROMPT_QA = (
@@ -600,6 +635,8 @@ SYSTEM_PROMPT_CHAT = (
     "- Keep it short and natural.\n"
     "- If USER_NAME is provided, greet/address them naturally.\n"
     + VARIABLES_POLICY
+    + ACTIVE_SECTION_POLICY
+    + LIMITS_POLICY
 )
 
 SYSTEM_PROMPT_COACH_FINAL = (
@@ -615,7 +652,11 @@ SYSTEM_PROMPT_COACH_FINAL = (
     "- If USER_NAME is provided, you may mention it once.\n"
     "- End with one short optional next step question.\n"
     + VARIABLES_POLICY
+    + TEMPLATE_FIRST_POLICY
+    + ACTIVE_SECTION_POLICY
+    + LIMITS_POLICY
 )
+
 
 # =========================
 # COACH / TEMPLATE ENGINE
@@ -645,6 +686,15 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# --- New: start again / confirm parsing ---
+_START_AGAIN_RE = re.compile(
+    r"^\s*(start again|restart|start over|reset|начать заново|почати заново|заново)\s*[!.?]*\s*$",
+    flags=re.IGNORECASE,
+)
+_YES_RE = re.compile(r"^\s*(yes|y|ok|okay|confirm|confirmed|sure|да|ок|угу)\s*[!.?]*\s*$", flags=re.IGNORECASE)
+_NO_RE = re.compile(r"^\s*(no|n|nope|cancel|stop|нет|не)\s*[!.?]*\s*$", flags=re.IGNORECASE)
+
+
 def _extract_mode(payload: Dict[str, Any], fallback_text: str = "") -> str:
     m = _safe_str(payload.get("mode"))
     if m in TEMPLATES:
@@ -656,8 +706,20 @@ def _extract_mode(payload: Dict[str, Any], fallback_text: str = "") -> str:
         return "build_confidence"
     return "build_confidence"
 
+
 def _default_state(mode: str) -> Dict[str, Any]:
-    return {"mode": mode, "step_index": 0, "answers": {}}
+    # variables are stored per active_section key (section-scoped)
+    return {
+        "mode": mode,
+        "step_index": 0,
+        "answers": {},
+        "active_section": "",
+        "variables": {},  # { section_key: [ {name, low, high, ideal, notes}, ... ] }
+        "pending_write": None,  # {"key": ..., "value": ...}
+        "awaiting_confirm": False,
+        "clarify_count": 0,
+    }
+
 
 def _load_state(session_id: str, mode: str) -> Tuple[Dict[str, Any], bool]:
     entry = _db_get(session_id) or {}
@@ -679,19 +741,39 @@ def _load_state(session_id: str, mode: str) -> Tuple[Dict[str, Any], bool]:
         st["answers"] = {}
     if "step_index" not in st:
         st["step_index"] = 0
-    st["mode"] = mode
+    if "variables" not in st or not isinstance(st["variables"], dict):
+        st["variables"] = {}
+    if "active_section" not in st:
+        st["active_section"] = ""
+    if "pending_write" not in st:
+        st["pending_write"] = None
+    if "awaiting_confirm" not in st:
+        st["awaiting_confirm"] = False
+    if "clarify_count" not in st:
+        st["clarify_count"] = 0
 
+    st["mode"] = mode
     entry["state"] = st
     _db_set(session_id, entry)
     return st, True
+
 
 def _save_state(session_id: str, state: Dict[str, Any]) -> None:
     entry = _db_get(session_id) or {}
     entry["state"] = state
     _db_set(session_id, entry)
 
+
 def _steps(mode: str) -> List[Dict[str, Any]]:
     return TEMPLATES[mode]["steps"]
+
+
+def _key_to_index(mode: str) -> Dict[str, int]:
+    out = {}
+    for i, st in enumerate(_steps(mode)):
+        out[st["key"]] = i
+    return out
+
 
 def _current_step(mode: str, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     steps = _steps(mode)
@@ -702,10 +784,12 @@ def _current_step(mode: str, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
     return steps[idx]
 
+
 def _retrieve_info_for_coach(mode: str, query: str, top_k: int) -> str:
     rag_query = f"{mode}: {query}"
     matches = get_matches(rag_query, top_k)
     return build_context(matches)
+
 
 def _make_final_user_message(mode: str, state: Dict[str, Any], info: str, user_name: str) -> str:
     tpl = TEMPLATES[mode]
@@ -717,21 +801,85 @@ def _make_final_user_message(mode: str, state: Dict[str, Any], info: str, user_n
             answers_lines.append(f"- {k}: {state['answers'][k]}")
     answers_block = "\n".join(answers_lines) if answers_lines else "(none)"
     name_line = user_name if user_name else ""
+
+    # Include variables for current active section only (section-scoped)
+    active_section = _safe_str(state.get("active_section"))
+    vars_for_section = state.get("variables", {}).get(active_section, [])
+    vars_lines = []
+    for v in vars_for_section[:20]:
+        try:
+            vars_lines.append(
+                f"- {v.get('name','')}: low={v.get('low','')}, high={v.get('high','')}, ideal={v.get('ideal','')}, notes={v.get('notes','')}"
+            )
+        except Exception:
+            continue
+    vars_block = "\n".join(vars_lines) if vars_lines else "(none)"
+
     return (
         f"USER_NAME:\n{name_line}\n\n"
         f"TEMPLATE: {tpl['title']} ({mode})\n\n"
+        f"ACTIVE_SECTION:\n{active_section}\n\n"
+        f"SECTION_VARIABLES:\n{vars_block}\n\n"
         f"ANSWERS:\n{answers_block}\n\n"
         f"INFORMATION (background support):\n{info}\n\n"
         f"FINAL TASK:\n"
         f"- If template is 'Build my confidence': summarise confidence plan in 5–7 short bullet points.\n"
         f"- If template is 'Prepare for difficult behaviours': create a final cheat sheet.\n"
+        f"- Keep it paste-ready and mapped to the template.\n"
     )
+
 
 def _reflect_line() -> str:
     return random.choice(["Got it.", "Okay.", "Thanks — noted.", "Understood.", "That helps."])
 
+
+def _parse_yes_no(text: str) -> Optional[bool]:
+    t = (text or "").strip()
+    if not t:
+        return None
+    if _YES_RE.match(t):
+        return True
+    if _NO_RE.match(t):
+        return False
+    return None
+
+
+def _active_section_from_payload(payload: Dict[str, Any]) -> str:
+    # Bubble can send any of these
+    for k in ("active_section", "active_field", "active_step", "field_key", "section_key"):
+        s = _safe_str(payload.get(k))
+        if s:
+            return s
+    return ""
+
+
+def _set_active_section(mode: str, state: Dict[str, Any], active_section: str) -> bool:
+    """
+    Returns True if active section changed and we reset local state per PDF.
+    """
+    active_section = (active_section or "").strip()
+    prev = _safe_str(state.get("active_section"))
+    if not active_section:
+        return False
+    if active_section == prev:
+        return False
+
+    # If this section corresponds to a known step key, move step_index to it (field focus change)
+    k2i = _key_to_index(mode)
+    if active_section in k2i:
+        state["step_index"] = k2i[active_section]
+
+    state["active_section"] = active_section
+
+    # PDF: changing field focus resets AI context -> clear pending confirm + clarify counter
+    state["pending_write"] = None
+    state["awaiting_confirm"] = False
+    state["clarify_count"] = 0
+    return True
+
+
 # =========================
-# COACH CORE (with logs + fix for start_template loop)
+# COACH CORE (with confirm write-back + active section)
 # =========================
 def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bool = False):
     raw_query = _extract_user_text(payload)
@@ -741,6 +889,12 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
     start_template = _as_bool(payload.get("start_template"))
     user_name = _extract_user_name(payload)
 
+    # new flags
+    confirm_write = _as_bool(payload.get("confirm_write")) or _as_bool(payload.get("write_confirmed"))
+    # if UI wants to keep old behavior (not recommended), can set auto_confirm=true
+    auto_confirm = _as_bool(payload.get("auto_confirm"))
+    active_section = _active_section_from_payload(payload)
+
     _jlog(
         "coach_in",
         session_id=session_id,
@@ -748,6 +902,9 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
         mode=_safe_str(payload.get("mode")),
         start_template=start_template,
         reset=reset,
+        confirm_write=confirm_write,
+        auto_confirm=auto_confirm,
+        active_section=active_section,
         raw_query_len=len(raw_query or ""),
         raw_query_preview=(raw_query or "")[:160],
         payload_keys=sorted(list(payload.keys()))[:60],
@@ -764,8 +921,28 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
         resp = {"text": text, "session_id": session_id, "done": False}
         return _with_debug(resp, case="smalltalk")
 
+    # Start again command (PDF)
+    if raw_query and _START_AGAIN_RE.match(raw_query):
+        _jlog("coach_start_again", session_id=session_id)
+        # keep session id but reset state
+        mode = _extract_mode(payload, fallback_text=raw_query)
+        st = _default_state(mode)
+        _save_state(session_id, st)
+        first = _current_step(mode, st)
+        q_text = first["question"] if first else "Choose a shortcut: Build my confidence or Prepare for difficult behaviours."
+        opener = _pick_opener(session_id, user_name, "coach_last_opener")
+        text = f"{opener} {q_text}".strip()
+        resp = {"text": text, "session_id": session_id, "done": False}
+        return _with_debug(resp, mode=mode, step_index=0, started=True, start_again=True)
+
     mode = _extract_mode(payload, fallback_text=raw_query)
     state, existed = _load_state(session_id, mode)
+
+    # Apply active section change (field focus change reset)
+    changed_section = _set_active_section(mode, state, active_section)
+    if changed_section:
+        _jlog("active_section_changed", session_id=session_id, mode=mode, active_section=state.get("active_section"))
+        _save_state(session_id, state)
 
     _jlog(
         "state_loaded",
@@ -773,6 +950,9 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
         mode=mode,
         existed=existed,
         step_index=int(state.get("step_index") or 0),
+        active_section=_safe_str(state.get("active_section")),
+        awaiting_confirm=bool(state.get("awaiting_confirm")),
+        pending_key=(state.get("pending_write") or {}).get("key") if isinstance(state.get("pending_write"), dict) else None,
         answers_keys=sorted(list((state.get("answers") or {}).keys()))[:30],
     )
 
@@ -791,28 +971,81 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
             reason=("start_template" if start_template else "new_session"),
         )
         state = _default_state(mode)
+        # set active section if provided
+        _set_active_section(mode, state, active_section)
         _save_state(session_id, state)
         first = _current_step(mode, state)
         q_text = first["question"] if first else "Choose a shortcut: Build my confidence or Prepare for difficult behaviours."
         opener = _pick_opener(session_id, user_name, "coach_last_opener")
         text = f"{opener} {q_text}".strip()
         resp = {"text": text, "session_id": session_id, "done": False}
-        return _with_debug(resp, mode=mode, step_index=0, existed=existed, started=True)
+        return _with_debug(resp, mode=mode, step_index=int(state.get("step_index") or 0), existed=existed, started=True)
 
     # If user didn't send an answer, just repeat current question without advancing
     if not raw_query:
         cur = _current_step(mode, state)
-        _jlog(
-            "no_answer_repeat_question",
-            session_id=session_id,
-            mode=mode,
-            step_index=int(state.get("step_index") or 0),
-            cur_key=(cur.get("key") if cur else None),
-        )
         q_text = cur["question"] if cur else "Choose a shortcut: Build my confidence or Prepare for difficult behaviours."
         resp = {"text": q_text, "session_id": session_id, "done": False}
         return _with_debug(resp, mode=mode, step_index=int(state.get("step_index") or 0), empty_answer=True)
 
+    # If we are awaiting confirmation, interpret yes/no
+    if state.get("awaiting_confirm"):
+        yn = _parse_yes_no(raw_query)
+        pending = state.get("pending_write") if isinstance(state.get("pending_write"), dict) else None
+
+        if yn is None and not confirm_write:
+            # not a yes/no, prompt again
+            key = pending.get("key") if pending else ""
+            prompt = f"Please confirm: should I write that into '{key}'? Reply Yes or No."
+            resp = {"text": prompt, "session_id": session_id, "done": False}
+            return _with_debug(resp, mode=mode, awaiting_confirm=True, need_yes_no=True)
+
+        if yn is False:
+            # discard pending, ask same question again
+            state["pending_write"] = None
+            state["awaiting_confirm"] = False
+            _save_state(session_id, state)
+            cur = _current_step(mode, state)
+            q_text = cur["question"] if cur else "Okay — what should I write instead?"
+            resp = {"text": f"No problem. {q_text}", "session_id": session_id, "done": False}
+            return _with_debug(resp, mode=mode, discarded=True)
+
+        # yn True OR confirm_write flag
+        if pending and pending.get("key"):
+            cur_key = pending["key"]
+            state["answers"][cur_key] = _safe_str(pending.get("value"))
+            state["step_index"] = int(state.get("step_index") or 0) + 1
+
+        state["pending_write"] = None
+        state["awaiting_confirm"] = False
+        _save_state(session_id, state)
+
+        nxt = _current_step(mode, state)
+        if nxt is None:
+            _jlog("final_generate_after_confirm", session_id=session_id, mode=mode)
+            info = _retrieve_info_for_coach(mode, "final summary", top_k)
+            final_user = _make_final_user_message(mode, state, info, user_name=user_name)
+            resp_llm = openai.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT_COACH_FINAL},
+                    {"role": "user", "content": final_user},
+                ],
+                temperature=0.2,
+            )
+            text = strip_markdown_chars((resp_llm.choices[0].message.content or "").strip())
+            opener = _pick_opener(session_id, user_name, "coach_last_opener")
+            text = _rewrite_bad_opening(text, opener)
+            resp = {"text": text, "session_id": session_id, "done": True}
+            return _with_debug(resp, mode=mode, done=True)
+
+        text = f"{_reflect_line()} {nxt['question']}".strip()
+        opener = _pick_opener(session_id, user_name, "coach_last_opener")
+        text = _rewrite_bad_opening(text, opener)
+        resp = {"text": text, "session_id": session_id, "done": False}
+        return _with_debug(resp, mode=mode, step_index=int(state.get("step_index") or 0), next_key=nxt.get("key"))
+
+    # Normal path: user is answering current step
     cur = _current_step(mode, state)
 
     # If already finished, return final
@@ -834,57 +1067,58 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
         resp = {"text": text, "session_id": session_id, "done": True}
         return _with_debug(resp, mode=mode, done=True)
 
+    cur_key = cur["key"]
     _jlog(
         "answer_received",
         session_id=session_id,
         mode=mode,
         step_index_before=int(state.get("step_index") or 0),
-        cur_key=cur.get("key"),
-        answer_preview=raw_query[:160],
+        cur_key=cur_key,
+        answer_preview=(raw_query or "")[:160],
     )
 
-    # Save answer for CURRENT step, then advance
-    cur_key = cur["key"]
-    state["answers"][cur_key] = raw_query.strip()
-    state["step_index"] = int(state.get("step_index") or 0) + 1
-    _save_state(session_id, state)
+    # If UI already confirmed, write immediately; else require confirm step (PDF guardrail)
+    if confirm_write or auto_confirm:
+        state["answers"][cur_key] = raw_query.strip()
+        state["step_index"] = int(state.get("step_index") or 0) + 1
+        _save_state(session_id, state)
 
-    nxt = _current_step(mode, state)
+        nxt = _current_step(mode, state)
+        if nxt is None:
+            _jlog("final_generate_after_last_answer", session_id=session_id, mode=mode)
+            info = _retrieve_info_for_coach(mode, "final summary", top_k)
+            final_user = _make_final_user_message(mode, state, info, user_name=user_name)
+            resp_llm = openai.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT_COACH_FINAL},
+                    {"role": "user", "content": final_user},
+                ],
+                temperature=0.2,
+            )
+            text = strip_markdown_chars((resp_llm.choices[0].message.content or "").strip())
+            opener = _pick_opener(session_id, user_name, "coach_last_opener")
+            text = _rewrite_bad_opening(text, opener)
+            resp = {"text": text, "session_id": session_id, "done": True}
+            return _with_debug(resp, mode=mode, done=True)
 
-    _jlog(
-        "state_advanced",
-        session_id=session_id,
-        mode=mode,
-        step_index_after=int(state.get("step_index") or 0),
-        next_key=(nxt.get("key") if nxt else None),
-    )
-
-    # If next is None -> finished => final
-    if nxt is None:
-        _jlog("final_generate_after_last_answer", session_id=session_id, mode=mode)
-        info = _retrieve_info_for_coach(mode, "final summary", top_k)
-        final_user = _make_final_user_message(mode, state, info, user_name=user_name)
-        resp_llm = openai.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT_COACH_FINAL},
-                {"role": "user", "content": final_user},
-            ],
-            temperature=0.2,
-        )
-        text = strip_markdown_chars((resp_llm.choices[0].message.content or "").strip())
+        text = f"{_reflect_line()} {nxt['question']}".strip()
         opener = _pick_opener(session_id, user_name, "coach_last_opener")
         text = _rewrite_bad_opening(text, opener)
-        resp = {"text": text, "session_id": session_id, "done": True}
-        return _with_debug(resp, mode=mode, done=True)
+        resp = {"text": text, "session_id": session_id, "done": False}
+        return _with_debug(resp, mode=mode, step_index=int(state.get("step_index") or 0), next_key=nxt.get("key"))
 
-    # Otherwise ask next question deterministically
-    text = f"{_reflect_line()} {nxt['question']}".strip()
+    # Require explicit confirmation (two-step)
+    state["pending_write"] = {"key": cur_key, "value": raw_query.strip()}
+    state["awaiting_confirm"] = True
+    _save_state(session_id, state)
+
+    prompt = f"Got it. Should I write that into '{cur_key}'? Reply Yes or No."
     opener = _pick_opener(session_id, user_name, "coach_last_opener")
-    text = _rewrite_bad_opening(text, opener)
+    prompt = _rewrite_bad_opening(prompt, opener)
+    resp = {"text": prompt, "session_id": session_id, "done": False}
+    return _with_debug(resp, mode=mode, awaiting_confirm=True, pending_key=cur_key)
 
-    resp = {"text": text, "session_id": session_id, "done": False}
-    return _with_debug(resp, mode=mode, step_index=int(state.get("step_index") or 0), next_key=nxt.get("key"))
 
 # =========================
 # ROUTES
@@ -892,6 +1126,7 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
 @app.get("/health")
 def health():
     return {"ok": True, "debug": DEBUG}
+
 
 # =========================
 # CHAT (RAG)
@@ -956,6 +1191,7 @@ def chat(payload: Dict = Body(...)):
 
     return {"answer": answer, "session_id": session_id}
 
+
 # =========================
 # COACH ENDPOINTS
 # =========================
@@ -965,11 +1201,11 @@ def coach_chat(payload: Dict = Body(...)):
     out = coach_turn_server_state(payload, session_id=session_id, stream=False)
     return JSONResponse(out)
 
+
 @app.post("/coach/sse")
 def coach_sse(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
 
-    # log payload quick
     if DEBUG:
         _jlog(
             "coach_sse_in",
@@ -977,11 +1213,11 @@ def coach_sse(payload: Dict = Body(...)):
             mode=_safe_str(payload.get("mode")),
             start_template=_as_bool(payload.get("start_template")),
             reset=_as_bool(payload.get("reset")),
+            confirm_write=_as_bool(payload.get("confirm_write")) or _as_bool(payload.get("write_confirmed")),
+            active_section=_active_section_from_payload(payload),
             raw_query_preview=_extract_user_text(payload)[:120],
         )
 
-    # We keep SSE simple: generate full text once, then stream it as one chunk.
-    # (Your previous version streamed already; we keep your event format.)
     result = coach_turn_server_state(payload, session_id=session_id, stream=False)
 
     def headers():
@@ -1002,6 +1238,7 @@ def coach_sse(payload: Dict = Body(...)):
         yield f"event: done\ndata: {done_payload}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers())
+
 
 @app.post("/coach/reset")
 def coach_reset(payload: Dict = Body(...)):
