@@ -679,6 +679,7 @@ SYSTEM_PROMPT_QA = (
     "- If you answered (not the 'can't find' case), end your message with one short question.\n"
 )
 
+# Chat must refuse non-doc questions (e.g., apple pie).
 SYSTEM_PROMPT_CHAT = (
     "You are a focused assistant specialised only in the provided materials.\n"
     "You may answer ONLY if INFORMATION is provided and clearly relevant to the user's question.\n"
@@ -696,16 +697,25 @@ SYSTEM_PROMPT_CHAT = (
     + LIMITS_POLICY
 )
 
-
+# Final output must be AI-written (not pasted user text) + no technical/template field names.
 SYSTEM_PROMPT_COACH_FINAL = (
     "You are a professional negotiation coach.\n"
     "The guided dialogue is complete.\n"
-    "Now produce the final output directly (do NOT ask the next question).\n"
-    "Rules:\n"
+    "Now produce the final output directly.\n"
+    "\nRules:\n"
     "- Output plain text only. NO markdown.\n"
     "- Do NOT mention documents, pages, sources, citations, or the word 'context'.\n"
-    "- Use the user's answers to produce a clean practical summary.\n"
-    "- If a TEMPLATE expects a 'cheat sheet', format it as: likely line -> your response -> steer-back phrase.\n"
+    "- Do NOT show template field keys or technical labels (no 'scenario:', no 'anticipate_tactics', no 'purpose').\n"
+    "- Do NOT copy/paste the user's wording verbatim; rephrase into confident, natural negotiation language.\n"
+    "- Preserve intent, but improve clarity, tone, and authority.\n"
+    "- Write as if the user could read this out loud in a real conversation.\n"
+    "\nOutput format:\n"
+    "- If template is 'Build my confidence': 5–7 short bullet points the user can read right before the call.\n"
+    "- If template is 'Prepare for difficult behaviours': output exactly 3 parts:\n"
+    "  1) One short scenario line (rephrased).\n"
+    "  2) One cheat sheet line in the format:\n"
+    "     likely line -> your response -> steer-back phrase.\n"
+    "  3) Optional: one short line describing their intent.\n"
     "- Keep it concise but usable.\n"
     "- If USER_NAME is provided, you may mention it once.\n"
     "- End with one short optional next step question.\n"
@@ -718,6 +728,10 @@ SYSTEM_PROMPT_COACH_FINAL = (
 # =========================
 # COACH / TEMPLATE ENGINE
 # =========================
+
+# NEW: confirmation cadence (max once per 3 answers, plus one final confirm)
+CONFIRM_EVERY_N = int(os.getenv("CONFIRM_EVERY_N", "3"))
+
 TEMPLATES: Dict[str, Dict[str, Any]] = {
     "build_confidence": {
         "title": "Build my confidence",
@@ -727,7 +741,8 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
             {"key": "relationship", "question": "About the relationship: what do you know about the other person’s priorities or pressures?"},
             {"key": "myself", "question": "About you: what strengths or skills do you bring that will help you handle this well?"},
             {"key": "why_confident", "question": "Great. Now list 3–5 reasons you should feel confident going into this."},
-            {"key": "summary", "question": "Want me to summarise your confidence plan in 5–7 bullet points you can read right before the call?"},
+            # Keep as the last step: user says yes -> then we do ONE final confirm -> then generate.
+            {"key": "summary", "question": "Want me to pull this together into a short confidence plan you can read right before the call?"},
         ],
     },
     "prepare_difficult_behaviours": {
@@ -738,7 +753,8 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
             {"key": "purpose", "question": "What do you think their purpose is with that move—pressure, delay, anchoring, saving face, something else?"},
             {"key": "response_bullet", "question": "Let’s craft your response. What’s the one key point you must hold your ground on? (One sentence)"},
             {"key": "move_on_air", "question": "Now write a short linking phrase to steer back on track (e.g., “That’s helpful—so to move this forward…”). What’s your version?"},
-            {"key": "summary", "question": "Want the final ‘cheat sheet’ (their likely line → your bullet → your steer-back phrase) in a clean format?"},
+            # Single “table/cheat sheet” ask. No second “ready to generate” inside templates.
+            {"key": "summary", "question": "Want me to pull this together into a clear final cheat sheet?"},
         ],
     },
 }
@@ -770,8 +786,7 @@ def _default_state(mode: str) -> Dict[str, Any]:
         "answers": {},
         "active_section": "",
         "variables": {},
-
-        # NEW: batch confirmations (checkpoint + final)
+        # batch confirmations (checkpoint + final)
         "awaiting_confirm": False,
         "pending_action": None,         # "checkpoint" | "final"
         "pending_checkpoint_upto": 0,   # step_index at time of checkpoint confirm
@@ -885,14 +900,9 @@ def _make_final_user_message(mode: str, state: Dict[str, Any], info: str, user_n
         f"ANSWERS:\n{answers_block}\n\n"
         f"INFORMATION (background support):\n{info}\n\n"
         f"FINAL TASK:\n"
-        f"- If template is 'Build my confidence': summarise confidence plan in 5–7 short bullet points.\n"
-        f"- If template is 'Prepare for difficult behaviours':\n"
-        f"  Output exactly:\n"
-        f"  1) scenario: <scenario>\n"
-        f"  2) cheat sheet: <anticipate_tactics> -> <response_bullet> -> <move_on_air>\n"
-        f"  3) optional: purpose: <purpose> (one short line)\n"
-        f"  Then end with one short optional next step question.\n"
-        f"- Do NOT output field-by-field arrows like 'scenario -> ... -> ...'.\n"
+        f"- Produce the final output following the system rules.\n"
+        f"- Rephrase: do not copy the user's wording verbatim.\n"
+        f"- Do not output internal field keys or technical labels.\n"
     )
 
 
@@ -942,10 +952,7 @@ def _set_active_section(mode: str, state: Dict[str, Any], active_section: str) -
 
 
 def _should_checkpoint_confirm(mode: str, state: Dict[str, Any]) -> bool:
-    """
-    Ask confirmation after every N answers, but not at the very end.
-    Also never spam: only if not already awaiting confirm.
-    """
+    # confirm after every N answers, not at the end, and never if already awaiting confirm
     if state.get("awaiting_confirm"):
         return False
     n = max(2, int(CONFIRM_EVERY_N or 3))
@@ -959,18 +966,15 @@ def _should_checkpoint_confirm(mode: str, state: Dict[str, Any]) -> bool:
 
 
 def _checkpoint_prompt(mode: str, state: Dict[str, Any]) -> str:
-    step_index = int(state.get("step_index") or 0)
-    keys = [s["key"] for s in _steps(mode)]
-    upto_keys = keys[:step_index]
-    recent = upto_keys[max(0, step_index - max(2, int(CONFIRM_EVERY_N or 3))):]
-    recent_str = ", ".join(recent) if recent else "these"
-    return f"Got it. Should I lock in your answers for {recent_str}? Reply Yes or No."
+    # Human prompt: no technical keys, no "Reply Yes or No."
+    return "Does this feel right to lock in before we move on?"
 
 
 def _final_confirm_prompt(mode: str) -> str:
+    # Human prompt: no technical keys, no "Reply Yes or No."
     if mode == "prepare_difficult_behaviours":
-        return "Got it. Ready for me to generate your final cheat sheet now? Reply Yes or No."
-    return "Got it. Ready for me to generate your final summary now? Reply Yes or No."
+        return "Do you want me to generate the final cheat sheet now?"
+    return "Do you want me to generate the final summary now?"
 
 
 # =========================
@@ -1092,8 +1096,10 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
     # =========================
     if state.get("awaiting_confirm"):
         yn = _parse_yes_no(raw_query)
+
+        # Accept explicit yes/no in text OR UI flags
         if yn is None and not (confirm_write or auto_confirm):
-            prompt = "Please reply Yes or No."
+            prompt = "Yes or no — should we lock this in and continue?"
             return _with_debug({"text": prompt, "session_id": session_id, "done": False}, mode=mode, awaiting_confirm=True)
 
         action = _safe_str(state.get("pending_action"))
@@ -1103,21 +1109,19 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
         state["pending_checkpoint_upto"] = 0
         _save_state(session_id, state)
 
-        # If user says No (or doesn't confirm), we simply continue without "locking" anything.
+        # If user says No, continue without locking; if final, ask what to adjust
         if (yn is False) and not (confirm_write or auto_confirm):
             if action == "final":
-                # Let them adjust: ask which field they want to change
                 keys = [s["key"] for s in _steps(mode)]
-                resp_text = "No problem. Which field do you want to adjust? " + ", ".join(keys)
+                resp_text = "No problem. Which part do you want to tweak? " + ", ".join(keys)
                 return _with_debug({"text": resp_text, "session_id": session_id, "done": False}, mode=mode, final_confirm_no=True)
-            # checkpoint no -> continue asking next question
             nxt = _current_step(mode, state)
             q_text = nxt["question"] if nxt else "Okay — tell me what you want to do next."
             opener = _pick_opener(session_id, user_name, "coach_last_opener")
             text = _rewrite_bad_opening(q_text, opener)
             return _with_debug({"text": text, "session_id": session_id, "done": False}, mode=mode, checkpoint_confirm_no=True, upto=pending_upto)
 
-        # Yes (or confirm flag)
+        # Yes -> act
         if action == "final":
             _jlog("final_generate_after_confirm", session_id=session_id, mode=mode)
             info = _retrieve_info_for_coach(mode, "final summary", top_k)
@@ -1176,7 +1180,7 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
     state["step_index"] = int(state.get("step_index") or 0) + 1
     _save_state(session_id, state)
 
-    # If we just answered the last step (summary question included), ask FINAL confirm (single)
+    # If we just answered the last step, ask FINAL confirm (single)
     if _current_step(mode, state) is None:
         state["awaiting_confirm"] = True
         state["pending_action"] = "final"
@@ -1247,10 +1251,11 @@ def chat(payload: Dict = Body(...)):
                 {"role": "system", "content": SYSTEM_PROMPT_CHAT},
                 {"role": "user", "content": user},
             ],
-            temperature=0.3,
+            temperature=0.2,
         )
         answer = strip_markdown_chars((resp.choices[0].message.content or "").strip())
-        if answer:
+        # IMPORTANT: if we are refusing, do not add openers.
+        if answer and answer.strip() != "I can only help with questions related to the provided materials.":
             opener = _pick_opener(session_id, user_name, "qa_last_opener")
             answer = _rewrite_bad_opening(answer, opener)
         return {"answer": answer, "session_id": session_id}
@@ -1307,10 +1312,10 @@ def chat_sse(payload: Dict = Body(...)):
                     {"role": "system", "content": SYSTEM_PROMPT_CHAT},
                     {"role": "user", "content": user},
                 ],
-                temperature=0.3,
+                temperature=0.2,
             )
             result_text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
-            if result_text:
+            if result_text and result_text.strip() != "I can only help with questions related to the provided materials.":
                 opener = _pick_opener(session_id, user_name, "qa_last_opener")
                 result_text = _rewrite_bad_opening(result_text, opener)
         else:
