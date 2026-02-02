@@ -882,8 +882,13 @@ def _make_final_user_message(mode: str, state: Dict[str, Any], info: str, user_n
         f"INFORMATION (background support):\n{info}\n\n"
         f"FINAL TASK:\n"
         f"- If template is 'Build my confidence': summarise confidence plan in 5–7 short bullet points.\n"
-        f"- If template is 'Prepare for difficult behaviours': create a final cheat sheet.\n"
-        f"- Keep it paste-ready and mapped to the template.\n"
+        f"- If template is 'Prepare for difficult behaviours':\n"
+        f"  Output exactly:\n"
+        f"  1) scenario: <scenario>\n"
+        f"  2) cheat sheet: <anticipate_tactics> -> <response_bullet> -> <move_on_air>\n"
+        f"  3) optional: purpose: <purpose> (one short line)\n"
+        f"  Then end with one short optional next step question.\n"
+        f"- Do NOT output field-by-field arrows like 'scenario -> ... -> ...'.\n"
     )
 
 
