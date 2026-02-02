@@ -1191,6 +1191,80 @@ def chat(payload: Dict = Body(...)):
 
     return {"answer": answer, "session_id": session_id}
 
+@app.post("/chat/sse")
+def chat_sse(payload: Dict = Body(...)):
+    session_id = _get_or_create_session_id(payload)
+    _cleanup_sessions()
+
+    query = (payload.get("query") or "").strip()
+    top_k = int(payload.get("top_k") or TOP_K)
+    user_name = _extract_user_name(payload)
+
+    # reuse the same logic as /chat but as a single computed response
+    if not query:
+        result_text = ""
+    elif _is_smalltalk(query):
+        result_text = _smalltalk_reply(user_name)
+    else:
+        matches = get_matches(query, top_k)
+        context = build_context(matches) if matches else ""
+
+        if not matches:
+            user = (
+                f"USER_NAME:\n{user_name}\n\n"
+                f"USER_MESSAGE:\n{query}\n\n"
+                f"INFORMATION:\n"
+            )
+            resp = openai.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT_CHAT},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.3,
+            )
+            result_text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
+            if result_text:
+                opener = _pick_opener(session_id, user_name, "qa_last_opener")
+                result_text = _rewrite_bad_opening(result_text, opener)
+        else:
+            user = (
+                f"USER_NAME:\n{user_name}\n\n"
+                f"QUESTION:\n{query}\n\n"
+                f"INFORMATION:\n{context}"
+            )
+            resp = openai.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT_QA},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.2,
+            )
+            result_text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
+            if result_text.strip() != "I can't find this in the provided documents.":
+                opener = _pick_opener(session_id, user_name, "qa_last_opener")
+                result_text = _rewrite_bad_opening(result_text, opener)
+
+    def headers():
+        return {
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+
+    def gen():
+        start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
+        yield f"event: start\ndata: {start_payload}\n\n"
+
+        data = json.dumps({"text": result_text}, ensure_ascii=False)
+        yield f"event: chunk\ndata: {data}\n\n"
+
+        done_payload = json.dumps({"done": True}, ensure_ascii=False)
+        yield f"event: done\ndata: {done_payload}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers())
+
 
 # =========================
 # COACH ENDPOINTS
