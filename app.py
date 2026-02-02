@@ -560,6 +560,17 @@ def get_matches(query: str, top_k_final: int) -> List[Dict]:
 # =========================
 # PROMPTS
 # =========================
+
+VARIABLES_POLICY = (
+    "\nTemplate Variables rules:\n"
+    "- A Variable is a user-defined negotiation lever (e.g., price, term, volume, timing, scope, risk, concessions).\n"
+    "- Variables exist only inside a specific template section; they are contextual, not global.\n"
+    "- The user creates and edits Variables at all times.\n"
+    "- You may suggest example Variables to consider.\n"
+    "- You must never insert Variables, infer values, or overwrite existing Variables without explicit user confirmation.\n"
+    "- Variables are part of the template structure, not your memory or internal state.\n"
+)
+
 SYSTEM_PROMPT_QA = (
     "You are a friendly, helpful assistant.\n"
     "You must answer ONLY using the provided INFORMATION.\n\n"
@@ -570,7 +581,8 @@ SYSTEM_PROMPT_QA = (
     "- Your answer MUST include 2–4 short direct quotes from INFORMATION in double quotes (each quote 3–12 words).\n"
     "- If you cannot include those quotes because INFORMATION is missing or generic/not about the question, say exactly:\n"
     "  \"I can't find this in the provided documents.\".\n"
-    "- Keep it concise and practical.\n\n"
+    "- Keep it concise and practical.\n"
+    "- Do not create or assume template variables unless they appear in INFORMATION.\n\n"
     "Tone rules:\n"
     "- Start softly (one short supportive sentence) when appropriate.\n"
     "- Avoid starting with the same phrase every time.\n"
@@ -587,6 +599,7 @@ SYSTEM_PROMPT_CHAT = (
     "- Do NOT mention documents, pages, sources, citations, or the word 'context'.\n"
     "- Keep it short and natural.\n"
     "- If USER_NAME is provided, greet/address them naturally.\n"
+    + VARIABLES_POLICY
 )
 
 SYSTEM_PROMPT_COACH_FINAL = (
@@ -601,6 +614,7 @@ SYSTEM_PROMPT_COACH_FINAL = (
     "- Keep it concise but usable.\n"
     "- If USER_NAME is provided, you may mention it once.\n"
     "- End with one short optional next step question.\n"
+    + VARIABLES_POLICY
 )
 
 # =========================
