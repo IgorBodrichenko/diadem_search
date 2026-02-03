@@ -859,6 +859,19 @@ def _active_section_from_payload(payload: Dict[str, Any]) -> str:
             return s
     return ""
 
+
+def _extract_mode(payload: Dict[str, Any], fallback_text: str = "") -> str:
+    m = _safe_str(payload.get("mode"))
+    if m in TEMPLATES:
+        return m
+
+    q = _norm_q(fallback_text)
+    if "difficult" in q or "behav" in q:
+        return "prepare_difficult_behaviours"
+    if "confidence" in q:
+        return "build_confidence"
+    return "build_confidence"
+
 # =========================
 # COACH CORE (single final confirm via summary)
 # =========================
