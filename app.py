@@ -920,6 +920,41 @@ def _extract_mode(payload: Dict[str, Any], fallback_text: str = "") -> str:
     if "confidence" in q:
         return "build_confidence"
     return "build_confidence"
+def _key_to_index(mode: str) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for i, st in enumerate(_steps(mode)):
+        out[st["key"]] = i
+    return out
+
+
+def _active_section_from_payload(payload: Dict[str, Any]) -> str:
+    for k in ("active_section", "active_field", "active_step", "field_key", "section_key"):
+        s = _safe_str(payload.get(k))
+        if s:
+            return s
+    return ""
+
+
+def _set_active_section(mode: str, state: Dict[str, Any], active_section: str) -> bool:
+    active_section = (active_section or "").strip()
+    prev = _safe_str(state.get("active_section"))
+
+    if not active_section or active_section == prev:
+        return False
+
+    k2i = _key_to_index(mode)
+    if active_section in k2i:
+        state["step_index"] = k2i[active_section]
+
+    state["active_section"] = active_section
+
+    # when user jumps fields, clear confirmations + counters
+    state["awaiting_confirm"] = False
+    state["pending_action"] = None
+    state["pending_checkpoint_upto"] = 0
+    state["clarify_count"] = 0
+
+    return True
 
 # =========================
 # COACH CORE (single final confirm via summary)
