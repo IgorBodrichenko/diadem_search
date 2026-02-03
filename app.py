@@ -841,6 +841,23 @@ def _generate_final(mode: str, state: Dict[str, Any], top_k: int, user_name: str
     _save_state(session_id, state)
     return {"text": text, "session_id": session_id, "done": True}
 
+def _parse_yes_no(text: str) -> Optional[bool]:
+    t = (text or "").strip()
+    if not t:
+        return None
+    if _YES_RE.match(t):
+        return True
+    if _NO_RE.match(t):
+        return False
+    return None
+
+
+def _active_section_from_payload(payload: Dict[str, Any]) -> str:
+    for k in ("active_section", "active_field", "active_step", "field_key", "section_key"):
+        s = _safe_str(payload.get(k))
+        if s:
+            return s
+    return ""
 
 # =========================
 # COACH CORE (single final confirm via summary)
@@ -1139,20 +1156,6 @@ def coach_chat(payload: Dict = Body(...)):
 def coach_sse(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
 
-    if DEBUG:
-        _jlog(
-            "coach_sse_in",
-            session_id=session_id,
-            mode=_safe_str(payload.get("mode")),
-            start_template=_as_bool(payload.get("start_template")),
-            reset=_as_bool(payload.get("reset")),
-            confirm_write=_as_bool(payload.get("confirm_write")) or _as_bool(payload.get("write_confirmed")),
-            active_section=_active_section_from_payload(payload),
-            raw_query_preview=_extract_user_text(payload)[:120],
-        )
-
-    result = coach_turn_server_state(payload, session_id=session_id, stream=False)
-
     def headers():
         return {
             "Cache-Control": "no-cache",
@@ -1161,17 +1164,33 @@ def coach_sse(payload: Dict = Body(...)):
         }
 
     def gen():
-        start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
-        yield f"event: start\ndata: {start_payload}\n\n"
+        try:
+            start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
+            yield f"event: start\ndata: {start_payload}\n\n"
 
-        data = json.dumps({"text": result.get("text", "")}, ensure_ascii=False)
-        yield f"event: chunk\ndata: {data}\n\n"
+            result = coach_turn_server_state(payload, session_id=session_id, stream=False)
 
-        done_payload = json.dumps({"done": bool(result.get("done"))}, ensure_ascii=False)
-        yield f"event: done\ndata: {done_payload}\n\n"
+            # гарантируем dict
+            if not isinstance(result, dict):
+                result = {"text": "Internal error.", "done": False}
+
+            chunk_payload = json.dumps({"text": result.get("text", "")}, ensure_ascii=False)
+            yield f"event: chunk\ndata: {chunk_payload}\n\n"
+
+            done_payload = json.dumps({"done": bool(result.get("done"))}, ensure_ascii=False)
+            yield f"event: done\ndata: {done_payload}\n\n"
+
+        except Exception as e:
+            _jlog("coach_sse_error", session_id=session_id, err=str(e)[:800])
+
+            # SSE-friendly error
+            err_chunk = json.dumps({"text": "Internal error. Please retry."}, ensure_ascii=False)
+            yield f"event: chunk\ndata: {err_chunk}\n\n"
+
+            err_done = json.dumps({"done": True}, ensure_ascii=False)
+            yield f"event: done\ndata: {err_done}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers())
-
 
 @app.post("/coach/reset")
 def coach_reset(payload: Dict = Body(...)):
