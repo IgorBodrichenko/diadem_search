@@ -798,6 +798,55 @@ def _default_state(mode: str) -> Dict[str, Any]:
         "clarify_count": 0,
     }
 
+def _load_state(session_id: str, mode: str) -> Tuple[Dict[str, Any], bool]:
+    entry = _db_get(session_id) or {}
+    st = entry.get("state")
+
+    # new session / corrupted
+    if not isinstance(st, dict):
+        st = _default_state(mode)
+        entry["state"] = st
+        _db_set(session_id, entry)
+        return st, False
+
+    # mode switch -> reset
+    if st.get("mode") != mode:
+        st = _default_state(mode)
+        entry["state"] = st
+        _db_set(session_id, entry)
+        return st, True
+
+    # defensive defaults
+    if "answers" not in st or not isinstance(st["answers"], dict):
+        st["answers"] = {}
+    if "step_index" not in st:
+        st["step_index"] = 0
+    if "variables" not in st or not isinstance(st["variables"], dict):
+        st["variables"] = {}
+    if "active_section" not in st:
+        st["active_section"] = ""
+    if "awaiting_confirm" not in st:
+        st["awaiting_confirm"] = False
+    if "pending_action" not in st:
+        st["pending_action"] = None
+    if "pending_checkpoint_upto" not in st:
+        st["pending_checkpoint_upto"] = 0
+    if "template_done" not in st:
+        st["template_done"] = False
+    if "clarify_count" not in st:
+        st["clarify_count"] = 0
+
+    st["mode"] = mode
+    entry["state"] = st
+    _db_set(session_id, entry)
+    return st, True
+
+
+def _save_state(session_id: str, state: Dict[str, Any]) -> None:
+    entry = _db_get(session_id) or {}
+    entry["state"] = state or {}
+    _db_set(session_id, entry)
+
 
 def _should_checkpoint_confirm(mode: str, state: Dict[str, Any]) -> bool:
     if state.get("awaiting_confirm"):
