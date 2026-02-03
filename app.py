@@ -847,6 +847,18 @@ def _save_state(session_id: str, state: Dict[str, Any]) -> None:
     entry["state"] = state or {}
     _db_set(session_id, entry)
 
+def _steps(mode: str) -> List[Dict[str, Any]]:
+    return TEMPLATES[mode]["steps"]
+
+def _current_step(mode: str, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    steps = _steps(mode)
+    idx = int(state.get("step_index") or 0)
+    if idx < 0:
+        idx = 0
+    if idx >= len(steps):
+        return None
+    return steps[idx]
+
 
 def _should_checkpoint_confirm(mode: str, state: Dict[str, Any]) -> bool:
     if state.get("awaiting_confirm"):
