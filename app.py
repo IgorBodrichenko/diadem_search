@@ -627,6 +627,33 @@ def get_matches(query: str, top_k_final: int) -> List[Dict]:
 
     return reranked
 
+def _reflect_line() -> str:
+    return random.choice(["Got it.", "Okay.", "Thanks — noted.", "Understood.", "That helps."])
+
+def _retrieve_info_for_coach(mode: str, query: str, top_k: int) -> str:
+    rag_query = f"{mode}: {query}"
+    matches = get_matches(rag_query, top_k)
+    return build_context(matches)
+
+def _make_final_user_message(mode: str, state: Dict[str, Any], info: str, user_name: str) -> str:
+    tpl = TEMPLATES[mode]
+    steps = tpl["steps"]
+    answers_lines = []
+    for st in steps:
+        k = st["key"]
+        if k in state.get("answers", {}):
+            answers_lines.append(f"- {k}: {state['answers'][k]}")
+    answers_block = "\n".join(answers_lines) if answers_lines else "(none)"
+    name_line = user_name if user_name else ""
+    return (
+        f"USER_NAME:\n{name_line}\n\n"
+        f"TEMPLATE: {tpl['title']} ({mode})\n\n"
+        f"ANSWERS:\n{answers_block}\n\n"
+        f"INFORMATION (background support):\n{info}\n\n"
+        f"FINAL TASK:\n"
+        f"- If template is 'Build my confidence': summarise confidence plan in 5–7 short bullet points.\n"
+        f"- If template is 'Prepare for difficult behaviours': create a final cheat sheet.\n"
+    )
 
 # =========================
 # PROMPTS
@@ -746,7 +773,6 @@ SYSTEM_PROMPT_COACH_FINAL = (
 # =========================
 # COACH / TEMPLATE ENGINE
 # =========================
-CONFIRM_EVERY_N = int(os.getenv("CONFIRM_EVERY_N", "3"))
 
 TEMPLATES: Dict[str, Dict[str, Any]] = {
     "build_confidence": {
@@ -1257,8 +1283,12 @@ def chat_sse(payload: Dict = Body(...)):
 @app.post("/coach/chat")
 def coach_chat(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
-    out = coach_turn_server_state(payload, session_id=session_id, stream=False)
-    return JSONResponse(out)
+    try:
+        out = coach_turn_server_state(payload, session_id=session_id, stream=False)
+        return JSONResponse(out)
+    except Exception as e:
+        _jlog("coach_chat_error", session_id=session_id, err=str(e))
+        return JSONResponse({"text": "Server error.", "session_id": session_id, "done": False}, status_code=500)
 
 
 @app.post("/coach/sse")
@@ -1277,7 +1307,11 @@ def coach_sse(payload: Dict = Body(...)):
             start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
             yield f"event: start\ndata: {start_payload}\n\n"
 
-            result = coach_turn_server_state(payload, session_id=session_id, stream=False)
+            try:
+                result = coach_turn_server_state(payload, session_id=session_id, stream=False)
+            except Exception as e:
+                _jlog("coach_sse_error", session_id=session_id, err=str(e))
+                result = {"text": "Server error.", "session_id": session_id, "done": False}
 
             # гарантируем dict
             if not isinstance(result, dict):
