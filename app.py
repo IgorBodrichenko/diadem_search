@@ -1516,12 +1516,19 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
     if dv is not None:
         st["deal_value"] = dv
 
-    # help_accepted flag
+
+    # help_accepted: explicit flag OR infer from user's "yes/no" text at the consent step
     help_accepted = payload.get("help_accepted")
     if help_accepted is None:
         help_accepted = payload.get("helpAccepted")
     if help_accepted is not None:
         st["help_accepted"] = _as_bool(help_accepted)
+    elif st.get("help_accepted") is None:
+        # Bubble may only send user_message="yes"/"no". Infer consent from text once.
+        yn = _parse_yes_no(user_message)
+        if yn is not None:
+            st["help_accepted"] = yn
+
 
     user_name = _extract_user_name(payload)
 
