@@ -1254,8 +1254,8 @@ def chat(payload: Dict = Body(...)):
     if _is_smalltalk(query):
         return {"answer": _smalltalk_reply(user_name), "session_id": session_id}
 
-    matches = get_matches(query, top_k)
-    context = build_context(matches) if matches else ""
+    matches = get_matches(query, top_k, request_id=request_id)
+    context = build_context(matches, request_id=request_id) if matches else ""
 
     if not matches:
         user = (
@@ -1553,7 +1553,7 @@ def _truncate_words(text: str, max_words: int = 140) -> str:
         return t
     return " ".join(words[:max_words]).strip()
 
-def _master_llm_text(user_message: str, active_section_id: str, focus_field: str, deal_value: Optional[float], user_name: str, clarify_count: int) -> str:
+def _master_llm_text(user_message: str, active_section_id: str, focus_field: str, deal_value: Optional[float], user_name: str, clarify_count: int, info: str) -> str:
     # Build a compact instruction that nudges the model to answer for the active field.
     deal_line = "" if deal_value is None else f"DEAL_VALUE: {deal_value}\n"
     name_line = user_name.strip() if user_name else ""
@@ -1563,6 +1563,7 @@ def _master_llm_text(user_message: str, active_section_id: str, focus_field: str
         f"FOCUS_FIELD: {focus_field}\n"
         f"{deal_line}"
         f"USER_MESSAGE: {user_message}\n\n"
+        f"INFORMATION:\n{info}\n\n"
         "TASK: Help the user fill the MASTER template.\n"
         "- If FOCUS_FIELD is set: explain what to type there + give 1–2 examples.\n"
         "- If user asks 'what variables': suggest 3–6 variables with short whys.\n"
@@ -1672,6 +1673,12 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
     # (We keep this light because user may want help elsewhere.)
     needs_deal_value_hint = st.get("deal_value") is None and (focus_field.lower() in ("deal_value", "dealvalue", "value") or "deal value" in user_message.lower())
 
+
+    # --- RAG retrieval for MASTER template (always) ---
+    request_id = str(uuid.uuid4())[:8]
+    rag_query = f"master_template {active_section_id} {focus_field}: {user_message}".strip()
+    matches = get_matches(rag_query, TOP_K, request_id=request_id)
+    info = build_context(matches, request_id=request_id) if matches else ""
     clarify_count = int(st.get("clarify_count") or 0)
 
     # Generate guidance text (text-only)
@@ -1683,6 +1690,7 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
             deal_value=st.get("deal_value"),
             user_name=user_name,
             clarify_count=clarify_count,
+            info=info,
         )
     except Exception as e:
         _jlog("master_template_llm_error", session_id=session_id, err=str(e)[:800])
