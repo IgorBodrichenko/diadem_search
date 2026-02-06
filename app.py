@@ -1553,13 +1553,35 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
             "done": False,
         }
 
-    # If user hasn't sent anything, prompt gently
+    # If user hasn't sent anything, prompt gently — but NEVER lose focus
     if not user_message:
         _mnt_save_state_text(session_id, st)
+
         ff = (st.get("focus_field") or "").strip()
+        sec = (st.get("active_section_id") or "").strip()
+
         if ff:
-            return {"session_id": session_id, "mode": MASTER_MODE, "text": f"What are you trying to write in '{ff}'?", "done": False}
-        return {"session_id": session_id, "mode": MASTER_MODE, "text": "Which part are you filling right now (deal value, variables, goals, walk-away, concessions, etc.)?", "done": False}
+            return {
+                "session_id": session_id,
+                "mode": MASTER_MODE,
+                "text": f"You’re working on '{ff}'. What are you unsure about in this field?",
+                "done": False,
+            }
+
+        if sec:
+            return {
+                "session_id": session_id,
+                "mode": MASTER_MODE,
+                "text": f"You’re in the '{sec}' section. What decision are you trying to make here?",
+                "done": False,
+            }
+
+        return {
+            "session_id": session_id,
+            "mode": MASTER_MODE,
+            "text": "Which part are you filling right now (deal value, variables, goals, walk-away, concessions, etc.)?",
+            "done": False,
+        }
 
     # If deal value missing and user is in that field (or mentions it), nudge but still answer
     # (We keep this light because user may want help elsewhere.)
