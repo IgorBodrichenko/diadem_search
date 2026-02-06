@@ -61,6 +61,11 @@ MIN_OVERLAP_SCORE = float(os.getenv("MIN_OVERLAP_SCORE", "1.3"))
 MULTI_QUERY_K = int(os.getenv("MULTI_QUERY_K", "3"))
 DIVERSITY_SAME_SOURCE_CAP = int(os.getenv("DIVERSITY_SAME_SOURCE_CAP", "3"))
 
+# Priority boost for specific documents (e.g., Negotiation.pdf vectors tagged with metadata priority=2)
+# Applied during reranking; base retrieval is still semantic similarity.
+PRIORITY_BOOST = float(os.getenv("PRIORITY_BOOST", "0.6"))  # bonus added per priority level above 1
+PRIORITY_MAX = int(os.getenv("PRIORITY_MAX", "3"))          # safety clamp (e.g., 1..3)
+
 # IMPORTANT: confirmation cadence (PDF intent: not after every answer)
 CONFIRM_EVERY_N = int(os.getenv("COACH_CONFIRM_EVERY_N", "3"))  # checkpoint confirm after N answers (default 3)
 
@@ -498,6 +503,15 @@ def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
 
     for m in matches or []:
         md = m.get("metadata") or {}
+        # priority is optional metadata (default 1). Higher = slightly boosted during rerank.
+        try:
+            pr = int(md.get("priority") or 1)
+        except Exception:
+            pr = 1
+        if pr < 1:
+            pr = 1
+        if pr > PRIORITY_MAX:
+            pr = PRIORITY_MAX
         text = (md.get("text") or "").strip()
         if not text:
             continue
@@ -533,7 +547,7 @@ def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
         except Exception:
             pscore = 0.0
 
-        final = (overlap_q * 1.25) + (overlap_hint * 1.6) + bonus + (pscore * 0.25) - penalty
+        final = (overlap_q * 1.25) + (overlap_hint * 1.6) + bonus + (pscore * 0.25) - penalty + (max(0, pr - 1) * PRIORITY_BOOST)
         scored.append((final, m))
 
     scored.sort(key=lambda x: x[0], reverse=True)
