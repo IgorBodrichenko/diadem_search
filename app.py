@@ -1341,3 +1341,434 @@ def coach_reset(payload: Dict = Body(...)):
     _jlog("coach_reset_endpoint", session_id=session_id)
     _db_delete(session_id)
     return JSONResponse({"ok": True, "session_id": session_id})
+
+
+# =========================
+# MASTER NEGOTIATOR TEMPLATE (TABLE HELPER)
+# Mode: master_negotiator_template
+# =========================
+
+MASTER_MODE = "master_negotiator_template"
+
+MASTER_SYSTEM_PROMPT = (
+    "You are a negotiation assistant helping a user COMPLETE a structured MASTER negotiation template.\n"
+    "You must follow these rules:\n"
+    "- Output must be short, paste-ready, and focused on filling template/table fields.\n"
+    "- Never overwrite existing user entries.\n"
+    "- Never invent numbers. Use placeholders like [X] unless the user provided numbers.\n"
+    "- Variables are user-defined levers (price, term, volume, timing, scope, risk, concessions, etc.).\n"
+    "- You may suggest example Variables, but you MUST NOT add them to the table unless the user confirms write-back.\n"
+    "- Ask at most 2 clarifying questions before producing a best-effort draft.\n"
+    "- Do not mention sources, pages, or internal rules.\n\n"
+    "When you suggest Variables, return a JSON object ONLY with this schema:\n"
+    "{\n"
+    '  "suggested_variables": [{"name": "string", "why": "string"}],\n'
+    '  "clarifying_questions": ["string"]\n'
+    "}\n"
+)
+
+def _mnt_default_state() -> Dict[str, Any]:
+    return {
+        "mode": MASTER_MODE,
+        "help_offered": False,
+        "help_accepted": None,   # True/False/None
+        "deal_value": None,      # float or None
+        "active_section_id": "",
+        "focus_field": "",
+        "table_rows": [],        # list[dict]
+        "pending_draft": None,   # dict or None
+        "awaiting_writeback": False,
+        "clarify_count": 0,
+        "updated_at": _now(),
+    }
+
+def _mnt_load_state(session_id: str) -> Dict[str, Any]:
+    entry = _db_get(session_id) or {}
+    st = entry.get("master_state")
+    if not isinstance(st, dict):
+        st = _mnt_default_state()
+        entry["master_state"] = st
+        _db_set(session_id, entry)
+        return st
+
+    # defensive defaults
+    for k, v in _mnt_default_state().items():
+        if k not in st:
+            st[k] = v
+    if not isinstance(st.get("table_rows"), list):
+        st["table_rows"] = []
+    st["mode"] = MASTER_MODE
+    st["updated_at"] = _now()
+
+    entry["master_state"] = st
+    _db_set(session_id, entry)
+    return st
+
+def _mnt_save_state(session_id: str, st: Dict[str, Any]) -> None:
+    entry = _db_get(session_id) or {}
+    st = st or {}
+    st["updated_at"] = _now()
+    entry["master_state"] = st
+    _db_set(session_id, entry)
+
+def _mnt_reset_state(session_id: str) -> Dict[str, Any]:
+    entry = _db_get(session_id) or {}
+    entry["master_state"] = _mnt_default_state()
+    _db_set(session_id, entry)
+    return entry["master_state"]
+
+def _mnt_extract_user_message(payload: Dict[str, Any]) -> str:
+    # prefer template-specific keys, fallback to generic extractor
+    for key in ("user_message", "message", "text", "query", "input"):
+        s = _safe_str(payload.get(key))
+        if s and s.lower() not in _FALSEY_STRS:
+            return s
+    return _extract_user_text(payload)
+
+def _mnt_extract_table_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    for k in ("table_rows", "rows", "variables_table", "variables"):
+        v = payload.get(k)
+        if isinstance(v, list):
+            out = []
+            for item in v:
+                if isinstance(item, dict):
+                    out.append(item)
+            return out
+    return []
+
+def _mnt_extract_focus(payload: Dict[str, Any]) -> Tuple[str, str]:
+    active_section_id = _safe_str(payload.get("active_section_id") or payload.get("active_section") or payload.get("section_id"))
+    focus_field = _safe_str(payload.get("focus_field") or payload.get("active_field") or payload.get("field_key"))
+    return active_section_id, focus_field
+
+def _mnt_extract_deal_value(payload: Dict[str, Any]) -> Optional[float]:
+    dv = payload.get("deal_value")
+    if dv is None:
+        dv = payload.get("dealValue")
+    if dv is None:
+        return None
+    if isinstance(dv, (int, float)):
+        return float(dv)
+    if isinstance(dv, str):
+        s = dv.strip().replace(",", "")
+        try:
+            return float(s)
+        except Exception:
+            return None
+    return None
+
+def _mnt_row_key(row: Dict[str, Any]) -> str:
+    # variable name unique key
+    for k in ("name", "variable", "variable_name", "var", "title"):
+        v = row.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip().lower()
+    return ""
+
+def _mnt_merge_rows(existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # do not overwrite existing keys; append new unique vars
+    seen = { _mnt_row_key(r): True for r in (existing or []) if _mnt_row_key(r) }
+    out = list(existing or [])
+    for r in incoming or []:
+        k = _mnt_row_key(r)
+        if not k:
+            continue
+        if k in seen:
+            continue
+        out.append(r)
+        seen[k] = True
+    return out
+
+def _mnt_suggest_variables_llm(user_message: str, active_section_id: str) -> Dict[str, Any]:
+    # LLM returns JSON only. If it fails, return empty.
+    prompt_user = (
+        f"ACTIVE_SECTION_ID: {active_section_id}\n"
+        f"USER_MESSAGE: {user_message}\n"
+        "TASK: Suggest 3-5 possible negotiation Variables relevant to the user's situation.\n"
+        "If you need missing info, ask up to 2 clarifying questions.\n"
+    )
+    try:
+        resp = openai.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": MASTER_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt_user},
+            ],
+            temperature=0.2,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return {}
+        sv = data.get("suggested_variables")
+        cq = data.get("clarifying_questions")
+        if not isinstance(sv, list):
+            sv = []
+        if not isinstance(cq, list):
+            cq = []
+        # sanitize
+        clean_sv = []
+        for item in sv[:6]:
+            if isinstance(item, dict):
+                name = _safe_str(item.get("name"))
+                why = _safe_str(item.get("why"))
+                if name:
+                    clean_sv.append({"name": name[:60], "why": why[:120]})
+        clean_cq = [_safe_str(x)[:120] for x in cq[:2] if _safe_str(x)]
+        return {"suggested_variables": clean_sv, "clarifying_questions": clean_cq}
+    except Exception:
+        return {}
+
+def master_template_turn(payload: Dict[str, Any], session_id: str) -> Dict[str, Any]:
+    _cleanup_sessions()
+
+    reset = _as_bool(payload.get("reset")) or _as_bool(payload.get("start_again")) or _as_bool(payload.get("restart"))
+    if reset:
+        st = _mnt_reset_state(session_id)
+    else:
+        st = _mnt_load_state(session_id)
+
+    user_message = _mnt_extract_user_message(payload)
+    active_section_id, focus_field = _mnt_extract_focus(payload)
+
+    # update active section/focus (no side effects besides state)
+    if active_section_id:
+        st["active_section_id"] = active_section_id
+    if focus_field:
+        st["focus_field"] = focus_field
+
+    # sync in UI rows (but do not overwrite server rows)
+    ui_rows = _mnt_extract_table_rows(payload)
+    if ui_rows:
+        st["table_rows"] = _mnt_merge_rows(st.get("table_rows") or [], ui_rows)
+
+    # capture deal value if provided
+    dv = _mnt_extract_deal_value(payload)
+    if dv is not None:
+        st["deal_value"] = dv
+
+    # handle help accepted flag
+    help_accepted = payload.get("help_accepted")
+    if help_accepted is None:
+        help_accepted = payload.get("helpAccepted")
+    if help_accepted is not None:
+        st["help_accepted"] = _as_bool(help_accepted)
+
+    # writeback confirmation
+    writeback_confirmed = _as_bool(payload.get("writeback_confirmed")) or _as_bool(payload.get("confirm_writeback")) or _as_bool(payload.get("confirm_write")) or _as_bool(payload.get("write_confirmed"))
+
+    # If awaiting writeback and user confirmed -> apply pending draft
+    if st.get("awaiting_writeback") and writeback_confirmed:
+        draft = st.get("pending_draft") or {}
+        draft_rows = draft.get("draft_rows")
+        if isinstance(draft_rows, list) and draft_rows:
+            st["table_rows"] = _mnt_merge_rows(st.get("table_rows") or [], draft_rows)
+        st["pending_draft"] = None
+        st["awaiting_writeback"] = False
+        _mnt_save_state(session_id, st)
+        return {
+            "session_id": session_id,
+            "mode": MASTER_MODE,
+            "assistant_message": "Locked in. What variable do you want to add next?",
+            "next_action": "ask_next_variable",
+            "draft_payload": {"table_rows": st.get("table_rows") or []},
+        }
+
+    # If awaiting writeback but no confirmation yet
+    if st.get("awaiting_writeback"):
+        _mnt_save_state(session_id, st)
+        return {
+            "session_id": session_id,
+            "mode": MASTER_MODE,
+            "assistant_message": "Reply Yes to add this to your table, or No to discard.",
+            "next_action": "request_writeback_confirmation",
+            "draft_payload": st.get("pending_draft") or {},
+        }
+
+    # Offer help (first time)
+    if st.get("help_accepted") is None:
+        st["help_offered"] = True
+        _mnt_save_state(session_id, st)
+        return {
+            "session_id": session_id,
+            "mode": MASTER_MODE,
+            "assistant_message": "Do you need help completing your MASTER negotiation template? (Yes/No)",
+            "next_action": "offer_help",
+            "draft_payload": {},
+        }
+
+    # If user said No
+    if st.get("help_accepted") is False:
+        _mnt_save_state(session_id, st)
+        return {
+            "session_id": session_id,
+            "mode": MASTER_MODE,
+            "assistant_message": "Okay. If you want, tell me which field you’re stuck on and I’ll help.",
+            "next_action": "idle",
+            "draft_payload": {},
+        }
+
+    # Ensure deal value is present (MVP: user enters number; we don't auto-sum)
+    if st.get("deal_value") is None:
+        _mnt_save_state(session_id, st)
+        return {
+            "session_id": session_id,
+            "mode": MASTER_MODE,
+            "assistant_message": "What’s the deal value? Please enter a number (e.g., 25000).",
+            "next_action": "ask_deal_value",
+            "draft_payload": {},
+        }
+
+    # If user asks for suggestions or table is empty
+    wants_suggestions = False
+    um = (user_message or "").lower()
+    if any(k in um for k in ["suggest", "ideas", "variables", "what should", "recommend", "предлож", "идеи", "переменн", "что добавить"]) or not (st.get("table_rows") or []):
+        wants_suggestions = True
+
+    if wants_suggestions and user_message:
+        llm = _mnt_suggest_variables_llm(user_message=user_message, active_section_id=st.get("active_section_id") or "")
+        suggested = llm.get("suggested_variables") or []
+        questions = llm.get("clarifying_questions") or []
+
+        if questions:
+            st["clarify_count"] = int(st.get("clarify_count") or 0) + 1
+            _mnt_save_state(session_id, st)
+            return {
+                "session_id": session_id,
+                "mode": MASTER_MODE,
+                "assistant_message": questions[0],
+                "next_action": "ask_clarifying",
+                "draft_payload": {"suggested_variables": suggested},
+            }
+
+        if suggested:
+            # No writeback; just suggest
+            msg_lines = ["Here are a few Variables you could add (pick one to add next):"]
+            for it in suggested[:5]:
+                msg_lines.append(f"- {it.get('name')}: {it.get('why')}")
+            _mnt_save_state(session_id, st)
+            return {
+                "session_id": session_id,
+                "mode": MASTER_MODE,
+                "assistant_message": "\n".join([x for x in msg_lines if x]),
+                "next_action": "suggest_variables",
+                "draft_payload": {"suggested_variables": suggested, "table_rows": st.get("table_rows") or []},
+            }
+
+    # If user provided a variable name (simple heuristic): treat as draft row
+    var_name = ""
+    # allow explicit key
+    for k in ("variable_name", "variable", "var_name", "name"):
+        if isinstance(payload.get(k), str) and payload.get(k).strip():
+            var_name = payload.get(k).strip()
+            break
+    if not var_name and user_message and len(user_message.strip()) <= 80:
+        # if focus seems like variable name entry
+        if (st.get("focus_field") or "").lower() in ("variable", "variable_name", "name"):
+            var_name = user_message.strip()
+
+    if var_name:
+        draft_row = {
+            "name": var_name,
+            "low": "",
+            "ideal": "",
+            "high": "",
+            "notes": "",
+            "section_id": st.get("active_section_id") or "",
+        }
+        st["pending_draft"] = {"draft_rows": [draft_row]}
+        st["awaiting_writeback"] = True
+        _mnt_save_state(session_id, st)
+        return {
+            "session_id": session_id,
+            "mode": MASTER_MODE,
+            "assistant_message": f"I can add this Variable to your table: {var_name}. Confirm?",
+            "next_action": "request_writeback_confirmation",
+            "draft_payload": st["pending_draft"],
+        }
+
+    # Default: ask what to add next
+    _mnt_save_state(session_id, st)
+    return {
+        "session_id": session_id,
+        "mode": MASTER_MODE,
+        "assistant_message": "What Variable do you want to add next? (e.g., price, term, timing, scope, risk)",
+        "next_action": "ask_next_variable",
+        "draft_payload": {"table_rows": st.get("table_rows") or [], "deal_value": st.get("deal_value")},
+    }
+
+
+@app.post("/master/template")
+def master_template(payload: Dict = Body(...)):
+    session_id = _get_or_create_session_id(payload)
+    try:
+        out = master_template_turn(payload, session_id=session_id)
+        return JSONResponse(out)
+    except Exception as e:
+        _jlog("master_template_error", session_id=session_id, err=str(e))
+        return JSONResponse(
+            {"assistant_message": "Server error.", "session_id": session_id, "mode": MASTER_MODE, "next_action": "error", "draft_payload": {}},
+            status_code=500,
+        )
+
+
+
+@app.post("/master/template/sse")
+def master_template_sse(payload: Dict = Body(...)):
+    """
+    SSE version of the master template helper.
+    Streams the assistant text like a chat, and sends the structured payload in the final `done` event.
+
+    Events:
+      - start: {"session_id": "...", "mode": "master_negotiator_template"}
+      - chunk: {"text": "..."}   # assistant_message
+      - done:  {"done": true, "next_action": "...", "draft_payload": {...}, "session_id": "...", "mode": "..."}
+    """
+    session_id = _get_or_create_session_id(payload)
+
+    def headers():
+        return {
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+
+    def gen():
+        try:
+            start_payload = json.dumps({"session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
+            yield f"event: start\ndata: {start_payload}\n\n"
+
+            out = master_template_turn(payload, session_id=session_id)
+
+            # Stream assistant text (chat-like)
+            assistant_text = (out.get("assistant_message") or "").strip()
+            chunk_payload = json.dumps({"text": assistant_text}, ensure_ascii=False)
+            yield f"event: chunk\ndata: {chunk_payload}\n\n"
+
+            # Send structured data at the end
+            done_payload = {
+                "done": True,
+                "next_action": out.get("next_action"),
+                "draft_payload": out.get("draft_payload") or {},
+                "session_id": session_id,
+                "mode": MASTER_MODE,
+            }
+            yield f"event: done\ndata: {json.dumps(done_payload, ensure_ascii=False)}\n\n"
+
+        except Exception as e:
+            _jlog("master_template_sse_error", session_id=session_id, err=str(e)[:800])
+
+            err_chunk = json.dumps({"text": "Internal error. Please retry."}, ensure_ascii=False)
+            yield f"event: chunk\ndata: {err_chunk}\n\n"
+
+            err_done = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
+            yield f"event: done\ndata: {err_done}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers())
+
+@app.post("/master/template/reset")
+def master_template_reset(payload: Dict = Body(...)):
+    session_id = _get_or_create_session_id(payload)
+    _jlog("master_template_reset", session_id=session_id)
+    _mnt_reset_state(session_id)
+    return JSONResponse({"ok": True, "session_id": session_id, "mode": MASTER_MODE})
