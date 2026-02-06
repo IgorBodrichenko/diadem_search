@@ -65,6 +65,15 @@ DIVERSITY_SAME_SOURCE_CAP = int(os.getenv("DIVERSITY_SAME_SOURCE_CAP", "3"))
 # Applied during reranking; base retrieval is still semantic similarity.
 PRIORITY_BOOST = float(os.getenv("PRIORITY_BOOST", "0.6"))  # bonus added per priority level above 1
 PRIORITY_MAX = int(os.getenv("PRIORITY_MAX", "3"))          # safety clamp (e.g., 1..3)
+# Search trace logging (human-readable, safe to share with clients)
+SEARCH_DEBUG_LOGS = os.getenv("SEARCH_DEBUG_LOGS", "0").strip().lower() in ("1","true","yes","y","on")
+SEARCH_LOG_MAX_MATCHES = int(os.getenv("SEARCH_LOG_MAX_MATCHES", "8"))   # how many matches to print
+SEARCH_LOG_TEXT_PREVIEW = int(os.getenv("SEARCH_LOG_TEXT_PREVIEW", "140"))  # chars of text preview in logs
+
+def _slog(event: str, **fields):
+    """Search logs (opt-in) that you can copy from server logs."""
+    if SEARCH_DEBUG_LOGS:
+        _jlog(event, **fields)
 
 # IMPORTANT: confirmation cadence (PDF intent: not after every answer)
 CONFIRM_EVERY_N = int(os.getenv("COACH_CONFIRM_EVERY_N", "3"))  # checkpoint confirm after N answers (default 3)
@@ -569,7 +578,7 @@ def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
     return out
 
 
-def build_context(matches: List[Dict]) -> str:
+def build_context(matches: List[Dict], request_id: Optional[str] = None) -> str:
     parts: List[str] = []
     total = 0
 
@@ -586,6 +595,12 @@ def build_context(matches: List[Dict]) -> str:
         parts.append(block)
         total += len(block)
 
+    if request_id is None:
+        request_id = str(uuid.uuid4())[:8]
+    _slog("context_built",
+          request_id=request_id,
+          chunks_used=len(parts),
+          context_chars=len("\n---\n".join(parts)))
     return "\n---\n".join(parts)
 
 
@@ -608,10 +623,46 @@ def is_context_relevant(query: str, matches: List[Dict]) -> bool:
     return overlap >= MIN_OVERLAP_SCORE or len(ctx.strip()) >= MIN_CONTEXT_CHARS
 
 
-def get_matches(query: str, top_k_final: int) -> List[Dict]:
+def _brief_match(m: Dict, label: str = "") -> Dict[str, Any]:
+    md = (m.get("metadata") or {})
+    try:
+        score = float(m.get("score") or 0.0)
+    except Exception:
+        score = 0.0
+    try:
+        pr = int(md.get("priority") or 1)
+    except Exception:
+        pr = 1
+    txt = (md.get("text") or "").strip().replace("\n", " ")
+    if SEARCH_LOG_TEXT_PREVIEW and len(txt) > SEARCH_LOG_TEXT_PREVIEW:
+        txt = txt[:SEARCH_LOG_TEXT_PREVIEW] + "…"
+    return {
+        "label": label,
+        "score": round(score, 4),
+        "priority": pr,
+        "file": md.get("file_name") or "",
+        "page": md.get("page"),
+        "chunk_index": md.get("chunk_index"),
+        "id": m.get("id") or "",
+        "preview": txt,
+    }
+
+def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) -> List[Dict]:
     q_clean = (query or "").strip()
     if not q_clean:
         return []
+
+    if request_id is None:
+        request_id = str(uuid.uuid4())[:8]
+
+    _slog("search_start",
+          request_id=request_id,
+          query=q_clean,
+          top_k_final=top_k_final,
+          pinecone_topk_raw=PINECONE_TOPK_RAW,
+          multi_query_k=MULTI_QUERY_K,
+          min_match_score=MIN_MATCH_SCORE,
+          priority_boost=PRIORITY_BOOST)
 
     hint = _hint_for_question(q_clean)
     q_hint = f"{q_clean}\n{hint}".strip() if hint else ""
@@ -623,20 +674,51 @@ def get_matches(query: str, top_k_final: int) -> List[Dict]:
     if len(queries) < MULTI_QUERY_K and q_kw:
         queries.append(q_kw)
 
+    _slog("search_queries",
+          request_id=request_id,
+          queries=queries)
     all_results: List[List[Dict]] = []
     for q in queries:
         try:
+            t0 = time.time()
             vec = embed_query(q)
             res = index.query(vector=vec, top_k=PINECONE_TOPK_RAW, include_metadata=True)
-            all_results.append(res.get("matches") or [])
+            ms = int((time.time() - t0) * 1000)
+            matches = res.get("matches") or []
+            all_results.append(matches)
+            _slog("pinecone_query",
+                  request_id=request_id,
+                  q=q,
+                  ms=ms,
+                  matches_count=len(matches),
+                  top_matches=[_brief_match(x) for x in matches[:SEARCH_LOG_MAX_MATCHES]])
         except Exception:
             continue
 
     merged = _merge_dedup_matches(all_results)
-    merged = _filter_matches_by_score(merged)
-    reranked = _rerank(q_clean, merged, top_k_final)
+    _slog("search_merged",
+          request_id=request_id,
+          merged_count=len(merged),
+          sample=[_brief_match(x) for x in merged[:SEARCH_LOG_MAX_MATCHES]])
 
-    if not is_context_relevant(q_clean, reranked):
+    merged = _filter_matches_by_score(merged)
+    _slog("search_filtered",
+          request_id=request_id,
+          filtered_count=len(merged),
+          sample=[_brief_match(x) for x in merged[:SEARCH_LOG_MAX_MATCHES]])
+
+    reranked = _rerank(q_clean, merged, top_k_final)
+    _slog("search_reranked",
+          request_id=request_id,
+          final_count=len(reranked),
+          final=[_brief_match(x) for x in reranked[:SEARCH_LOG_MAX_MATCHES]])
+
+    relevant = is_context_relevant(q_clean, reranked)
+    _slog("search_context_relevance",
+          request_id=request_id,
+          relevant=relevant,
+          kept=len(reranked))
+    if not relevant:
         return []
 
     return reranked
@@ -646,8 +728,9 @@ def _reflect_line() -> str:
 
 def _retrieve_info_for_coach(mode: str, query: str, top_k: int) -> str:
     rag_query = f"{mode}: {query}"
-    matches = get_matches(rag_query, top_k)
-    return build_context(matches)
+    request_id = str(uuid.uuid4())[:8]
+    matches = get_matches(rag_query, top_k, request_id=request_id)
+    return build_context(matches, request_id=request_id)
 
 def _make_final_user_message(mode: str, state: Dict[str, Any], info: str, user_name: str) -> str:
     tpl = TEMPLATES[mode]
@@ -1162,6 +1245,7 @@ def chat(payload: Dict = Body(...)):
     user_name = _extract_user_name(payload)
 
     session_id = _get_or_create_session_id(payload)
+    request_id = str(uuid.uuid4())[:8]
     _cleanup_sessions()
 
     if not query:
@@ -1220,6 +1304,7 @@ def chat(payload: Dict = Body(...)):
 @app.post("/chat/sse")
 def chat_sse(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
+    request_id = str(uuid.uuid4())[:8]
     _cleanup_sessions()
 
     query = (payload.get("query") or "").strip()
@@ -1231,7 +1316,7 @@ def chat_sse(payload: Dict = Body(...)):
     elif _is_smalltalk(query):
         result_text = _smalltalk_reply(user_name)
     else:
-        matches = get_matches(query, top_k)
+        matches = get_matches(query, top_k, request_id=request_id)
         context = build_context(matches) if matches else ""
 
         if not matches:
