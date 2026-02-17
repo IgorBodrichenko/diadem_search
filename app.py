@@ -65,6 +65,11 @@ DIVERSITY_SAME_SOURCE_CAP = int(os.getenv("DIVERSITY_SAME_SOURCE_CAP", "3"))
 # Applied during reranking; base retrieval is still semantic similarity.
 PRIORITY_BOOST = float(os.getenv("PRIORITY_BOOST", "0.6"))  # bonus added per priority level above 1
 PRIORITY_MAX = int(os.getenv("PRIORITY_MAX", "3"))          # safety clamp (e.g., 1..3)
+
+# Concept boosting (Concept -> Document -> Page -> Chunk)
+# Chunks tagged with metadata.concept (e.g., "negotiation") can be softly boosted at query time.
+CONCEPT_BOOST = float(os.getenv("CONCEPT_BOOST", "0.35"))  # bonus added when chunk concept matches detected concept
+CONCEPT_MAX = int(os.getenv("CONCEPT_MAX", "3"))           # safety clamp for concept bonus multiplier
 # Search trace logging (human-readable, safe to share with clients)
 SEARCH_DEBUG_LOGS = os.getenv("SEARCH_DEBUG_LOGS", "0").strip().lower() in ("1","true","yes","y","on")
 SEARCH_LOG_MAX_MATCHES = int(os.getenv("SEARCH_LOG_MAX_MATCHES", "8"))   # how many matches to print
@@ -379,6 +384,35 @@ def _hint_for_question(question: str) -> str:
             if key in qn:
                 return item["hint"]
     return ""
+# =========================
+# CONCEPT DETECTION (soft routing)
+# =========================
+# Lightweight heuristic concept detection to support Concept -> Document -> Page -> Chunk.
+# We keep this non-breaking: if no concept is detected, we fallback to "general" and apply no extra bias.
+
+_CONCEPT_KEYWORDS = {
+    "negotiation": [
+        "negotiat", "push back", "pushback", "counter", "concession", "anchor", "anchoring",
+        "walk away", "walkaway", "batna", "deal", "terms", "leverage", "power", "tactics",
+        "difficult questions", "difficult question", "master negotiator",
+    ],
+    "selling": ["sell", "selling", "objection", "pipeline", "prospect", "closing", "close", "pitch"],
+    "presenting": ["present", "presentation", "slide", "storytelling", "audience", "public speaking"],
+    "coaching": ["coach", "coaching", "feedback", "mentor", "mentoring", "one-to-one", "1:1"],
+    "emotional_intelligence": ["emotional intelligence", "eq", "self-awareness", "self awareness", "empathy", "emotional regulation"],
+}
+
+def _detect_concept(query: str) -> str:
+    q = (query or "").strip().lower()
+    q = re.sub(r"\s+", " ", q)
+    if not q:
+        return "general"
+    for concept, keys in _CONCEPT_KEYWORDS.items():
+        for k in keys:
+            if k in q:
+                return concept
+    return "general"
+
 
 
 # =========================
@@ -502,7 +536,7 @@ def _merge_dedup_matches(list_of_lists: List[List[Dict]]) -> List[Dict]:
     return list(best.values())
 
 
-def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
+def _rerank(query: str, matches: List[Dict], final_k: int, detected_concept: str = "general") -> List[Dict]:
     qt = set(_tokenize(query))
     hint = _hint_for_question(query)
     hint_toks = set(_tokenize(hint)) if hint else set()
@@ -513,6 +547,12 @@ def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
     for m in matches or []:
         md = m.get("metadata") or {}
         # priority is optional metadata (default 1). Higher = slightly boosted during rerank.
+        # concept is optional metadata (default "general"). Soft-boost when it matches detected concept.
+        c_md = (md.get("concept") or "general")
+        c_det = (detected_concept or "general")
+        c_mult = 0
+        if c_det != "general" and c_md == c_det:
+            c_mult = 1
         try:
             pr = int(md.get("priority") or 1)
         except Exception:
@@ -556,7 +596,7 @@ def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
         except Exception:
             pscore = 0.0
 
-        final = (overlap_q * 1.25) + (overlap_hint * 1.6) + bonus + (pscore * 0.25) - penalty + (max(0, pr - 1) * PRIORITY_BOOST)
+        final = (overlap_q * 1.25) + (overlap_hint * 1.6) + bonus + (pscore * 0.25) - penalty + (max(0, pr - 1) * PRIORITY_BOOST) + (c_mult * CONCEPT_BOOST)
         scored.append((final, m))
 
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -640,6 +680,7 @@ def _brief_match(m: Dict, label: str = "") -> Dict[str, Any]:
         "label": label,
         "score": round(score, 4),
         "priority": pr,
+        "concept": (md.get("concept") or ""),
         "file": md.get("file_name") or "",
         "page": md.get("page"),
         "chunk_index": md.get("chunk_index"),
@@ -662,7 +703,11 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
           pinecone_topk_raw=PINECONE_TOPK_RAW,
           multi_query_k=MULTI_QUERY_K,
           min_match_score=MIN_MATCH_SCORE,
-          priority_boost=PRIORITY_BOOST)
+          priority_boost=PRIORITY_BOOST,
+          concept_boost=CONCEPT_BOOST)
+
+    detected_concept = _detect_concept(q_clean)
+    _slog("search_concept_detected", request_id=request_id, concept=detected_concept)
 
     hint = _hint_for_question(q_clean)
     q_hint = f"{q_clean}\n{hint}".strip() if hint else ""
@@ -707,7 +752,7 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
           filtered_count=len(merged),
           sample=[_brief_match(x) for x in merged[:SEARCH_LOG_MAX_MATCHES]])
 
-    reranked = _rerank(q_clean, merged, top_k_final)
+    reranked = _rerank(q_clean, merged, top_k_final, detected_concept=detected_concept)
     _slog("search_reranked",
           request_id=request_id,
           final_count=len(reranked),
@@ -1317,7 +1362,7 @@ def chat_sse(payload: Dict = Body(...)):
         result_text = _smalltalk_reply(user_name)
     else:
         matches = get_matches(query, top_k, request_id=request_id)
-        context = build_context(matches) if matches else ""
+        context = build_context(matches, request_id=request_id) if matches else ""
 
         if not matches:
             user = (
