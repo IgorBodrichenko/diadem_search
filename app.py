@@ -403,20 +403,20 @@ _CONCEPT_KEYWORDS = {
 }
 
 def _detect_concept(query: str) -> str:
-q = (query or "").strip().lower()
-q = re.sub(r"\s+", " ", q)
-if not q:
+    q = (query or "").strip().lower()
+    q = re.sub(r"\s+", " ", q)
+    if not q:
+        return "general"
+
+    # Force negotiation concept if MASTER is referenced
+    if "master" in q and ("framework" in q or "template" in q or "negotiator" in q):
+        return "negotiation"
+
+    for concept, keys in _CONCEPT_KEYWORDS.items():
+        for k in keys:
+            if k in q:
+                return concept
     return "general"
-
-# Force negotiation concept if MASTER is referenced
-if "master" in q and ("framework" in q or "template" in q or "negotiator" in q):
-    return "negotiation"
-
-for concept, keys in _CONCEPT_KEYWORDS.items():
-    for k in keys:
-        if k in q:
-            return concept
-return "general"
 
 
 
