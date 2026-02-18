@@ -403,15 +403,20 @@ _CONCEPT_KEYWORDS = {
 }
 
 def _detect_concept(query: str) -> str:
-    q = (query or "").strip().lower()
-    q = re.sub(r"\s+", " ", q)
-    if not q:
-        return "general"
-    for concept, keys in _CONCEPT_KEYWORDS.items():
-        for k in keys:
-            if k in q:
-                return concept
+q = (query or "").strip().lower()
+q = re.sub(r"\s+", " ", q)
+if not q:
     return "general"
+
+# Force negotiation concept if MASTER is referenced
+if "master" in q and ("framework" in q or "template" in q or "negotiator" in q):
+    return "negotiation"
+
+for concept, keys in _CONCEPT_KEYWORDS.items():
+    for k in keys:
+        if k in q:
+            return concept
+return "general"
 
 
 
@@ -830,10 +835,16 @@ LIMITS_POLICY = (
 )
 
 SYSTEM_PROMPT_QA = (
+    "Use UK English spelling and tone.\n"
     "You are a negotiation assistant that can ONLY use the provided INFORMATION.\n"
     "Your job is to produce specific, usable negotiation output (scripts + options), grounded in INFORMATION.\n\n"
 
     "Hard rules:\n"
+    "Behaviour rules:\n"
+    "- If the user is preparing for a negotiation/price change and key context is missing, ask 2–4 short questions first (e.g., relationship importance, confidence level, in-person vs writing, how well they know the customer).\n"
+    "- If the user asks about the MASTER negotiator framework or template, guide them methodically (start by asking them to list their key variables/levers; offer help identifying variables).\n"
+    "- Offer the Think–Feel–Do model when relevant and help the user complete it.\n"
+    "- Stay anchored to the user’s scenario. Do not switch topics unless the user explicitly asks.\n\n"
     "- Output plain text only. NO markdown.\n"
     "- Do NOT mention document names, pages, sources, citations, or the word 'context'.\n"
     "- Do NOT copy sentences from INFORMATION. Paraphrase everything.\n"
@@ -858,6 +869,7 @@ SYSTEM_PROMPT_QA = (
 
 # Strict doc-only chat (no apple pie)
 SYSTEM_PROMPT_CHAT = (
+    "Use UK English spelling and tone.\n"
     "You are a focused assistant specialised only in the provided materials.\n"
     "You may answer ONLY if INFORMATION is provided and clearly relevant to the user's question.\n"
     "If INFORMATION is empty, missing, or not relevant to the question, you must respond exactly with:\n"
@@ -876,6 +888,7 @@ SYSTEM_PROMPT_CHAT = (
 
 # Final output must be AI-written (not pasted) and no technical keys
 SYSTEM_PROMPT_COACH_FINAL = (
+    "Use UK English spelling and tone.\n"
     "You are a professional negotiation coach.\n"
     "You may ONLY use the provided INFORMATION to shape your guidance.\n"
     "Do not rely on general negotiation knowledge outside INFORMATION.\n"
@@ -1500,6 +1513,7 @@ def coach_reset(payload: Dict = Body(...)):
 MASTER_MODE = "master_negotiator_template"
 
 MASTER_SYSTEM_PROMPT_TEXT = (
+    "Use UK English spelling and tone.\n"
     "You are a negotiation assistant helping a user COMPLETE a structured MASTER negotiation template.\n"
     "You are NOT editing any tables. You only give guidance in plain text, like a chat.\n\n"
     "Hard rules:\n"
