@@ -272,6 +272,78 @@ def strip_markdown_chars(text: str) -> str:
 
 
 # =========================
+# OUTPUT COMPLIANCE (DOC-ONLY, PASTE-READY)
+# =========================
+QA_REWRITE_ON_FAIL = os.getenv("QA_REWRITE_ON_FAIL", "1").strip().lower() in ("1","true","yes","y","on")
+
+_WEAK_SPEAK_RE = re.compile(
+    r"\b(maybe|might|could|should|consider|generally|perhaps|possibly|try|i\s+think|i\s+believe|it\s+depends)\b",
+    flags=re.IGNORECASE,
+)
+
+def _qa_has_required_sections(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return (
+        "recommended move:" in t
+        and "options:" in t
+        and "script (say this):" in t
+        and "pushback line:" in t
+    )
+
+def _qa_needs_rewrite(text: str) -> bool:
+    if not text:
+        return True
+    if _WEAK_SPEAK_RE.search(text or ""):
+        return True
+    if not _qa_has_required_sections(text):
+        return True
+    # avoid accidental reasoning/explanations
+    if re.search(r"\b(because|therefore|this means|so that|in other words)\b", text, flags=re.IGNORECASE):
+        return True
+    return False
+
+def _rewrite_qa_answer(question: str, info: str, draft: str) -> str:
+    # Strict formatter: rewrite into the exact required structure using ONLY INFORMATION.
+    # If not supported by INFORMATION -> return the exact refusal sentence.
+    sys = (
+        "Rewrite the DRAFT into the exact required structure.\n"
+        "You MUST use ONLY INFORMATION. No outside knowledge.\n"
+        "No reasoning, no explanations. No weak/hedging language.\n"
+        "Plain text only.\n"
+        "If INFORMATION is empty or not clearly relevant, output exactly:\n"
+        "\"I can't find this in the provided documents.\"\n\n"
+        "Required structure:\n"
+        "Recommended move: <one line>\n"
+        "Options:\n"
+        "- <option 1>\n"
+        "- <option 2>\n"
+        "- <option 3 (optional)>\n"
+        "Script (say this):\n"
+        "<2–4 short lines>\n"
+        "Pushback line:\n"
+        "<1–2 lines>\n"
+    )
+    user = f"QUESTION:\n{question}\n\nINFORMATION:\n{info}\n\nDRAFT:\n{draft}"
+    resp = openai.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[{"role":"system","content":sys},{"role":"user","content":user}],
+        temperature=0.0,
+    )
+    return strip_markdown_chars((resp.choices[0].message.content or "").strip())
+
+def _enforce_qa_output(question: str, info: str, answer: str) -> str:
+    if not QA_REWRITE_ON_FAIL:
+        return answer
+    if _qa_needs_rewrite(answer):
+        try:
+            fixed = _rewrite_qa_answer(question, info, answer)
+            return fixed or answer
+        except Exception:
+            return answer
+    return answer
+
+
+# =========================
 # SMALL TALK
 # =========================
 _SMALLTALK_RE = re.compile(
@@ -837,33 +909,30 @@ LIMITS_POLICY = (
 SYSTEM_PROMPT_QA = (
     "Use UK English spelling and tone.\n"
     "You are a negotiation assistant that can ONLY use the provided INFORMATION.\n"
-    "Your job is to produce specific, usable negotiation output (scripts + options), grounded in INFORMATION.\n\n"
+    "You must not add any outside knowledge, assumptions, or 'common sense'.\n"
+    "If INFORMATION is empty, missing, or not clearly relevant, respond exactly:\n"
+    "\"I can't find this in the provided documents.\".\n\n"
 
-    "Hard rules:\n"
-    "Behaviour rules:\n"
-    "- If the user is preparing for a negotiation/price change and key context is missing, ask 2–4 short questions first (e.g., relationship importance, confidence level, in-person vs writing, how well they know the customer).\n"
-    "- If the user asks about the MASTER negotiator framework or template, guide them methodically (start by asking them to list their key variables/levers; offer help identifying variables).\n"
-    "- Offer the Think–Feel–Do model when relevant and help the user complete it.\n"
-    "- Stay anchored to the user’s scenario. Do not switch topics unless the user explicitly asks.\n\n"
+    "Hard rules (must follow):\n"
     "- Output plain text only. NO markdown.\n"
     "- Do NOT mention document names, pages, sources, citations, or the word 'context'.\n"
-    "- Do NOT copy sentences from INFORMATION. Paraphrase everything.\n"
-    "- You may include at most ONE very short quoted phrase (max 6 words) only if it is essential.\n"
-    "- If INFORMATION is missing / too generic / not clearly relevant, respond exactly:\n"
-    "  \"I can't find this in the provided documents.\".\n\n"
-
-    "Make it actionable:\n"
-    "- Always include:\n"
-    "  1) Recommended move (1 line)\n"
-    "  2) 2–3 concrete options you can propose (numbers/terms where possible)\n"
-    "  3) A word-for-word script (2–4 lines) the user can say\n"
-    "  4) One pushback handling line (1–2 lines)\n"
-    "- If the user didn’t give key numbers, provide placeholders like [X], [date], [volume], [payment terms].\n"
+    "- Do NOT explain your reasoning. No analysis, no 'because', no teaching.\n"
+    "- Do NOT use weak / hedging language (avoid words like: maybe, might, could, should, consider, generally, perhaps, possibly, try).\n"
+    "- Do NOT copy sentences from INFORMATION. Paraphrase.\n"
     "- Keep it concise (<=180 words).\n\n"
 
-    "Tone:\n"
-    "- Direct, practical, confident.\n"
-    "- End with ONE short question only if absolutely needed to choose between options.\n"
+    "Your answer MUST be copy/paste-ready and follow this exact structure:\n"
+    "Recommended move: <one line>\n"
+    "Options:\n"
+    "- <option 1>\n"
+    "- <option 2>\n"
+    "- <option 3 (optional)>\n"
+    "Script (say this):\n"
+    "<2–4 short lines the user can say>\n"
+    "Pushback line:\n"
+    "<1–2 lines>\n\n"
+
+    "Placeholders: if key numbers are missing, use placeholders like [X], [date], [volume], [payment terms].\n"
 )
 
 
@@ -873,14 +942,14 @@ SYSTEM_PROMPT_CHAT = (
     "You are a focused assistant specialised only in the provided materials.\n"
     "You may answer ONLY if INFORMATION is provided and clearly relevant to the user's question.\n"
     "If INFORMATION is empty, missing, or not relevant to the question, you must respond exactly with:\n"
-    "\"I can only help with questions related to the provided materials.\"\n"
-    "\nRules:\n"
+    "\"I can only help with questions related to the provided materials.\"\n\n"
+    "Rules:\n"
     "- Output plain text only. NO markdown.\n"
     "- Do NOT mention documents, pages, sources, citations, or the word 'context'.\n"
-    "- Do NOT provide general knowledge, explanations, recipes, or advice outside INFORMATION.\n"
+    "- Do NOT provide general knowledge or advice outside INFORMATION.\n"
+    "- Do NOT explain reasoning.\n"
     "- Keep it short and neutral.\n"
     "- Do NOT ask follow-up questions when refusing.\n"
-    "- If USER_NAME is provided, you may greet them only when answering (not when refusing).\n"
     + VARIABLES_POLICY
     + ACTIVE_SECTION_POLICY
     + LIMITS_POLICY
@@ -890,7 +959,7 @@ SYSTEM_PROMPT_CHAT = (
 SYSTEM_PROMPT_COACH_FINAL = (
     "Use UK English spelling and tone.\n"
     "You are a professional negotiation coach.\n"
-    "You may ONLY use the provided INFORMATION to shape your guidance.\n"
+    "You may ONLY use the provided INFORMATION to shape your output.\n"
     "Do not rely on general negotiation knowledge outside INFORMATION.\n"
     "The guided dialogue is complete. Produce the final output now.\n\n"
 
@@ -898,26 +967,24 @@ SYSTEM_PROMPT_COACH_FINAL = (
     "- Output plain text only. NO markdown.\n"
     "- Do NOT mention documents, pages, sources, citations, or the word 'context'.\n"
     "- Do NOT introduce tactics, terms, or levers that are not supported by INFORMATION.\n"
-    "- Do NOT copy sentences verbatim from INFORMATION.\n"
-    "- Rephrase, synthesise, and apply INFORMATION to the user's situation.\n\n"
+    "- Do NOT copy sentences verbatim from INFORMATION. Paraphrase.\n"
+    "- Do NOT explain your reasoning. No analysis.\n"
+    "- Avoid weak / hedging language (maybe, might, could, should, consider, generally, perhaps, possibly, try).\n\n"
 
     "Specificity rules:\n"
-    "- Convert INFORMATION into concrete, usable negotiation language.\n"
-    "- Where INFORMATION implies options (e.g. timing, scope, commitment), make them explicit.\n"
-    "- If INFORMATION does not support a specific term (price, payment, %), use placeholders like [X], [date].\n"
-    "- Avoid generic advice (e.g. 'focus on value') unless INFORMATION explains how to do so.\n\n"
+    "- Convert INFORMATION into concrete, usable language the user can copy/paste.\n"
+    "- If INFORMATION does not support a specific term (price, payment, %), use placeholders like [X], [date].\n\n"
 
     "Output format for 'Prepare for difficult behaviours':\n"
-    "1) Scenario (1–2 sentences, rewritten).\n"
-    "2) Cheat sheet:\n"
-    "   likely line -> your response -> steer-back phrase.\n"
-    "   (All lines must be something the user could say out loud.)\n"
-    "3) Optional: one short line explaining the other party’s tactic, grounded in INFORMATION.\n"
-    "4) Optional: 1–2 concrete trade-offs supported by INFORMATION.\n\n"
+    "Scenario: <1–2 sentences>\n"
+    "Cheat sheet:\n"
+    "likely line -> your response -> steer-back phrase\n"
+    "(All lines must be something the user could say out loud.)\n"
+    "Optional: one short line naming the tactic (only if supported).\n"
+    "Optional: 1–2 concrete trade-offs (only if supported).\n\n"
 
     "Style:\n"
     "- Calm, confident, practical.\n"
-    "- Sound like a real coach preparing someone for a live conversation.\n"
     "- End with one short optional next-step question.\n"
     + VARIABLES_POLICY
     + TEMPLATE_FIRST_POLICY
@@ -1330,10 +1397,6 @@ def chat(payload: Dict = Body(...)):
             temperature=0.2,
         )
         answer = strip_markdown_chars((resp.choices[0].message.content or "").strip())
-        # IMPORTANT: if we are refusing, do not add openers.
-        if answer and answer.strip() != "I can only help with questions related to the provided materials.":
-            opener = _pick_opener(session_id, user_name, "qa_last_opener")
-            answer = _rewrite_bad_opening(answer, opener)
         return {"answer": answer, "session_id": session_id}
 
     user = (
@@ -1392,9 +1455,6 @@ def chat_sse(payload: Dict = Body(...)):
                 temperature=0.2,
             )
             result_text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
-            if result_text and result_text.strip() != "I can only help with questions related to the provided materials.":
-                opener = _pick_opener(session_id, user_name, "qa_last_opener")
-                result_text = _rewrite_bad_opening(result_text, opener)
         else:
             user = (
                 f"USER_NAME:\n{user_name}\n\n"
@@ -1410,9 +1470,6 @@ def chat_sse(payload: Dict = Body(...)):
                 temperature=0.2,
             )
             result_text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
-            if result_text.strip() != "I can't find this in the provided documents.":
-                opener = _pick_opener(session_id, user_name, "qa_last_opener")
-                result_text = _rewrite_bad_opening(result_text, opener)
 
     def headers():
         return {
