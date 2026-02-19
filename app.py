@@ -277,9 +277,29 @@ def strip_markdown_chars(text: str) -> str:
 QA_REWRITE_ON_FAIL = os.getenv("QA_REWRITE_ON_FAIL", "1").strip().lower() in ("1","true","yes","y","on")
 
 _WEAK_SPEAK_RE = re.compile(
-    r"\b(maybe|might|could|should|consider|generally|perhaps|possibly|try|i\s+think|i\s+believe|it\s+depends)\b",
+    r"\b("
+    r"maybe|might|could|should|consider|generally|perhaps|possibly|try|it\s+depends|"
+    r"i\s+think|i\s+believe|i\s+feel|i\s+understand|"
+    r"i\s+appreciate|appreciate\s+your\s+perspective|"
+    r"mutually\s+beneficial|win[-\s]?win|"
+    r"let'?s\s+focus|work\s+together|find\s+a\s+solution\s+together|"
+    r"hopefully|just|kind\s+of|sort\s+of"
+    r")\b",
     flags=re.IGNORECASE,
 )
+
+# Disallowed "defence" moves for Diadem style
+_HUMOUR_RE = re.compile(r"\b(humou?r|joke|banter|lighten\s+the\s+mood)\b", flags=re.IGNORECASE)
+
+# Disallowed logic/explanation markers (Taboo)
+_LOGIC_RE = re.compile(
+    r"\b(because|therefore|this\s+means|so\s+that|in\s+other\s+words|"
+    r"in\s+order\s+to|to\s+ensure|to\s+maintain|to\s+protect|this\s+allows)\b",
+    flags=re.IGNORECASE,
+)
+
+# Trading requirement ("If you... then I...") for QA output
+_TRADE_RE = re.compile(r"\bif\s+you\b[\s\S]{0,120}?\bthen\s+i\b", flags=re.IGNORECASE)
 
 def _qa_has_required_sections(text: str) -> bool:
     t = (text or "").strip().lower()
@@ -293,13 +313,28 @@ def _qa_has_required_sections(text: str) -> bool:
 def _qa_needs_rewrite(text: str) -> bool:
     if not text:
         return True
+
+    # Weak speak / collaboration framing
     if _WEAK_SPEAK_RE.search(text or ""):
         return True
+
+    # Humour / defence moves are not allowed in Diadem style
+    if _HUMOUR_RE.search(text or ""):
+        return True
+
+    # Required structure
     if not _qa_has_required_sections(text):
         return True
-    # avoid accidental reasoning/explanations
-    if re.search(r"\b(because|therefore|this means|so that|in other words)\b", text, flags=re.IGNORECASE):
+
+    # No logic / explaining
+    if _LOGIC_RE.search(text or ""):
         return True
+
+    # Trading: require at least one explicit trade line (If you... then I...)
+    # This keeps options in the Diadem "conditional movement" style.
+    if not _TRADE_RE.search(text or ""):
+        return True
+
     return False
 
 def _rewrite_qa_answer(question: str, info: str, draft: str) -> str:
@@ -308,7 +343,9 @@ def _rewrite_qa_answer(question: str, info: str, draft: str) -> str:
     sys = (
         "Rewrite the DRAFT into the exact required structure.\n"
         "You MUST use ONLY INFORMATION. No outside knowledge.\n"
-        "No reasoning, no explanations. No weak/hedging language.\n"
+        "No reasoning, no explanations. No logic.\n"
+        "No humour. No rapport-building. No collaboration framing.\n"
+        "Use declarative, calm, firm sentences only.\n"
         "Plain text only.\n"
         "If INFORMATION is empty or not clearly relevant, output exactly:\n"
         "\"I can't find this in the provided documents.\"\n\n"
@@ -321,7 +358,12 @@ def _rewrite_qa_answer(question: str, info: str, draft: str) -> str:
         "Script (say this):\n"
         "<2–4 short lines>\n"
         "Pushback line:\n"
-        "<1–2 lines>\n"
+        "<1–2 lines>\n\n"
+        "Hard constraints:\n"
+        "- At least ONE option must be a trade in the exact style: 'If you..., then I...'.\n"
+        "- Do NOT use: maybe/might/could/should/consider/I think/I believe/I feel/I understand.\n"
+        "- Do NOT use: win-win, mutually beneficial, let's focus, work together.\n"
+        "- Do NOT use any explanation markers: because/therefore/so that/in order to/to ensure.\n"
     )
     user = f"QUESTION:\n{question}\n\nINFORMATION:\n{info}\n\nDRAFT:\n{draft}"
     resp = openai.chat.completions.create(
@@ -953,10 +995,14 @@ SYSTEM_PROMPT_QA = (
     "Hard rules (must follow):\n"
     "- Output plain text only. NO markdown.\n"
     "- Do NOT mention document names, pages, sources, citations, or the word 'context'.\n"
-    "- Do NOT explain your reasoning. No analysis, no 'because', no teaching.\n"
-    "- Do NOT use weak / hedging language (avoid words like: maybe, might, could, should, consider, generally, perhaps, possibly, try).\n"
+    "- Do NOT explain your reasoning. No analysis, no teaching.\n"
+    "- Do NOT use humour or jokes.\n"
+    "- Do NOT use collaboration/rapport framing (no: let's focus, work together, I appreciate, mutually beneficial, win-win).\n"
+    "- Do NOT use weak / hedging language (avoid: maybe, might, could, should, consider, generally, perhaps, possibly, try, I think, I believe, I feel, I understand).\n"
+    "- Do NOT use logic/explanation markers (no: because, therefore, so that, in other words, in order to, to ensure, to maintain, to protect, this allows).\n"
     "- Do NOT copy sentences from INFORMATION. Paraphrase.\n"
-    "- Keep it concise (<=180 words).\n\n"
+    "- Keep it concise (<=180 words).\n"
+    "- Use declarative, calm, firm sentences.\n\n"
 
     "Your answer MUST be copy/paste-ready and follow this exact structure:\n"
     "Recommended move: <one line>\n"
@@ -969,10 +1015,11 @@ SYSTEM_PROMPT_QA = (
     "Pushback line:\n"
     "<1–2 lines>\n\n"
 
+    "Trading rule:\n"
+    "- At least ONE option must use the exact structure: If you..., then I...\n\n"
+
     "Placeholders: if key numbers are missing, use placeholders like [X], [date], [volume], [payment terms].\n"
 )
-
-
 # Strict doc-only chat (no apple pie)
 SYSTEM_PROMPT_CHAT = (
     "Use UK English spelling and tone.\n"
@@ -1448,10 +1495,13 @@ def chat(payload: Dict = Body(...)):
             {"role": "system", "content": SYSTEM_PROMPT_QA},
             {"role": "user", "content": user},
         ],
-        temperature=0.2,
+        temperature=0.0,
     )
 
     answer = strip_markdown_chars((resp.choices[0].message.content or "").strip())
+    # Enforce Diadem QA rules (no weak speak / humour / logic, and require trading)
+    answer = _enforce_qa_output(query, context, answer)
+
     if answer.strip() != "I can't find this in the provided documents.":
         opener = _pick_opener(session_id, user_name, "qa_last_opener")
         answer = _rewrite_bad_opening(answer, opener)
@@ -1492,6 +1542,7 @@ def chat_sse(payload: Dict = Body(...)):
                 temperature=0.2,
             )
             result_text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
+            result_text = _enforce_qa_output(query, context, result_text)
         else:
             user = (
                 f"USER_NAME:\n{user_name}\n\n"
@@ -1504,7 +1555,7 @@ def chat_sse(payload: Dict = Body(...)):
                     {"role": "system", "content": SYSTEM_PROMPT_QA},
                     {"role": "user", "content": user},
                 ],
-                temperature=0.2,
+                temperature=0.0,
             )
             result_text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
 
