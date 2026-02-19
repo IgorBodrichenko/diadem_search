@@ -1926,6 +1926,14 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
     if first_turn:
         st["greeted"] = True
 
+    # Bubble sends the first user message immediately when the template loads.
+    # Requirement: FIRST response must be greeting ONLY (no refusal / no RAG / no extra text).
+    if first_turn:
+        _mnt_save_state_text(session_id, st)
+        return {"session_id": session_id, "mode": MASTER_MODE, "text": greeting, "done": False}
+
+
+
 
     # If no message, greet and ask for the active field (no yes/no gating)
     if not user_message:
