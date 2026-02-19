@@ -513,7 +513,29 @@ def _filter_matches_by_score(matches: List[Dict]) -> List[Dict]:
             score = 0.0
         if score >= MIN_MATCH_SCORE:
             out.append(m)
+    
+def _hard_filter_matches(matches: List[Dict], *, concept: Optional[str] = None, priority_min: Optional[int] = None) -> List[Dict]:
+    """Optional strict filters applied after score filtering.
+    - concept: keep only matches where metadata.concept == concept
+    - priority_min: keep only matches where metadata.priority >= priority_min
+    """
+    out: List[Dict] = []
+    for m in matches or []:
+        md = m.get("metadata") or {}
+        if concept:
+            if (md.get("concept") or "").strip().lower() != concept.strip().lower():
+                continue
+        if priority_min is not None:
+            try:
+                p = int(md.get("priority") or 0)
+            except Exception:
+                p = 0
+            if p < int(priority_min):
+                continue
+        out.append(m)
     return out
+
+return out
 
 
 _STOPWORDS = {
@@ -765,8 +787,12 @@ def _brief_match(m: Dict, label: str = "") -> Dict[str, Any]:
         "preview": txt,
     }
 
-def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) -> List[Dict]:
+def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None, *, hard_filter_concept: Optional[str] = None, hard_filter_priority_min: Optional[int] = None) -> List[Dict]:
     q_clean = (query or "").strip()
+    q_l = q_clean.lower()
+    # Auto strict filter for MASTER template mode (keeps retrieval inside negotiation library)
+    if (q_l.startswith("master_negotiator_template") or q_l.startswith("master_template")) and not hard_filter_concept:
+        hard_filter_concept = "negotiation"
     if not q_clean:
         return []
 
@@ -783,7 +809,7 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
           priority_boost=PRIORITY_BOOST,
           concept_boost=CONCEPT_BOOST)
 
-    detected_concept = _detect_concept(q_clean)
+    detected_concept = hard_filter_concept or _detect_concept(q_clean)
     _slog("search_concept_detected", request_id=request_id, concept=detected_concept)
 
     hint = _hint_for_question(q_clean)
@@ -824,6 +850,11 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
           sample=[_brief_match(x) for x in merged[:SEARCH_LOG_MAX_MATCHES]])
 
     merged = _filter_matches_by_score(merged)
+
+    merged_before_hard = len(merged)
+    merged = _hard_filter_matches(merged, concept=hard_filter_concept, priority_min=hard_filter_priority_min)
+    if hard_filter_concept or (hard_filter_priority_min is not None):
+        _slog("search_hard_filter", request_id=request_id, concept=hard_filter_concept or "", priority_min=hard_filter_priority_min, before=merged_before_hard, after=len(merged))
     _slog("search_filtered",
           request_id=request_id,
           filtered_count=len(merged),
