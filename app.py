@@ -535,7 +535,6 @@ def _hard_filter_matches(matches: List[Dict], *, concept: Optional[str] = None, 
         out.append(m)
     return out
 
-return out
 
 
 _STOPWORDS = {
