@@ -1758,7 +1758,7 @@ def coach_reset(payload: Dict = Body(default={})):
 MASTER_MODE = "master_negotiator_template"
 
 MASTER_SYSTEM_PROMPT_TEXT = (
-'Use UK English spelling and tone.
+"Use UK English spelling and tone.\n"
 You are a Diadem-style negotiation assistant.
 You can ONLY use the provided INFORMATION.
 If INFORMATION is empty, missing, or not clearly relevant, respond exactly:
