@@ -1893,7 +1893,7 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
     """Diadem-only MASTER template helper (paste-ready, no corporate guidance).
 
     - No consent gating.
-    - No greetings.
+    - Greeting on the first turn.
     - FIRE-style output by default.
     - Doc-only: if RAG yields nothing, refuse with the exact sentence.
     """
@@ -1919,10 +1919,17 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
 
     user_name = _extract_user_name(payload)  # kept for compatibility; not used in tone
 
+
+    # Always greet on the first turn in MASTER template mode (Bubble may send a real first message).
+    greeting = "Hello! How can I assist you with the MASTER negotiation template today?"
+    first_turn = not _as_bool(st.get("greeted"))
+    if first_turn:
+        st["greeted"] = True
+
+
     # If no message, greet and ask for the active field (no yes/no gating)
     if not user_message:
         _mnt_save_state_text(session_id, st)
-        greeting = "Hello! How can I assist you with the MASTER negotiation template today?"
         ff = (st.get("focus_field") or "").strip()
         sec = (st.get("active_section_id") or "").strip()
         if ff:
@@ -1939,7 +1946,10 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
 
     if not matches or not info.strip():
         _mnt_save_state_text(session_id, st)
-        return {"session_id": session_id, "mode": MASTER_MODE, "text": "I can't find this in the provided documents.", "done": False}
+        msg = "I can't find this in the provided documents."
+        if first_turn:
+            msg = f"{greeting} {msg}"
+        return {"session_id": session_id, "mode": MASTER_MODE, "text": msg, "done": False}
 
     # FIRE by default in MASTER mode
     trade_variable = ""
@@ -1972,8 +1982,11 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
         _jlog("master_template_llm_error", session_id=session_id, err=str(e)[:800])
         text_out = "Server error."
 
+    out_text = _truncate_words(text_out, 140)
+    if first_turn:
+        out_text = f"{greeting} {out_text}"
     _mnt_save_state_text(session_id, st)
-    return {"session_id": session_id, "mode": MASTER_MODE, "text": _truncate_words(text_out, 140), "done": False}
+    return {"session_id": session_id, "mode": MASTER_MODE, "text": out_text, "done": False}
 
 
 
