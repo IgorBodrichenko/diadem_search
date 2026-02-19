@@ -498,25 +498,14 @@ def _is_smalltalk(q: str) -> bool:
 
 
 def _smalltalk_reply(user_name: str) -> str:
-    name = (user_name or "").strip()
-    if name:
-        return f"Hi {name}. How can I help?"
-    return "Hi. How can I help?"
+    # Diadem-only: no greetings / small talk.
+    return "State the field you are filling."
 
 
 # =========================
 # VARIATION
 # =========================
-SOFT_OPENERS = [
-    "Glad you’re thinking about this ahead of time.",
-    "That makes sense — getting prepared early helps a lot.",
-    "Good call to tackle this before the meeting.",
-    "Nice — planning this now will make the conversation easier.",
-    "Totally doable. Let’s get you set up for it.",
-    "Okay, let’s make this straightforward and calm.",
-    "Makes sense. Let’s work through it step by step.",
-    "Alright — we can make this feel a lot more manageable.",
-]
+SOFT_OPENERS = [""]
 
 _BAD_START_RE = re.compile(r"^\s*(it['’]s\s+(great|wonderful)|great)\b", flags=re.IGNORECASE)
 
@@ -1021,7 +1010,7 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None, 
     return reranked
 
 def _reflect_line() -> str:
-    return random.choice(["Got it.", "Okay.", "Thanks — noted.", "Understood.", "That helps."])
+    return ""
 
 def _retrieve_info_for_coach(mode: str, query: str, top_k: int) -> str:
     rag_query = f"{mode}: {query}"
@@ -1569,7 +1558,7 @@ def health():
 # CHAT (RAG)
 # =========================
 @app.post("/chat")
-def chat(payload: Dict = Body(...)):
+def chat(payload: Dict = Body(default={})):
     query = (payload.get("query") or "").strip()
     top_k = int(payload.get("top_k") or TOP_K)
     user_name = _extract_user_name(payload)
@@ -1589,23 +1578,8 @@ def chat(payload: Dict = Body(...)):
 
     fire_mode = _is_fire_request(payload, query)
     trade_variable = "payment terms" if re.search(r"\bpayment\s*terms?\b", query, flags=re.IGNORECASE) else ""
-
     if not matches:
-        user = (
-            f"USER_NAME:\n{user_name}\n\n"
-            f"USER_MESSAGE:\n{query}\n\n"
-            f"INFORMATION:\n"
-        )
-        resp = openai.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT_CHAT},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.2,
-        )
-        answer = strip_markdown_chars((resp.choices[0].message.content or "").strip())
-        return {"answer": answer, "session_id": session_id}
+        return {"answer": "I can't find this in the provided documents.", "session_id": session_id}
 
     user = (
         f"USER_NAME:\n{user_name}\n\n"
@@ -1627,15 +1601,11 @@ def chat(payload: Dict = Body(...)):
     answer = (_enforce_fire_output(query, context, answer, trade_variable=trade_variable)
              if fire_mode else _enforce_qa_output(query, context, answer))
 
-    if answer.strip() != "I can't find this in the provided documents.":
-        opener = _pick_opener(session_id, user_name, "qa_last_opener")
-        answer = _rewrite_bad_opening(answer, opener)
-
     return {"answer": answer, "session_id": session_id}
 
 
 @app.post("/chat/sse")
-def chat_sse(payload: Dict = Body(...)):
+def chat_sse(payload: Dict = Body(default={})):
     session_id = _get_or_create_session_id(payload)
     request_id = str(uuid.uuid4())[:8]
     _cleanup_sessions()
@@ -1713,7 +1683,7 @@ def chat_sse(payload: Dict = Body(...)):
 # COACH ENDPOINTS
 # =========================
 @app.post("/coach/chat")
-def coach_chat(payload: Dict = Body(...)):
+def coach_chat(payload: Dict = Body(default={})):
     session_id = _get_or_create_session_id(payload)
     try:
         out = coach_turn_server_state(payload, session_id=session_id, stream=False)
@@ -1724,7 +1694,7 @@ def coach_chat(payload: Dict = Body(...)):
 
 
 @app.post("/coach/sse")
-def coach_sse(payload: Dict = Body(...)):
+def coach_sse(payload: Dict = Body(default={})):
     session_id = _get_or_create_session_id(payload)
 
     def headers():
@@ -1768,7 +1738,7 @@ def coach_sse(payload: Dict = Body(...)):
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers())
 
 @app.post("/coach/reset")
-def coach_reset(payload: Dict = Body(...)):
+def coach_reset(payload: Dict = Body(default={})):
     session_id = _get_or_create_session_id(payload)
     _jlog("coach_reset_endpoint", session_id=session_id)
     _db_delete(session_id)
@@ -1788,20 +1758,24 @@ def coach_reset(payload: Dict = Body(...)):
 MASTER_MODE = "master_negotiator_template"
 
 MASTER_SYSTEM_PROMPT_TEXT = (
-    "Use UK English spelling and tone.\n"
-    "You are a negotiation assistant helping a user COMPLETE a structured MASTER negotiation template.\n"
-    "You are NOT editing any tables. You only give guidance in plain text, like a chat.\n\n"
-    "Hard rules:\n"
-    "- Plain text only. NO markdown.\n"
-    "- Do not claim you updated or wrote into any table or field.\n"
-    "- Do not output JSON.\n"
-    "- Never invent numbers; if needed use placeholders like [X], [date], [volume].\n"
-    "- Ask at most 2 clarifying questions total before giving best-effort guidance.\n"
-    "- Keep responses <= 140 words unless the user explicitly asks for more.\n\n"
-    "How to help:\n"
-    "- If the user provides active_section_id / focus_field, tailor guidance to what to type there.\n"
-    "- When suggesting Variables, provide 3–6 examples with a one-line 'why' each.\n"
-    "- Encourage user to pick ONE variable and type it themselves.\n"
+'Use UK English spelling and tone.
+You are a Diadem-style negotiation assistant.
+You can ONLY use the provided INFORMATION.
+If INFORMATION is empty, missing, or not clearly relevant, respond exactly:
+"I can\'t find this in the provided documents.".
+
+Hard rules:
+- Plain text only. NO markdown.
+- Output ONLY paste-ready text the user can put into the MASTER template field.
+- No teaching. No examples label. No \'choose one\'. No questions.
+- No humour.
+- No collaboration/rapport framing.
+- No weak speak.
+- No logic or justification.
+- Declarative sentences.
+- If the user asks for a trade, use: If you..., then I...
+- Keep it short (<=120 words).
+'
 )
 
 def _mnt_default_state_text() -> Dict[str, Any]:
@@ -1915,7 +1889,15 @@ def _master_llm_text(user_message: str, active_section_id: str, focus_field: str
     text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
     return _truncate_words(text, 140)
 
+
 def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[str, Any]:
+    """Diadem-only MASTER template helper (paste-ready, no corporate guidance).
+
+    - No consent gating.
+    - No greetings.
+    - FIRE-style output by default.
+    - Doc-only: if RAG yields nothing, refuse with the exact sentence.
+    """
     _cleanup_sessions()
 
     reset = _as_bool(payload.get("reset")) or _as_bool(payload.get("start_again")) or _as_bool(payload.get("restart"))
@@ -1936,110 +1918,67 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
     if dv is not None:
         st["deal_value"] = dv
 
+    user_name = _extract_user_name(payload)  # kept for compatibility; not used in tone
 
-    # help_accepted: explicit flag OR infer from user's "yes/no" text at the consent step
-    help_accepted = payload.get("help_accepted")
-    if help_accepted is None:
-        help_accepted = payload.get("helpAccepted")
-    if help_accepted is not None:
-        st["help_accepted"] = _as_bool(help_accepted)
-    elif st.get("help_accepted") is None:
-        # Bubble may only send user_message="yes"/"no". Infer consent from text once.
-        yn = _parse_yes_no(user_message)
-        if yn is not None:
-            st["help_accepted"] = yn
-
-
-    user_name = _extract_user_name(payload)
-
-    # Offer help (first time)
-    if st.get("help_accepted") is None:
-        st["help_offered"] = True
-        _mnt_save_state_text(session_id, st)
-        return {
-            "session_id": session_id,
-            "mode": MASTER_MODE,
-            "text": "Do you need help completing your MASTER negotiation template? (Yes/No)",
-            "done": False,
-        }
-
-    # User said No
-    if st.get("help_accepted") is False:
-        _mnt_save_state_text(session_id, st)
-        return {
-            "session_id": session_id,
-            "mode": MASTER_MODE,
-            "text": "Okay. If you get stuck, tell me which field you’re on and what you’ve written so far, and I’ll help.",
-            "done": False,
-        }
-
-    # If user hasn't sent anything, prompt gently — but NEVER lose focus
+    # If no message, demand focus (no small talk)
     if not user_message:
         _mnt_save_state_text(session_id, st)
-
         ff = (st.get("focus_field") or "").strip()
         sec = (st.get("active_section_id") or "").strip()
-
         if ff:
-            return {
-                "session_id": session_id,
-                "mode": MASTER_MODE,
-                "text": f"You’re working on '{ff}'. What are you unsure about in this field?",
-                "done": False,
-            }
-
+            return {"session_id": session_id, "mode": MASTER_MODE, "text": f"{ff}: send your draft line or the outcome you want.", "done": False}
         if sec:
-            return {
-                "session_id": session_id,
-                "mode": MASTER_MODE,
-                "text": f"You’re in the '{sec}' section. What decision are you trying to make here?",
-                "done": False,
-            }
+            return {"session_id": session_id, "mode": MASTER_MODE, "text": f"{sec}: send the exact field name and what you need to write.", "done": False}
+        return {"session_id": session_id, "mode": MASTER_MODE, "text": "Send: focus_field + your draft line.", "done": False}
 
-        return {
-            "session_id": session_id,
-            "mode": MASTER_MODE,
-            "text": "Which part are you filling right now (deal value, variables, goals, walk-away, concessions, etc.)?",
-            "done": False,
-        }
-
-    # If deal value missing and user is in that field (or mentions it), nudge but still answer
-    # (We keep this light because user may want help elsewhere.)
-    needs_deal_value_hint = st.get("deal_value") is None and (focus_field.lower() in ("deal_value", "dealvalue", "value") or "deal value" in user_message.lower())
-
-
-    # --- RAG retrieval for MASTER template (always) ---
+    # --- RAG retrieval for MASTER template ---
     request_id = str(uuid.uuid4())[:8]
-    rag_query = f"master_template {active_section_id} {focus_field}: {user_message}".strip()
+    rag_query = f"master_template {st.get('active_section_id') or ''} {st.get('focus_field') or ''}: {user_message}".strip()
     matches = get_matches(rag_query, TOP_K, request_id=request_id)
     info = build_context(matches, request_id=request_id) if matches else ""
-    clarify_count = int(st.get("clarify_count") or 0)
 
-    # Generate guidance text (text-only)
+    if not matches or not info.strip():
+        _mnt_save_state_text(session_id, st)
+        return {"session_id": session_id, "mode": MASTER_MODE, "text": "I can't find this in the provided documents.", "done": False}
+
+    # FIRE by default in MASTER mode
+    trade_variable = ""
+    if re.search(r"\bpayment\s*terms?\b", user_message, flags=re.IGNORECASE) or (st.get("focus_field") or "").lower() in ("payment_terms", "payment term", "payment terms"):
+        trade_variable = "payment terms"
+
+    # Ask LLM once, then enforce FIRE rules
+    deal_line = "" if st.get("deal_value") is None else f"DEAL_VALUE: {st.get('deal_value')}\n"
+    prompt_user = (
+        f"ACTIVE_SECTION_ID: {st.get('active_section_id') or ''}\n"
+        f"FOCUS_FIELD: {st.get('focus_field') or ''}\n"
+        f"{deal_line}"
+        f"USER_MESSAGE: {user_message}\n\n"
+        f"INFORMATION:\n{info}\n\n"
+        "TASK: Output paste-ready text for the focus field. No headings. No questions."
+    )
+
     try:
-        text = _master_llm_text(
-            user_message=user_message,
-            active_section_id=st.get("active_section_id") or "",
-            focus_field=st.get("focus_field") or "",
-            deal_value=st.get("deal_value"),
-            user_name=user_name,
-            clarify_count=clarify_count,
-            info=info,
+        resp = openai.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT_FIRE},
+                {"role": "user", "content": prompt_user},
+            ],
+            temperature=0.0,
         )
+        text_out = strip_markdown_chars((resp.choices[0].message.content or "").strip())
+        text_out = _enforce_fire_output(user_message, info, text_out, trade_variable=trade_variable)
     except Exception as e:
         _jlog("master_template_llm_error", session_id=session_id, err=str(e)[:800])
-        text = "Server error."
-
-    if needs_deal_value_hint and "deal value" not in (text or "").lower():
-        # add one short line if not already covered
-        text = (text + "\n\nDeal value: enter the total commercial value as a number (e.g., 120000).").strip()
+        text_out = "Server error."
 
     _mnt_save_state_text(session_id, st)
-    return {"session_id": session_id, "mode": MASTER_MODE, "text": text, "done": False}
+    return {"session_id": session_id, "mode": MASTER_MODE, "text": _truncate_words(text_out, 140), "done": False}
+
 
 
 @app.post("/master/template")
-def master_template(payload: Dict = Body(...)):
+def master_template(payload: Dict = Body(default={})):
     session_id = _get_or_create_session_id(payload)
     try:
         out = master_template_turn_text(payload, session_id=session_id)
@@ -2050,7 +1989,7 @@ def master_template(payload: Dict = Body(...)):
 
 
 @app.post("/master/template/sse")
-def master_template_sse(payload: Dict = Body(...)):
+def master_template_sse(payload: Dict = Body(default={})):
     """
     SSE version (text-only).
     Streams the assistant text like a chat.
@@ -2096,7 +2035,7 @@ def master_template_sse(payload: Dict = Body(...)):
 
 
 @app.post("/master/template/reset")
-def master_template_reset(payload: Dict = Body(...)):
+def master_template_reset(payload: Dict = Body(default={})):
     session_id = _get_or_create_session_id(payload)
     _jlog("master_template_reset", session_id=session_id)
     _mnt_reset_state_text(session_id)
