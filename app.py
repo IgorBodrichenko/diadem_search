@@ -386,6 +386,102 @@ def _enforce_qa_output(question: str, info: str, answer: str) -> str:
 
 
 # =========================
+# FIRE OUTPUT (SHORT TEMPLATE TEXT)
+# =========================
+FIRE_REWRITE_ON_FAIL = os.getenv("FIRE_REWRITE_ON_FAIL", "1").strip().lower() in ("1","true","yes","y","on")
+
+def _is_fire_request(payload: Dict[str, Any], query: str) -> bool:
+    # Explicit flag from client
+    if str(payload.get("fire") or "").strip().lower() in ("1","true","yes","y","on"):
+        return True
+    style = (payload.get("style") or payload.get("mode") or "").strip().lower()
+    if style in ("fire", "script_only", "template_only"):
+        return True
+
+    q = (query or "").lower()
+    # Heuristics: user explicitly asks for exact template text or FIRE response / trade line
+    if "fire response" in q:
+        return True
+    if "exact text" in q and ("template" in q or "field" in q):
+        return True
+    if "if you" in q and "then i" in q:
+        return True
+    if "if you... then i" in q:
+        return True
+    return False
+
+def _fire_needs_rewrite(text: str, trade_variable: str = "") -> bool:
+    if not text:
+        return True
+    t = (text or "").strip()
+
+    # Must be script only (no headings/sections)
+    if re.search(r"(?im)^\s*(recommended move:|options:|script \(say this\):|pushback line:)", t):
+        return True
+
+    # No weak speak / humour / logic
+    if _WEAK_SPEAK_RE.search(t):
+        return True
+    if _HUMOUR_RE.search(t):
+        return True
+    if _LOGIC_RE.search(t):
+        return True
+
+    # Must include a trade line
+    if not _TRADE_RE.search(t):
+        return True
+
+    # If user specified a trade variable, require it to appear (loose match)
+    if trade_variable:
+        tv = trade_variable.strip().lower()
+        if tv and (tv not in t.lower()):
+            return True
+
+    # Keep it short (avoid long advisory essays)
+    if len(t.split()) > 120:
+        return True
+
+    return False
+
+def _rewrite_fire_answer(question: str, info: str, draft: str, trade_variable: str = "") -> str:
+    base = (
+        "Rewrite the DRAFT into a short, paste-ready negotiation script.\n"
+        "You MUST use ONLY INFORMATION. No outside knowledge.\n"
+        "Output ONLY the exact text the user should paste into their template field.\n"
+        "No headings, no labels, no explanation.\n"
+        "UK English.\n\n"
+        "Hard constraints:\n"
+        "- Use calm, firm, declarative sentences.\n"
+        "- NO weak/hedging language (no: maybe/might/could/should/consider/I think/I believe/I feel/I understand).\n"
+        "- NO rapport/collaboration framing (no: I appreciate, let's focus, work together, mutually beneficial, win-win).\n"
+        "- NO humour.\n"
+        "- NO logic markers (no: because/therefore/so that/in order to/to ensure/to maintain).\n"
+        "- MUST include at least ONE explicit trade line in this exact style: 'If you..., then I...'.\n"
+    )
+    sys = base + (f"- The trade must use this variable: {trade_variable}.\n" if trade_variable else "") + (
+        "\nIf INFORMATION is empty or not clearly relevant, output exactly:\n"
+        "\"I can't find this in the provided documents.\""
+    )
+    user = f"QUESTION:\n{question}\n\nINFORMATION:\n{info}\n\nDRAFT:\n{draft}"
+    resp = openai.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[{"role":"system","content":sys},{"role":"user","content":user}],
+        temperature=0.0,
+    )
+    return strip_markdown_chars((resp.choices[0].message.content or "").strip())
+
+def _enforce_fire_output(question: str, info: str, answer: str, trade_variable: str = "") -> str:
+    if not FIRE_REWRITE_ON_FAIL:
+        return answer
+    if _fire_needs_rewrite(answer, trade_variable=trade_variable):
+        try:
+            fixed = _rewrite_fire_answer(question, info, answer, trade_variable=trade_variable)
+            return fixed or answer
+        except Exception:
+            return answer
+    return answer
+
+# =========================
 # SMALL TALK
 # =========================
 _SMALLTALK_RE = re.compile(
@@ -1020,6 +1116,31 @@ SYSTEM_PROMPT_QA = (
 
     "Placeholders: if key numbers are missing, use placeholders like [X], [date], [volume], [payment terms].\n"
 )
+
+# Short "FIRE" script mode: return ONLY paste-ready template text (no headings)
+SYSTEM_PROMPT_FIRE = (
+    "Use UK English spelling and tone.\n"
+    "You are a negotiation assistant that can ONLY use the provided INFORMATION.\n"
+    "You must not add any outside knowledge, assumptions, or 'common sense'.\n"
+    "If INFORMATION is empty, missing, or not clearly relevant, respond exactly:\n"
+    "\"I can't find this in the provided documents.\".\n\n"
+
+    "Hard rules (must follow):\n"
+    "- Output plain text only. NO markdown.\n"
+    "- Output ONLY the exact text the user should paste into their template field.\n"
+    "- Do NOT include headings, labels, or sections.\n"
+    "- Do NOT explain your reasoning. No analysis, no teaching.\n"
+    "- Do NOT use humour or jokes.\n"
+    "- Do NOT use collaboration/rapport framing (no: let's focus, work together, I appreciate, mutually beneficial, win-win).\n"
+    "- Do NOT use weak / hedging language (avoid: maybe, might, could, should, consider, generally, perhaps, possibly, try, I think, I believe, I feel, I understand).\n"
+    "- Do NOT use logic/explanation markers (no: because, therefore, so that, in other words, in order to, to ensure, to maintain, to protect, this allows).\n"
+    "- Use declarative, calm, firm sentences.\n"
+    "- MUST include at least ONE trade line in the exact style: If you..., then I...\n"
+    "- Keep it short (<=120 words).\n\n"
+
+    "Placeholders: if key numbers are missing, use placeholders like [X], [date], [volume], [payment terms].\n"
+)
+
 # Strict doc-only chat (no apple pie)
 SYSTEM_PROMPT_CHAT = (
     "Use UK English spelling and tone.\n"
@@ -1466,6 +1587,9 @@ def chat(payload: Dict = Body(...)):
     matches = get_matches(query, top_k, request_id=request_id)
     context = build_context(matches, request_id=request_id) if matches else ""
 
+    fire_mode = _is_fire_request(payload, query)
+    trade_variable = "payment terms" if re.search(r"\bpayment\s*terms?\b", query, flags=re.IGNORECASE) else ""
+
     if not matches:
         user = (
             f"USER_NAME:\n{user_name}\n\n"
@@ -1492,7 +1616,7 @@ def chat(payload: Dict = Body(...)):
     resp = openai.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT_QA},
+            {"role": "system", "content": (SYSTEM_PROMPT_FIRE if fire_mode else SYSTEM_PROMPT_QA)},
             {"role": "user", "content": user},
         ],
         temperature=0.0,
@@ -1500,7 +1624,8 @@ def chat(payload: Dict = Body(...)):
 
     answer = strip_markdown_chars((resp.choices[0].message.content or "").strip())
     # Enforce Diadem QA rules (no weak speak / humour / logic, and require trading)
-    answer = _enforce_qa_output(query, context, answer)
+    answer = (_enforce_fire_output(query, context, answer, trade_variable=trade_variable)
+             if fire_mode else _enforce_qa_output(query, context, answer))
 
     if answer.strip() != "I can't find this in the provided documents.":
         opener = _pick_opener(session_id, user_name, "qa_last_opener")
@@ -1518,6 +1643,8 @@ def chat_sse(payload: Dict = Body(...)):
     query = (payload.get("query") or "").strip()
     top_k = int(payload.get("top_k") or TOP_K)
     user_name = _extract_user_name(payload)
+    fire_mode = _is_fire_request(payload, query)
+    trade_variable = "payment terms" if re.search(r"\bpayment\s*terms?\b", query, flags=re.IGNORECASE) else ""
 
     if not query:
         result_text = ""
@@ -1542,7 +1669,8 @@ def chat_sse(payload: Dict = Body(...)):
                 temperature=0.2,
             )
             result_text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
-            result_text = _enforce_qa_output(query, context, result_text)
+            result_text = (_enforce_fire_output(query, context, result_text, trade_variable=trade_variable)
+                      if fire_mode else _enforce_qa_output(query, context, result_text))
         else:
             user = (
                 f"USER_NAME:\n{user_name}\n\n"
@@ -1552,12 +1680,14 @@ def chat_sse(payload: Dict = Body(...)):
             resp = openai.chat.completions.create(
                 model=CHAT_MODEL,
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT_QA},
+                    {"role": "system", "content": (SYSTEM_PROMPT_FIRE if fire_mode else SYSTEM_PROMPT_QA)},
                     {"role": "user", "content": user},
                 ],
                 temperature=0.0,
             )
             result_text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
+            result_text = (_enforce_fire_output(query, context, result_text, trade_variable=trade_variable)
+                          if fire_mode else _enforce_qa_output(query, context, result_text))
 
     def headers():
         return {
