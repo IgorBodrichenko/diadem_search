@@ -505,6 +505,11 @@ def embed_query(text: str) -> List[float]:
 
 
 def _filter_matches_by_score(matches: List[Dict]) -> List[Dict]:
+    """Filter matches by MIN_MATCH_SCORE.
+
+    IMPORTANT: must always return a list (never None), because downstream code
+    assumes list-like behaviour (len(), iteration, slicing).
+    """
     out: List[Dict] = []
     for m in matches or []:
         try:
@@ -513,7 +518,8 @@ def _filter_matches_by_score(matches: List[Dict]) -> List[Dict]:
             score = 0.0
         if score >= MIN_MATCH_SCORE:
             out.append(m)
-    
+    return out
+
 def _hard_filter_matches(matches: List[Dict], *, concept: Optional[str] = None, priority_min: Optional[int] = None) -> List[Dict]:
     """Optional strict filters applied after score filtering.
     - concept: keep only matches where metadata.concept == concept
