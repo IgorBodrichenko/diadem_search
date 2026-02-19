@@ -1757,17 +1757,17 @@ def coach_reset(payload: Dict = Body(default={})):
 
 MASTER_MODE = "master_negotiator_template"
 
-MASTER_SYSTEM_PROMPT_TEXT = (
-"Use UK English spelling and tone.\n"
+MASTER_SYSTEM_PROMPT_TEXT = """
+Use UK English spelling and tone.
 You are a Diadem-style negotiation assistant.
 You can ONLY use the provided INFORMATION.
 If INFORMATION is empty, missing, or not clearly relevant, respond exactly:
-"I can\'t find this in the provided documents.".
+"I can't find this in the provided documents."
 
 Hard rules:
 - Plain text only. NO markdown.
 - Output ONLY paste-ready text the user can put into the MASTER template field.
-- No teaching. No examples label. No \'choose one\'. No questions.
+- No teaching. No labels. No 'choose one'. No examples framing.
 - No humour.
 - No collaboration/rapport framing.
 - No weak speak.
@@ -1775,8 +1775,7 @@ Hard rules:
 - Declarative sentences.
 - If the user asks for a trade, use: If you..., then I...
 - Keep it short (<=120 words).
-'
-)
+"""
 
 def _mnt_default_state_text() -> Dict[str, Any]:
     return {
@@ -1920,18 +1919,19 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
 
     user_name = _extract_user_name(payload)  # kept for compatibility; not used in tone
 
-    # If no message, demand focus (no small talk)
+    # If no message, greet and ask for the active field (no yes/no gating)
     if not user_message:
         _mnt_save_state_text(session_id, st)
+        greeting = "Hello! How can I assist you with the MASTER negotiation template today?"
         ff = (st.get("focus_field") or "").strip()
         sec = (st.get("active_section_id") or "").strip()
         if ff:
-            return {"session_id": session_id, "mode": MASTER_MODE, "text": f"{ff}: send your draft line or the outcome you want.", "done": False}
+            return {"session_id": session_id, "mode": MASTER_MODE, "text": f"{greeting} {ff}: send your draft line or the outcome you want.", "done": False}
         if sec:
-            return {"session_id": session_id, "mode": MASTER_MODE, "text": f"{sec}: send the exact field name and what you need to write.", "done": False}
-        return {"session_id": session_id, "mode": MASTER_MODE, "text": "Send: focus_field + your draft line.", "done": False}
+            return {"session_id": session_id, "mode": MASTER_MODE, "text": f"{greeting} {sec}: send the exact field name and what you need to write.", "done": False}
+        return {"session_id": session_id, "mode": MASTER_MODE, "text": f"{greeting} Tell me the field you are filling (focus_field) and what happened.", "done": False}
 
-    # --- RAG retrieval for MASTER template ---
+# --- RAG retrieval for MASTER template ---
     request_id = str(uuid.uuid4())[:8]
     rag_query = f"master_template {st.get('active_section_id') or ''} {st.get('focus_field') or ''}: {user_message}".strip()
     matches = get_matches(rag_query, TOP_K, request_id=request_id)
