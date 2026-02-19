@@ -843,20 +843,21 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None, 
             continue
 
     merged = _merge_dedup_matches(all_results)
+    merged = merged or []
     _slog("search_merged",
           request_id=request_id,
-          merged_count=len(merged),
+          merged_count=len(merged or []),
           sample=[_brief_match(x) for x in merged[:SEARCH_LOG_MAX_MATCHES]])
 
     merged = _filter_matches_by_score(merged)
 
-    merged_before_hard = len(merged)
+    merged_before_hard = len(merged or [])
     merged = _hard_filter_matches(merged, concept=hard_filter_concept, priority_min=hard_filter_priority_min)
     if hard_filter_concept or (hard_filter_priority_min is not None):
-        _slog("search_hard_filter", request_id=request_id, concept=hard_filter_concept or "", priority_min=hard_filter_priority_min, before=merged_before_hard, after=len(merged))
+        _slog("search_hard_filter", request_id=request_id, concept=hard_filter_concept or "", priority_min=hard_filter_priority_min, before=merged_before_hard, after=len(merged or []))
     _slog("search_filtered",
           request_id=request_id,
-          filtered_count=len(merged),
+          filtered_count=len(merged or []),
           sample=[_brief_match(x) for x in merged[:SEARCH_LOG_MAX_MATCHES]])
 
     reranked = _rerank(q_clean, merged, top_k_final, detected_concept=detected_concept)
