@@ -117,6 +117,10 @@ def _openai_stream_text(messages: List[Dict[str, str]], model: str, temperature:
             except Exception:
                 continue
     except Exception as e:
+        try:
+            _jlog("openai_stream_failed", model=model, err=str(e))
+        except Exception:
+            pass
         # If streaming fails, fallback to a single non-streamed response
         try:
             resp = openai.chat.completions.create(
@@ -127,7 +131,11 @@ def _openai_stream_text(messages: List[Dict[str, str]], model: str, temperature:
             full = (resp.choices[0].message.content or "")
             if full:
                 yield full
-        except Exception:
+        except Exception as e2:
+            try:
+                _jlog("openai_fallback_failed", model=model, err=str(e2))
+            except Exception:
+                pass
             yield "Server error."
 
 def _sse_headers():
@@ -138,7 +146,7 @@ def _sse_headers():
         "X-Accel-Buffering": "no",
     }
 
-def _iter_text_as_sse_chunks(text_iter, *, min_chars: int = 24):
+def _iter_text_as_sse_chunks(text_iter, *, min_chars: int = SSE_MIN_CHARS):
     """Coalesce tiny deltas into readable chunks for Bubble Stream."""
     buf = ""
     for piece in text_iter:
@@ -506,6 +514,10 @@ _STOPWORDS = {
     "that",
 }
 
+
+# SSE chunking (Bubble-friendly)
+SSE_MIN_CHARS = int(os.getenv("SSE_MIN_CHARS", "1"))
+SSE_KEEPALIVE_SECS = float(os.getenv("SSE_KEEPALIVE_SECS", "0.0"))
 _GENERIC_PHRASES = [
     "key techniques to consider",
     "negotiation techniques",
@@ -1378,7 +1390,7 @@ def chat_sse(payload: Dict = Body(...)):
     def gen():
         start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
         yield f"event: start\ndata: {start_payload}\n\n"
-
+        yield ": ping\n\n"
         # Smalltalk: single chunk
         if not query:
             chunks = [""]
@@ -1410,7 +1422,7 @@ def chat_sse(payload: Dict = Body(...)):
                 ]
 
             # Stream from OpenAI
-            chunks = _iter_text_as_sse_chunks(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2), min_chars=28)
+            chunks = _iter_text_as_sse_chunks(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2), min_chars=SSE_MIN_CHARS)
 
         # Emit chunks
         for part in chunks:
@@ -1455,7 +1467,7 @@ def coach_sse(payload: Dict = Body(...)):
         try:
             start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
             yield f"event: start\ndata: {start_payload}\n\n"
-
+            yield ": ping\n\n"
             try:
                 result = coach_turn_server_state(payload, session_id=session_id, stream=False)
             except Exception as e:
@@ -1831,7 +1843,7 @@ def master_template_sse(payload: Dict = Body(...)):
     def gen():
         start_payload = json.dumps({"session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
         yield f"event: start\ndata: {start_payload}\n\n"
-
+        yield ": ping\n\n"
         try:
             # Load/update state (same as non-SSE) but without the consent gate
             _cleanup_sessions()
@@ -1893,7 +1905,7 @@ def master_template_sse(payload: Dict = Body(...)):
                 {"role": "user", "content": prompt_user},
             ]
 
-            for part in _iter_text_as_sse_chunks(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2), min_chars=28):
+            for part in _iter_text_as_sse_chunks(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2), min_chars=SSE_MIN_CHARS):
                 part = _format_for_bubble(strip_markdown_chars(part))
                 data = json.dumps({"text": part}, ensure_ascii=False)
                 yield f"event: chunk\ndata: {data}\n\n"
