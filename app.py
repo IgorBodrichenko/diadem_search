@@ -161,13 +161,6 @@ def _iter_text_as_sse_chunks(text_iter, *, min_chars: int = SSE_MIN_CHARS):
     if buf:
         yield buf
 
-def _format_for_bubble(text: str) -> str:
-    if not text:
-        return ""
-    # only normalize line endings — nothing else
-    return text.replace("\r\n", "\n").replace("\r", "\n").strip()
-
-
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
