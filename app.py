@@ -449,7 +449,7 @@ def _rewrite_fire_answer(question: str, info: str, draft: str, trade_variable: s
         "You MUST use ONLY INFORMATION. No outside knowledge.\n"
         "Output ONLY the exact text the user should paste into their template field.\n"
         "No headings, no labels, no explanation.\n"
-        "UK English.\n\n"
+        "UK English.\nFormat with clear line breaks (short lines; separate ideas with blank lines).\n\n"
         "Hard constraints:\n"
         "- Use calm, firm, declarative sentences.\n"
         "- NO weak/hedging language (no: maybe/might/could/should/consider/I think/I believe/I feel/I understand).\n"
@@ -498,8 +498,12 @@ def _is_smalltalk(q: str) -> bool:
 
 
 def _smalltalk_reply(user_name: str) -> str:
-    # Diadem-only: no greetings / small talk.
-    return "State the field you are filling."
+    # Keep the original MASTER greeting behaviour on first turn elsewhere.
+    # For short greetings like "hi", respond with a helpful prompt (no corporate tone).
+    name = (user_name or "").strip()
+    if name:
+        return f"Hi {name}. What part of the MASTER negotiation template are you filling right now?"
+    return "Hi. What part of the MASTER negotiation template are you filling right now?"
 
 
 # =========================
@@ -788,6 +792,23 @@ def _rerank(query: str, matches: List[Dict], final_k: int, detected_concept: str
             pr = int(md.get("priority") or 1)
         except Exception:
             pr = 1
+
+        # Implicit priority for the two key negotiation sources,
+        # even if vectors were ingested without metadata.priority.
+        fmeta = " ".join([
+            str(md.get("file_name") or ""),
+            str(md.get("title") or ""),
+            str(md.get("source") or ""),
+            str(md.get("file") or ""),
+            str(md.get("document") or ""),
+        ]).lower()
+        if "negotiation.pdf" in fmeta:
+            pr = max(pr, PRIORITY_MAX)
+        if "master negotiator slides" in fmeta:
+            pr = max(pr, PRIORITY_MAX)
+        elif "master negotiator" in fmeta and "slide" in fmeta:
+            pr = max(pr, PRIORITY_MAX)
+
         if pr < 1:
             pr = 1
         if pr > PRIORITY_MAX:
@@ -1072,6 +1093,7 @@ LIMITS_POLICY = (
 
 SYSTEM_PROMPT_QA = (
     "Use UK English spelling and tone.\n"
+    "Format output with clear paragraphs and line breaks (short lines; blank line between idea blocks).\n"
     "You are a negotiation assistant that can ONLY use the provided INFORMATION.\n"
     "You must not add any outside knowledge, assumptions, or 'common sense'.\n"
     "If INFORMATION is empty, missing, or not clearly relevant, respond exactly:\n"
@@ -1109,6 +1131,7 @@ SYSTEM_PROMPT_QA = (
 # Short "FIRE" script mode: return ONLY paste-ready template text (no headings)
 SYSTEM_PROMPT_FIRE = (
     "Use UK English spelling and tone.\n"
+    "Format output with clear paragraphs and line breaks (short lines; blank line between idea blocks).\n"
     "You are a negotiation assistant that can ONLY use the provided INFORMATION.\n"
     "You must not add any outside knowledge, assumptions, or 'common sense'.\n"
     "If INFORMATION is empty, missing, or not clearly relevant, respond exactly:\n"
@@ -1133,6 +1156,7 @@ SYSTEM_PROMPT_FIRE = (
 # Strict doc-only chat (no apple pie)
 SYSTEM_PROMPT_CHAT = (
     "Use UK English spelling and tone.\n"
+    "Format output with clear paragraphs and line breaks (short lines; blank line between idea blocks).\n"
     "You are a focused assistant specialised only in the provided materials.\n"
     "You may answer ONLY if INFORMATION is provided and clearly relevant to the user's question.\n"
     "If INFORMATION is empty, missing, or not relevant to the question, you must respond exactly with:\n"
@@ -1152,6 +1176,7 @@ SYSTEM_PROMPT_CHAT = (
 # Final output must be AI-written (not pasted) and no technical keys
 SYSTEM_PROMPT_COACH_FINAL = (
     "Use UK English spelling and tone.\n"
+    "Format output with clear paragraphs and line breaks (short lines; blank line between idea blocks).\n"
     "You are a professional negotiation coach.\n"
     "You may ONLY use the provided INFORMATION to shape your output.\n"
     "Do not rely on general negotiation knowledge outside INFORMATION.\n"
@@ -1759,6 +1784,7 @@ MASTER_MODE = "master_negotiator_template"
 
 MASTER_SYSTEM_PROMPT_TEXT = """
 Use UK English spelling and tone.
+Format output with clear paragraphs and line breaks (short lines; blank line between idea blocks).
 You are a Diadem-style negotiation assistant.
 You can ONLY use the provided INFORMATION.
 If INFORMATION is empty, missing, or not clearly relevant, respond exactly:
