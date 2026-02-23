@@ -70,6 +70,9 @@ SEARCH_DEBUG_LOGS = os.getenv("SEARCH_DEBUG_LOGS", "0").strip().lower() in ("1",
 SEARCH_LOG_MAX_MATCHES = int(os.getenv("SEARCH_LOG_MAX_MATCHES", "8"))   # how many matches to print
 SEARCH_LOG_TEXT_PREVIEW = int(os.getenv("SEARCH_LOG_TEXT_PREVIEW", "140"))  # chars of text preview in logs
 
+# SSE streaming: send chunks early so Bubble/clients don't buffer the whole response
+SSE_MIN_CHARS = int(os.getenv("SSE_MIN_CHARS", "1"))  # 1 = flush ASAP; raise to 8-15 for smoother UI
+
 def _slog(event: str, **fields):
     """Search logs (opt-in) that you can copy from server logs."""
     if SEARCH_DEBUG_LOGS:
@@ -516,7 +519,6 @@ _STOPWORDS = {
 
 
 # SSE chunking (Bubble-friendly)
-SSE_MIN_CHARS = int(os.getenv("SSE_MIN_CHARS", "1"))
 SSE_KEEPALIVE_SECS = float(os.getenv("SSE_KEEPALIVE_SECS", "0.0"))
 _GENERIC_PHRASES = [
     "key techniques to consider",
