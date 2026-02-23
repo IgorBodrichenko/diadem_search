@@ -164,11 +164,24 @@ def _iter_text_as_sse_chunks(text_iter, *, min_chars: int = SSE_MIN_CHARS):
 def _format_for_bubble(text: str) -> str:
     # Normalise whitespace to make Bubble chat look like paragraphs.
     t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
-    # Ensure blank line before numbered/bulleted items if missing
+
+    # If the model returned a "glued" string (no spaces at all), try a safe repair.
+    # Example: "SILENCE-Identifythreekeyvariablesfornegotiation.-Ensure..."
+    if t and (" " not in t) and len(t) > 40:
+        # Add space between camelCase / PascalCase boundaries
+        t = re.sub(r"([a-z])([A-Z])", r"\1 \2", t)
+        # Add space after punctuation when followed by a letter/number
+        t = re.sub(r"([.!?])([A-Za-z0-9])", r"\1 \2", t)
+        # Add newline after periods that look like sentence boundaries (keeps it readable)
+        t = re.sub(r"\.\s+(?=[A-Z])", ".\n", t)
+
+    # Ensure a blank line before numbered/bulleted items if missing
     t = re.sub(r"(?<!\n)\n(\d+\.)", r"\n\n\1", t)
     t = re.sub(r"(?<!\n)\n([-•])", r"\n\n\1", t)
+
     # Collapse 3+ newlines to 2
     t = re.sub(r"\n{3,}", "\n\n", t)
+
     return t.strip()
 
 app = FastAPI()
@@ -1459,41 +1472,88 @@ def coach_sse(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
 
     def headers():
-        return {
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        }
+        return _sse_headers()
+
+    def _iter_string_chunks(s: str, max_chars: int = 160):
+        s = (s or "").strip()
+        if not s:
+            return
+        # Prefer splitting by paragraphs/lines first
+        parts = re.split(r"(\n\n+)", s)
+        buf = ""
+        for p in parts:
+            if not p:
+                continue
+            if p.startswith("\n"):
+                # keep paragraph breaks in the buffer
+                buf += p
+                continue
+            # If adding this part would overflow, flush buffer first.
+            if buf and (len(buf) + len(p) > max_chars):
+                yield buf
+                buf = ""
+            if len(p) <= max_chars:
+                buf += p
+                continue
+            # Long part: split by words
+            words = p.split(" ")
+            line = ""
+            for w in words:
+                if not line:
+                    line = w
+                    continue
+                if len(line) + 1 + len(w) <= max_chars:
+                    line += " " + w
+                else:
+                    yield line
+                    line = w
+            if line:
+                buf += line
+        if buf.strip():
+            yield buf
 
     def gen():
         try:
             start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
             yield f"event: start\ndata: {start_payload}\n\n"
             yield ": ping\n\n"
+
             try:
                 result = coach_turn_server_state(payload, session_id=session_id, stream=False)
             except Exception as e:
                 _jlog("coach_sse_error", session_id=session_id, err=str(e))
                 result = {"text": "Server error.", "session_id": session_id, "done": False}
 
-            # гарантируем dict
             if not isinstance(result, dict):
                 result = {"text": "Internal error.", "done": False}
 
-            chunk_payload = json.dumps({"text": result.get("text", "")}, ensure_ascii=False)
-            yield f"event: chunk\ndata: {chunk_payload}\n\n"
+            full_text = _format_for_bubble(strip_markdown_chars(result.get("text", "") or ""))
+            max_chars = _clamp_int(payload.get("sse_chunk_chars"), 160, 40, 600)
 
-            done_payload = json.dumps({"done": bool(result.get("done"))}, ensure_ascii=False)
+            # Stream as multiple chunk events (Bubble-friendly), even if the underlying LLM call was non-streamed.
+            sent_any = False
+            for piece in _iter_string_chunks(full_text, max_chars=max_chars):
+                sent_any = True
+                data = json.dumps({"text": piece}, ensure_ascii=False)
+                yield f"event: chunk\ndata: {data}\n\n"
+                if SSE_KEEPALIVE_SECS and SSE_KEEPALIVE_SECS > 0:
+                    try:
+                        time.sleep(min(0.05, float(SSE_KEEPALIVE_SECS)))
+                    except Exception:
+                        pass
+
+            if not sent_any:
+                data = json.dumps({"text": ""}, ensure_ascii=False)
+                yield f"event: chunk\ndata: {data}\n\n"
+
+            done_payload = json.dumps({"done": bool(result.get("done")), "session_id": session_id}, ensure_ascii=False)
             yield f"event: done\ndata: {done_payload}\n\n"
 
         except Exception as e:
             _jlog("coach_sse_error", session_id=session_id, err=str(e)[:800])
-
-            # SSE-friendly error
             err_chunk = json.dumps({"text": "Internal error. Please retry."}, ensure_ascii=False)
             yield f"event: chunk\ndata: {err_chunk}\n\n"
-
-            err_done = json.dumps({"done": True}, ensure_ascii=False)
+            err_done = json.dumps({"done": True, "session_id": session_id}, ensure_ascii=False)
             yield f"event: done\ndata: {err_done}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers())
