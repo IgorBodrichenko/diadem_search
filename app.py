@@ -41,41 +41,6 @@ def _with_debug(resp: Dict[str, Any], **dbg):
     return resp
 
 
-
-def _chunk_text_for_sse(text: str, max_chars: int = 160) -> List[str]:
-    """Split text into small chunks for Bubble Stream responses.
-    Keeps newlines; tries to split on paragraph boundaries first.
-    """
-    t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
-    if not t:
-        return [""]
-    # Prefer paragraph chunks
-    parts = []
-    buf = ""
-    for para in t.split("\n\n"):
-        p = para.strip("\n")
-        if not p:
-            continue
-        candidate = (buf + ("\n\n" if buf else "") + p) if buf else p
-        if len(candidate) <= max_chars:
-            buf = candidate
-            continue
-        if buf:
-            parts.append(buf)
-            buf = ""
-        # Now split long paragraph
-        while len(p) > max_chars:
-            cut = p.rfind(" ", 0, max_chars)
-            if cut < int(max_chars * 0.6):
-                cut = max_chars
-            parts.append(p[:cut].rstrip())
-            p = p[cut:].lstrip()
-        if p:
-            buf = p
-    if buf:
-        parts.append(buf)
-    return parts or [t[:max_chars]]
-
 # =========================
 # CONFIG
 # =========================
@@ -100,11 +65,6 @@ DIVERSITY_SAME_SOURCE_CAP = int(os.getenv("DIVERSITY_SAME_SOURCE_CAP", "3"))
 # Applied during reranking; base retrieval is still semantic similarity.
 PRIORITY_BOOST = float(os.getenv("PRIORITY_BOOST", "0.6"))  # bonus added per priority level above 1
 PRIORITY_MAX = int(os.getenv("PRIORITY_MAX", "3"))          # safety clamp (e.g., 1..3)
-
-# Concept boosting (Concept -> Document -> Page -> Chunk)
-# Chunks tagged with metadata.concept (e.g., "negotiation") can be softly boosted at query time.
-CONCEPT_BOOST = float(os.getenv("CONCEPT_BOOST", "0.35"))  # bonus added when chunk concept matches detected concept
-CONCEPT_MAX = int(os.getenv("CONCEPT_MAX", "3"))           # safety clamp for concept bonus multiplier
 # Search trace logging (human-readable, safe to share with clients)
 SEARCH_DEBUG_LOGS = os.getenv("SEARCH_DEBUG_LOGS", "0").strip().lower() in ("1","true","yes","y","on")
 SEARCH_LOG_MAX_MATCHES = int(os.getenv("SEARCH_LOG_MAX_MATCHES", "8"))   # how many matches to print
@@ -135,6 +95,70 @@ if not PINECONE_HOST:
 openai = OpenAI(api_key=OPENAI_API_KEY)
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(PINECONE_INDEX_NAME, host=PINECONE_HOST)
+
+# =========================
+# OPENAI STREAM HELPERS (SSE)
+# =========================
+def _openai_stream_text(messages: List[Dict[str, str]], model: str, temperature: float = 0.2):
+    """Yield incremental text deltas from OpenAI streaming API."""
+    try:
+        stream = openai.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            stream=True,
+        )
+        for ev in stream:
+            try:
+                delta = ev.choices[0].delta
+                txt = getattr(delta, "content", None)
+                if txt:
+                    yield txt
+            except Exception:
+                continue
+    except Exception as e:
+        # If streaming fails, fallback to a single non-streamed response
+        try:
+            resp = openai.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+            )
+            full = (resp.choices[0].message.content or "")
+            if full:
+                yield full
+        except Exception:
+            yield "Server error."
+
+def _sse_headers():
+    # Best-practice SSE headers (Render/Nginx friendly)
+    return {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+
+def _iter_text_as_sse_chunks(text_iter, *, min_chars: int = 24):
+    """Coalesce tiny deltas into readable chunks for Bubble Stream."""
+    buf = ""
+    for piece in text_iter:
+        buf += piece
+        if len(buf) >= min_chars or buf.endswith("\n"):
+            out = buf
+            buf = ""
+            yield out
+    if buf:
+        yield buf
+
+def _format_for_bubble(text: str) -> str:
+    # Normalise whitespace to make Bubble chat look like paragraphs.
+    t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    # Ensure blank line before numbered/bulleted items if missing
+    t = re.sub(r"(?<!\n)\n(\d+\.)", r"\n\n\1", t)
+    t = re.sub(r"(?<!\n)\n([-•])", r"\n\n\1", t)
+    # Collapse 3+ newlines to 2
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
 
 app = FastAPI()
 app.add_middleware(
@@ -307,216 +331,6 @@ def strip_markdown_chars(text: str) -> str:
 
 
 # =========================
-# OUTPUT COMPLIANCE (DOC-ONLY, PASTE-READY)
-# =========================
-QA_REWRITE_ON_FAIL = os.getenv("QA_REWRITE_ON_FAIL", "1").strip().lower() in ("1","true","yes","y","on")
-
-_WEAK_SPEAK_RE = re.compile(
-    r"\b("
-    r"maybe|might|could|should|consider|generally|perhaps|possibly|try|it\s+depends|"
-    r"i\s+think|i\s+believe|i\s+feel|i\s+understand|"
-    r"i\s+appreciate|appreciate\s+your\s+perspective|"
-    r"mutually\s+beneficial|win[-\s]?win|"
-    r"let'?s\s+focus|work\s+together|find\s+a\s+solution\s+together|"
-    r"hopefully|just|kind\s+of|sort\s+of"
-    r")\b",
-    flags=re.IGNORECASE,
-)
-
-# Disallowed "defence" moves for Diadem style
-_HUMOUR_RE = re.compile(r"\b(humou?r|joke|banter|lighten\s+the\s+mood)\b", flags=re.IGNORECASE)
-
-# Disallowed logic/explanation markers (Taboo)
-_LOGIC_RE = re.compile(
-    r"\b(because|therefore|this\s+means|so\s+that|in\s+other\s+words|"
-    r"in\s+order\s+to|to\s+ensure|to\s+maintain|to\s+protect|this\s+allows)\b",
-    flags=re.IGNORECASE,
-)
-
-# Trading requirement ("If you... then I...") for QA output
-_TRADE_RE = re.compile(r"\bif\s+you\b[\s\S]{0,120}?\bthen\s+i\b", flags=re.IGNORECASE)
-
-def _qa_has_required_sections(text: str) -> bool:
-    t = (text or "").strip().lower()
-    return (
-        "recommended move:" in t
-        and "options:" in t
-        and "script (say this):" in t
-        and "pushback line:" in t
-    )
-
-def _qa_needs_rewrite(text: str) -> bool:
-    if not text:
-        return True
-
-    # Weak speak / collaboration framing
-    if _WEAK_SPEAK_RE.search(text or ""):
-        return True
-
-    # Humour / defence moves are not allowed in Diadem style
-    if _HUMOUR_RE.search(text or ""):
-        return True
-
-    # Required structure
-    if not _qa_has_required_sections(text):
-        return True
-
-    # No logic / explaining
-    if _LOGIC_RE.search(text or ""):
-        return True
-
-    # Trading: require at least one explicit trade line (If you... then I...)
-    # This keeps options in the Diadem "conditional movement" style.
-    if not _TRADE_RE.search(text or ""):
-        return True
-
-    return False
-
-def _rewrite_qa_answer(question: str, info: str, draft: str) -> str:
-    # Strict formatter: rewrite into the exact required structure using ONLY INFORMATION.
-    # If not supported by INFORMATION -> return the exact refusal sentence.
-    sys = (
-        "Rewrite the DRAFT into the exact required structure.\n"
-        "You MUST use ONLY INFORMATION. No outside knowledge.\n"
-        "No reasoning, no explanations. No logic.\n"
-        "No humour. No rapport-building. No collaboration framing.\n"
-        "Use declarative, calm, firm sentences only.\n"
-        "Plain text only.\n"
-        "If INFORMATION is empty or not clearly relevant, output exactly:\n"
-        "\"I can't find this in the provided documents.\"\n\n"
-        "Required structure:\n"
-        "Recommended move: <one line>\n"
-        "Options:\n"
-        "- <option 1>\n"
-        "- <option 2>\n"
-        "- <option 3 (optional)>\n"
-        "Script (say this):\n"
-        "<2–4 short lines>\n"
-        "Pushback line:\n"
-        "<1–2 lines>\n\n"
-        "Hard constraints:\n"
-        "- At least ONE option must be a trade in the exact style: 'If you..., then I...'.\n"
-        "- Do NOT use: maybe/might/could/should/consider/I think/I believe/I feel/I understand.\n"
-        "- Do NOT use: win-win, mutually beneficial, let's focus, work together.\n"
-        "- Do NOT use any explanation markers: because/therefore/so that/in order to/to ensure.\n"
-    )
-    user = f"QUESTION:\n{question}\n\nINFORMATION:\n{info}\n\nDRAFT:\n{draft}"
-    resp = openai.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=[{"role":"system","content":sys},{"role":"user","content":user}],
-        temperature=0.0,
-    )
-    return strip_markdown_chars((resp.choices[0].message.content or "").strip())
-
-def _enforce_qa_output(question: str, info: str, answer: str) -> str:
-    if not QA_REWRITE_ON_FAIL:
-        return answer
-    if _qa_needs_rewrite(answer):
-        try:
-            fixed = _rewrite_qa_answer(question, info, answer)
-            return fixed or answer
-        except Exception:
-            return answer
-    return answer
-
-
-# =========================
-# FIRE OUTPUT (SHORT TEMPLATE TEXT)
-# =========================
-FIRE_REWRITE_ON_FAIL = os.getenv("FIRE_REWRITE_ON_FAIL", "1").strip().lower() in ("1","true","yes","y","on")
-
-def _is_fire_request(payload: Dict[str, Any], query: str) -> bool:
-    # Explicit flag from client
-    if str(payload.get("fire") or "").strip().lower() in ("1","true","yes","y","on"):
-        return True
-    style = (payload.get("style") or payload.get("mode") or "").strip().lower()
-    if style in ("fire", "script_only", "template_only"):
-        return True
-
-    q = (query or "").lower()
-    # Heuristics: user explicitly asks for exact template text or FIRE response / trade line
-    if "fire response" in q:
-        return True
-    if "exact text" in q and ("template" in q or "field" in q):
-        return True
-    if "if you" in q and "then i" in q:
-        return True
-    if "if you... then i" in q:
-        return True
-    return False
-
-def _fire_needs_rewrite(text: str, trade_variable: str = "") -> bool:
-    if not text:
-        return True
-    t = (text or "").strip()
-
-    # Must be script only (no headings/sections)
-    if re.search(r"(?im)^\s*(recommended move:|options:|script \(say this\):|pushback line:)", t):
-        return True
-
-    # No weak speak / humour / logic
-    if _WEAK_SPEAK_RE.search(t):
-        return True
-    if _HUMOUR_RE.search(t):
-        return True
-    if _LOGIC_RE.search(t):
-        return True
-
-    # Must include a trade line
-    if not _TRADE_RE.search(t):
-        return True
-
-    # If user specified a trade variable, require it to appear (loose match)
-    if trade_variable:
-        tv = trade_variable.strip().lower()
-        if tv and (tv not in t.lower()):
-            return True
-
-    # Keep it short (avoid long advisory essays)
-    if len(t.split()) > 120:
-        return True
-
-    return False
-
-def _rewrite_fire_answer(question: str, info: str, draft: str, trade_variable: str = "") -> str:
-    base = (
-        "Rewrite the DRAFT into a short, paste-ready negotiation script.\n"
-        "You MUST use ONLY INFORMATION. No outside knowledge.\n"
-        "Output ONLY the exact text the user should paste into their template field.\n"
-        "No headings, no labels, no explanation.\n"
-        "UK English.\nFormat with clear line breaks (short lines; separate ideas with blank lines).\n\n"
-        "Hard constraints:\n"
-        "- Use calm, firm, declarative sentences.\n"
-        "- NO weak/hedging language (no: maybe/might/could/should/consider/I think/I believe/I feel/I understand).\n"
-        "- NO rapport/collaboration framing (no: I appreciate, let's focus, work together, mutually beneficial, win-win).\n"
-        "- NO humour.\n"
-        "- NO logic markers (no: because/therefore/so that/in order to/to ensure/to maintain).\n"
-        "- MUST include at least ONE explicit trade line in this exact style: 'If you..., then I...'.\n"
-    )
-    sys = base + (f"- The trade must use this variable: {trade_variable}.\n" if trade_variable else "") + (
-        "\nIf INFORMATION is empty or not clearly relevant, output exactly:\n"
-        "\"I can't find this in the provided documents.\""
-    )
-    user = f"QUESTION:\n{question}\n\nINFORMATION:\n{info}\n\nDRAFT:\n{draft}"
-    resp = openai.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=[{"role":"system","content":sys},{"role":"user","content":user}],
-        temperature=0.0,
-    )
-    return strip_markdown_chars((resp.choices[0].message.content or "").strip())
-
-def _enforce_fire_output(question: str, info: str, answer: str, trade_variable: str = "") -> str:
-    if not FIRE_REWRITE_ON_FAIL:
-        return answer
-    if _fire_needs_rewrite(answer, trade_variable=trade_variable):
-        try:
-            fixed = _rewrite_fire_answer(question, info, answer, trade_variable=trade_variable)
-            return fixed or answer
-        except Exception:
-            return answer
-    return answer
-
-# =========================
 # SMALL TALK
 # =========================
 _SMALLTALK_RE = re.compile(
@@ -533,18 +347,25 @@ def _is_smalltalk(q: str) -> bool:
 
 
 def _smalltalk_reply(user_name: str) -> str:
-    # Keep the original MASTER greeting behaviour on first turn elsewhere.
-    # For short greetings like "hi", respond with a helpful prompt (no corporate tone).
     name = (user_name or "").strip()
     if name:
-        return f"Hi {name}. What part of the MASTER negotiation template are you filling right now?"
-    return "Hi. What part of the MASTER negotiation template are you filling right now?"
+        return f"Hi {name}. How can I help?"
+    return "Hi. How can I help?"
 
 
 # =========================
 # VARIATION
 # =========================
-SOFT_OPENERS = [""]
+SOFT_OPENERS = [
+    "Glad you’re thinking about this ahead of time.",
+    "That makes sense — getting prepared early helps a lot.",
+    "Good call to tackle this before the meeting.",
+    "Nice — planning this now will make the conversation easier.",
+    "Totally doable. Let’s get you set up for it.",
+    "Okay, let’s make this straightforward and calm.",
+    "Makes sense. Let’s work through it step by step.",
+    "Alright — we can make this feel a lot more manageable.",
+]
 
 _BAD_START_RE = re.compile(r"^\s*(it['’]s\s+(great|wonderful)|great)\b", flags=re.IGNORECASE)
 
@@ -622,61 +443,7 @@ def _hint_for_question(question: str) -> str:
             if key in qn:
                 return item["hint"]
     return ""
-# =========================
-# CONCEPT DETECTION (soft routing)
-# =========================
-# Lightweight heuristic concept detection to support Concept -> Document -> Page -> Chunk.
-# We keep this non-breaking: if no concept is detected, we fallback to "general" and apply no extra bias.
 
-_CONCEPT_KEYWORDS = {
-    "negotiation": [
-        "negotiat", "push back", "pushback", "counter", "concession", "anchor", "anchoring",
-        "walk away", "walkaway", "batna", "deal", "terms", "leverage", "power", "tactics",
-        "difficult questions", "difficult question", "master negotiator",
-    ],
-    "selling": ["sell", "selling", "objection", "pipeline", "prospect", "closing", "close", "pitch"],
-    "presenting": ["present", "presentation", "slide", "storytelling", "audience", "public speaking"],
-    "coaching": ["coach", "coaching", "feedback", "mentor", "mentoring", "one-to-one", "1:1"],
-    "emotional_intelligence": ["emotional intelligence", "eq", "self-awareness", "self awareness", "empathy", "emotional regulation"],
-}
-
-def _detect_concept(query: str) -> str:
-    q = (query or "").strip().lower()
-    q = re.sub(r"\s+", " ", q)
-    if not q:
-        return "general"
-
-    # Force negotiation concept if MASTER is referenced
-    if "master" in q and ("framework" in q or "template" in q or "negotiator" in q):
-        return "negotiation"
-
-    for concept, keys in _CONCEPT_KEYWORDS.items():
-        for k in keys:
-            if k in q:
-                return concept
-    return "general"
-
-
-
-
-def _is_master_template_query(q: str) -> bool:
-    s = (q or "").strip().lower()
-    return s.startswith("master_negotiator_template") or s.startswith("master_template") or "master_negotiator_template" in s or "master_template" in s
-
-def _is_priority_master_doc(md: Dict[str, Any]) -> int:
-    """Return 2 for Master Negotiator Slides, 1 for Negotiation.pdf, 0 otherwise."""
-    fmeta = " ".join([
-        str(md.get("file_name") or ""),
-        str(md.get("title") or ""),
-        str(md.get("source") or ""),
-        str(md.get("file") or ""),
-        str(md.get("document") or ""),
-    ]).lower()
-    if "master negotiator slides" in fmeta or ("master negotiator" in fmeta and "slide" in fmeta):
-        return 2
-    if "negotiation.pdf" in fmeta:
-        return 1
-    return 0
 
 # =========================
 # RAG HELPERS
@@ -691,11 +458,6 @@ def embed_query(text: str) -> List[float]:
 
 
 def _filter_matches_by_score(matches: List[Dict]) -> List[Dict]:
-    """Filter matches by MIN_MATCH_SCORE.
-
-    IMPORTANT: must always return a list (never None), because downstream code
-    assumes list-like behaviour (len(), iteration, slicing).
-    """
     out: List[Dict] = []
     for m in matches or []:
         try:
@@ -705,28 +467,6 @@ def _filter_matches_by_score(matches: List[Dict]) -> List[Dict]:
         if score >= MIN_MATCH_SCORE:
             out.append(m)
     return out
-
-def _hard_filter_matches(matches: List[Dict], *, concept: Optional[str] = None, priority_min: Optional[int] = None) -> List[Dict]:
-    """Optional strict filters applied after score filtering.
-    - concept: keep only matches where metadata.concept == concept
-    - priority_min: keep only matches where metadata.priority >= priority_min
-    """
-    out: List[Dict] = []
-    for m in matches or []:
-        md = m.get("metadata") or {}
-        if concept:
-            if (md.get("concept") or "").strip().lower() != concept.strip().lower():
-                continue
-        if priority_min is not None:
-            try:
-                p = int(md.get("priority") or 0)
-            except Exception:
-                p = 0
-            if p < int(priority_min):
-                continue
-        out.append(m)
-    return out
-
 
 
 _STOPWORDS = {
@@ -826,7 +566,7 @@ def _merge_dedup_matches(list_of_lists: List[List[Dict]]) -> List[Dict]:
     return list(best.values())
 
 
-def _rerank(query: str, matches: List[Dict], final_k: int, detected_concept: str = "general") -> List[Dict]:
+def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
     qt = set(_tokenize(query))
     hint = _hint_for_question(query)
     hint_toks = set(_tokenize(hint)) if hint else set()
@@ -834,37 +574,13 @@ def _rerank(query: str, matches: List[Dict], final_k: int, detected_concept: str
     scored: List[Tuple[float, Dict]] = []
     qlow = (query or "").lower()
 
-    master_mode = _is_master_template_query(query)
-
     for m in matches or []:
         md = m.get("metadata") or {}
         # priority is optional metadata (default 1). Higher = slightly boosted during rerank.
-        # concept is optional metadata (default "general"). Soft-boost when it matches detected concept.
-        c_md = (md.get("concept") or "general")
-        c_det = (detected_concept or "general")
-        c_mult = 0
-        if c_det != "general" and c_md == c_det:
-            c_mult = 1
         try:
             pr = int(md.get("priority") or 1)
         except Exception:
             pr = 1
-
-        # Implicit priority for key negotiation sources (even if metadata.priority is missing).
-        # IMPORTANT: For master_template queries, Master Negotiator Slides is Priority #1.
-        doc_rank = _is_priority_master_doc(md)  # 2=Slides, 1=Negotiation, 0=other
-        if master_mode:
-            if doc_rank == 2:
-                pr = max(pr, PRIORITY_MAX)
-            elif doc_rank == 1:
-                pr = max(pr, max(1, PRIORITY_MAX - 1))
-            else:
-                # Keep other docs available but do not boost them.
-                pr = min(pr, 1)
-        else:
-            if doc_rank >= 1:
-                pr = max(pr, PRIORITY_MAX)
-
         if pr < 1:
             pr = 1
         if pr > PRIORITY_MAX:
@@ -899,16 +615,12 @@ def _rerank(query: str, matches: List[Dict], final_k: int, detected_concept: str
             if gp in tlow:
                 penalty += 1.1
 
-        if master_mode and doc_rank == 0:
-            # Push non-negotiation docs down for master_template.
-            penalty += 1.4
-
         try:
             pscore = float(m.get("score") or 0.0)
         except Exception:
             pscore = 0.0
 
-        final = (overlap_q * 1.25) + (overlap_hint * 1.6) + bonus + (pscore * 0.25) - penalty + (max(0, pr - 1) * PRIORITY_BOOST) + (c_mult * CONCEPT_BOOST)
+        final = (overlap_q * 1.25) + (overlap_hint * 1.6) + bonus + (pscore * 0.25) - penalty + (max(0, pr - 1) * PRIORITY_BOOST)
         scored.append((final, m))
 
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -992,7 +704,6 @@ def _brief_match(m: Dict, label: str = "") -> Dict[str, Any]:
         "label": label,
         "score": round(score, 4),
         "priority": pr,
-        "concept": (md.get("concept") or ""),
         "file": md.get("file_name") or "",
         "page": md.get("page"),
         "chunk_index": md.get("chunk_index"),
@@ -1000,12 +711,8 @@ def _brief_match(m: Dict, label: str = "") -> Dict[str, Any]:
         "preview": txt,
     }
 
-def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None, *, hard_filter_concept: Optional[str] = None, hard_filter_priority_min: Optional[int] = None) -> List[Dict]:
+def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) -> List[Dict]:
     q_clean = (query or "").strip()
-    q_l = q_clean.lower()
-    # Auto strict filter for MASTER template mode (keeps retrieval inside negotiation library)
-    if (q_l.startswith("master_negotiator_template") or q_l.startswith("master_template")) and not hard_filter_concept:
-        hard_filter_concept = "negotiation"
     if not q_clean:
         return []
 
@@ -1019,11 +726,7 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None, 
           pinecone_topk_raw=PINECONE_TOPK_RAW,
           multi_query_k=MULTI_QUERY_K,
           min_match_score=MIN_MATCH_SCORE,
-          priority_boost=PRIORITY_BOOST,
-          concept_boost=CONCEPT_BOOST)
-
-    detected_concept = hard_filter_concept or _detect_concept(q_clean)
-    _slog("search_concept_detected", request_id=request_id, concept=detected_concept)
+          priority_boost=PRIORITY_BOOST)
 
     hint = _hint_for_question(q_clean)
     q_hint = f"{q_clean}\n{hint}".strip() if hint else ""
@@ -1057,43 +760,18 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None, 
             continue
 
     merged = _merge_dedup_matches(all_results)
-    merged = merged or []
     _slog("search_merged",
           request_id=request_id,
-          merged_count=len(merged or []),
+          merged_count=len(merged),
           sample=[_brief_match(x) for x in merged[:SEARCH_LOG_MAX_MATCHES]])
 
     merged = _filter_matches_by_score(merged)
-
-    merged_before_hard = len(merged or [])
-    merged = _hard_filter_matches(merged, concept=hard_filter_concept, priority_min=hard_filter_priority_min)
-    if hard_filter_concept or (hard_filter_priority_min is not None):
-        _slog("search_hard_filter", request_id=request_id, concept=hard_filter_concept or "", priority_min=hard_filter_priority_min, before=merged_before_hard, after=len(merged or []))
     _slog("search_filtered",
           request_id=request_id,
-          filtered_count=len(merged or []),
+          filtered_count=len(merged),
           sample=[_brief_match(x) for x in merged[:SEARCH_LOG_MAX_MATCHES]])
 
-    reranked = _rerank(q_clean, merged, top_k_final, detected_concept=detected_concept)
-
-    # For master_template, keep the retrieval tightly anchored on negotiation sources.
-    master_mode = _is_master_template_query(q_clean)
-    if master_mode:
-        masters = [m for m in (reranked or []) if _is_priority_master_doc(m.get("metadata") or {}) > 0]
-        if len(masters) >= max(2, min(4, top_k_final)):
-            reranked = masters[:top_k_final]
-        else:
-            # Fallback: keep at least the best master docs, then fill remaining with reranked.
-            keep_ids = set((m.get("id") for m in masters if m.get("id")))
-            filled = masters[:]
-            for m in (reranked or []):
-                mid = m.get("id")
-                if mid and mid in keep_ids:
-                    continue
-                filled.append(m)
-                if len(filled) >= top_k_final:
-                    break
-            reranked = filled[:top_k_final]
+    reranked = _rerank(q_clean, merged, top_k_final)
     _slog("search_reranked",
           request_id=request_id,
           final_count=len(reranked),
@@ -1110,7 +788,7 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None, 
     return reranked
 
 def _reflect_line() -> str:
-    return ""
+    return random.choice(["Got it.", "Okay.", "Thanks — noted.", "Understood.", "That helps."])
 
 def _retrieve_info_for_coach(mode: str, query: str, top_k: int) -> str:
     rag_query = f"{mode}: {query}"
@@ -1171,82 +849,45 @@ LIMITS_POLICY = (
 )
 
 SYSTEM_PROMPT_QA = (
-    "Use UK English spelling and tone.\n"
-    "Format output with clear paragraphs and line breaks (short lines; blank line between idea blocks).\n"
     "You are a negotiation assistant that can ONLY use the provided INFORMATION.\n"
-    "You must not add any outside knowledge, assumptions, or 'common sense'.\n"
-    "If INFORMATION is empty, missing, or not clearly relevant, respond exactly:\n"
-    "\"I can't find this in the provided documents.\".\n\n"
+    "Your job is to produce specific, usable negotiation output (scripts + options), grounded in INFORMATION.\n\n"
 
-    "Hard rules (must follow):\n"
+    "Hard rules:\n"
     "- Output plain text only. NO markdown.\n"
     "- Do NOT mention document names, pages, sources, citations, or the word 'context'.\n"
-    "- Do NOT explain your reasoning. No analysis, no teaching.\n"
-    "- Do NOT use humour or jokes.\n"
-    "- Do NOT use collaboration/rapport framing (no: let's focus, work together, I appreciate, mutually beneficial, win-win).\n"
-    "- Do NOT use weak / hedging language (avoid: maybe, might, could, should, consider, generally, perhaps, possibly, try, I think, I believe, I feel, I understand).\n"
-    "- Do NOT use logic/explanation markers (no: because, therefore, so that, in other words, in order to, to ensure, to maintain, to protect, this allows).\n"
-    "- Do NOT copy sentences from INFORMATION. Paraphrase.\n"
-    "- Keep it concise (<=180 words).\n"
-    "- Use declarative, calm, firm sentences.\n\n"
+    "- Do NOT copy sentences from INFORMATION. Paraphrase everything.\n"
+    "- You may include at most ONE very short quoted phrase (max 6 words) only if it is essential.\n"
+    "- If INFORMATION is missing / too generic / not clearly relevant, respond exactly:\n"
+    "  \"I can't find this in the provided documents.\".\n\n"
 
-    "Your answer MUST be copy/paste-ready and follow this exact structure:\n"
-    "Recommended move: <one line>\n"
-    "Options:\n"
-    "- <option 1>\n"
-    "- <option 2>\n"
-    "- <option 3 (optional)>\n"
-    "Script (say this):\n"
-    "<2–4 short lines the user can say>\n"
-    "Pushback line:\n"
-    "<1–2 lines>\n\n"
+    "Make it actionable:\n"
+    "- Always include:\n"
+    "  1) Recommended move (1 line)\n"
+    "  2) 2–3 concrete options you can propose (numbers/terms where possible)\n"
+    "  3) A word-for-word script (2–4 lines) the user can say\n"
+    "  4) One pushback handling line (1–2 lines)\n"
+    "- If the user didn’t give key numbers, provide placeholders like [X], [date], [volume], [payment terms].\n"
+    "- Keep it concise (<=180 words).\n\n"
 
-    "Trading rule:\n"
-    "- At least ONE option must use the exact structure: If you..., then I...\n\n"
-
-    "Placeholders: if key numbers are missing, use placeholders like [X], [date], [volume], [payment terms].\n"
+    "Tone:\n"
+    "- Direct, practical, confident.\n"
+    "- End with ONE short question only if absolutely needed to choose between options.\n"
 )
 
-# Short "FIRE" script mode: return ONLY paste-ready template text (no headings)
-SYSTEM_PROMPT_FIRE = (
-    "Use UK English spelling and tone.\n"
-    "Format output with clear paragraphs and line breaks (short lines; blank line between idea blocks).\n"
-    "You are a negotiation assistant that can ONLY use the provided INFORMATION.\n"
-    "You must not add any outside knowledge, assumptions, or 'common sense'.\n"
-    "If INFORMATION is empty, missing, or not clearly relevant, respond exactly:\n"
-    "\"I can't find this in the provided documents.\".\n\n"
-
-    "Hard rules (must follow):\n"
-    "- Output plain text only. NO markdown.\n"
-    "- Output ONLY the exact text the user should paste into their template field.\n"
-    "- Do NOT include headings, labels, or sections.\n"
-    "- Do NOT explain your reasoning. No analysis, no teaching.\n"
-    "- Do NOT use humour or jokes.\n"
-    "- Do NOT use collaboration/rapport framing (no: let's focus, work together, I appreciate, mutually beneficial, win-win).\n"
-    "- Do NOT use weak / hedging language (avoid: maybe, might, could, should, consider, generally, perhaps, possibly, try, I think, I believe, I feel, I understand).\n"
-    "- Do NOT use logic/explanation markers (no: because, therefore, so that, in other words, in order to, to ensure, to maintain, to protect, this allows).\n"
-    "- Use declarative, calm, firm sentences.\n"
-    "- MUST include at least ONE trade line in the exact style: If you..., then I...\n"
-    "- Keep it short (<=120 words).\n\n"
-
-    "Placeholders: if key numbers are missing, use placeholders like [X], [date], [volume], [payment terms].\n"
-)
 
 # Strict doc-only chat (no apple pie)
 SYSTEM_PROMPT_CHAT = (
-    "Use UK English spelling and tone.\n"
-    "Format output with clear paragraphs and line breaks (short lines; blank line between idea blocks).\n"
     "You are a focused assistant specialised only in the provided materials.\n"
     "You may answer ONLY if INFORMATION is provided and clearly relevant to the user's question.\n"
     "If INFORMATION is empty, missing, or not relevant to the question, you must respond exactly with:\n"
-    "\"I can only help with questions related to the provided materials.\"\n\n"
-    "Rules:\n"
+    "\"I can only help with questions related to the provided materials.\"\n"
+    "\nRules:\n"
     "- Output plain text only. NO markdown.\n"
     "- Do NOT mention documents, pages, sources, citations, or the word 'context'.\n"
-    "- Do NOT provide general knowledge or advice outside INFORMATION.\n"
-    "- Do NOT explain reasoning.\n"
+    "- Do NOT provide general knowledge, explanations, recipes, or advice outside INFORMATION.\n"
     "- Keep it short and neutral.\n"
     "- Do NOT ask follow-up questions when refusing.\n"
+    "- If USER_NAME is provided, you may greet them only when answering (not when refusing).\n"
     + VARIABLES_POLICY
     + ACTIVE_SECTION_POLICY
     + LIMITS_POLICY
@@ -1254,10 +895,8 @@ SYSTEM_PROMPT_CHAT = (
 
 # Final output must be AI-written (not pasted) and no technical keys
 SYSTEM_PROMPT_COACH_FINAL = (
-    "Use UK English spelling and tone.\n"
-    "Format output with clear paragraphs and line breaks (short lines; blank line between idea blocks).\n"
     "You are a professional negotiation coach.\n"
-    "You may ONLY use the provided INFORMATION to shape your output.\n"
+    "You may ONLY use the provided INFORMATION to shape your guidance.\n"
     "Do not rely on general negotiation knowledge outside INFORMATION.\n"
     "The guided dialogue is complete. Produce the final output now.\n\n"
 
@@ -1265,24 +904,26 @@ SYSTEM_PROMPT_COACH_FINAL = (
     "- Output plain text only. NO markdown.\n"
     "- Do NOT mention documents, pages, sources, citations, or the word 'context'.\n"
     "- Do NOT introduce tactics, terms, or levers that are not supported by INFORMATION.\n"
-    "- Do NOT copy sentences verbatim from INFORMATION. Paraphrase.\n"
-    "- Do NOT explain your reasoning. No analysis.\n"
-    "- Avoid weak / hedging language (maybe, might, could, should, consider, generally, perhaps, possibly, try).\n\n"
+    "- Do NOT copy sentences verbatim from INFORMATION.\n"
+    "- Rephrase, synthesise, and apply INFORMATION to the user's situation.\n\n"
 
     "Specificity rules:\n"
-    "- Convert INFORMATION into concrete, usable language the user can copy/paste.\n"
-    "- If INFORMATION does not support a specific term (price, payment, %), use placeholders like [X], [date].\n\n"
+    "- Convert INFORMATION into concrete, usable negotiation language.\n"
+    "- Where INFORMATION implies options (e.g. timing, scope, commitment), make them explicit.\n"
+    "- If INFORMATION does not support a specific term (price, payment, %), use placeholders like [X], [date].\n"
+    "- Avoid generic advice (e.g. 'focus on value') unless INFORMATION explains how to do so.\n\n"
 
     "Output format for 'Prepare for difficult behaviours':\n"
-    "Scenario: <1–2 sentences>\n"
-    "Cheat sheet:\n"
-    "likely line -> your response -> steer-back phrase\n"
-    "(All lines must be something the user could say out loud.)\n"
-    "Optional: one short line naming the tactic (only if supported).\n"
-    "Optional: 1–2 concrete trade-offs (only if supported).\n\n"
+    "1) Scenario (1–2 sentences, rewritten).\n"
+    "2) Cheat sheet:\n"
+    "   likely line -> your response -> steer-back phrase.\n"
+    "   (All lines must be something the user could say out loud.)\n"
+    "3) Optional: one short line explaining the other party’s tactic, grounded in INFORMATION.\n"
+    "4) Optional: 1–2 concrete trade-offs supported by INFORMATION.\n\n"
 
     "Style:\n"
     "- Calm, confident, practical.\n"
+    "- Sound like a real coach preparing someone for a live conversation.\n"
     "- End with one short optional next-step question.\n"
     + VARIABLES_POLICY
     + TEMPLATE_FIRST_POLICY
@@ -1662,7 +1303,7 @@ def health():
 # CHAT (RAG)
 # =========================
 @app.post("/chat")
-def chat(payload: Dict = Body(default={})):
+def chat(payload: Dict = Body(...)):
     query = (payload.get("query") or "").strip()
     top_k = int(payload.get("top_k") or TOP_K)
     user_name = _extract_user_name(payload)
@@ -1680,10 +1321,26 @@ def chat(payload: Dict = Body(default={})):
     matches = get_matches(query, top_k, request_id=request_id)
     context = build_context(matches, request_id=request_id) if matches else ""
 
-    fire_mode = _is_fire_request(payload, query)
-    trade_variable = "payment terms" if re.search(r"\bpayment\s*terms?\b", query, flags=re.IGNORECASE) else ""
     if not matches:
-        return {"answer": "I can't find this in the provided documents.", "session_id": session_id}
+        user = (
+            f"USER_NAME:\n{user_name}\n\n"
+            f"USER_MESSAGE:\n{query}\n\n"
+            f"INFORMATION:\n"
+        )
+        resp = openai.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT_CHAT},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
+        )
+        answer = strip_markdown_chars((resp.choices[0].message.content or "").strip())
+        # IMPORTANT: if we are refusing, do not add openers.
+        if answer and answer.strip() != "I can only help with questions related to the provided materials.":
+            opener = _pick_opener(session_id, user_name, "qa_last_opener")
+            answer = _rewrite_bad_opening(answer, opener)
+        return {"answer": answer, "session_id": session_id}
 
     user = (
         f"USER_NAME:\n{user_name}\n\n"
@@ -1694,22 +1351,22 @@ def chat(payload: Dict = Body(default={})):
     resp = openai.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
-            {"role": "system", "content": (SYSTEM_PROMPT_FIRE if fire_mode else SYSTEM_PROMPT_QA)},
+            {"role": "system", "content": SYSTEM_PROMPT_QA},
             {"role": "user", "content": user},
         ],
-        temperature=0.0,
+        temperature=0.2,
     )
 
     answer = strip_markdown_chars((resp.choices[0].message.content or "").strip())
-    # Enforce Diadem QA rules (no weak speak / humour / logic, and require trading)
-    answer = (_enforce_fire_output(query, context, answer, trade_variable=trade_variable)
-             if fire_mode else _enforce_qa_output(query, context, answer))
+    if answer.strip() != "I can't find this in the provided documents.":
+        opener = _pick_opener(session_id, user_name, "qa_last_opener")
+        answer = _rewrite_bad_opening(answer, opener)
 
     return {"answer": answer, "session_id": session_id}
 
 
 @app.post("/chat/sse")
-def chat_sse(payload: Dict = Body(default={})):
+def chat_sse(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
     request_id = str(uuid.uuid4())[:8]
     _cleanup_sessions()
@@ -1717,78 +1374,63 @@ def chat_sse(payload: Dict = Body(default={})):
     query = (payload.get("query") or "").strip()
     top_k = int(payload.get("top_k") or TOP_K)
     user_name = _extract_user_name(payload)
-    fire_mode = _is_fire_request(payload, query)
-    trade_variable = "payment terms" if re.search(r"\bpayment\s*terms?\b", query, flags=re.IGNORECASE) else ""
-
-    if not query:
-        result_text = ""
-    elif _is_smalltalk(query):
-        result_text = _smalltalk_reply(user_name)
-    else:
-        matches = get_matches(query, top_k, request_id=request_id)
-        context = build_context(matches, request_id=request_id) if matches else ""
-
-        if not matches:
-            user = (
-                f"USER_NAME:\n{user_name}\n\n"
-                f"USER_MESSAGE:\n{query}\n\n"
-                f"INFORMATION:\n"
-            )
-            resp = openai.chat.completions.create(
-                model=CHAT_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT_CHAT},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0.2,
-            )
-            result_text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
-            result_text = (_enforce_fire_output(query, context, result_text, trade_variable=trade_variable)
-                      if fire_mode else _enforce_qa_output(query, context, result_text))
-        else:
-            user = (
-                f"USER_NAME:\n{user_name}\n\n"
-                f"QUESTION:\n{query}\n\n"
-                f"INFORMATION:\n{context}"
-            )
-            resp = openai.chat.completions.create(
-                model=CHAT_MODEL,
-                messages=[
-                    {"role": "system", "content": (SYSTEM_PROMPT_FIRE if fire_mode else SYSTEM_PROMPT_QA)},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0.0,
-            )
-            result_text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
-            result_text = (_enforce_fire_output(query, context, result_text, trade_variable=trade_variable)
-                          if fire_mode else _enforce_qa_output(query, context, result_text))
-
-    def headers():
-        return {
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        }
 
     def gen():
         start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
         yield f"event: start\ndata: {start_payload}\n\n"
 
-        for piece in _chunk_text_for_sse(result_text):
-            data = json.dumps({"text": piece}, ensure_ascii=False)
+        # Smalltalk: single chunk
+        if not query:
+            chunks = [""]
+        elif _is_smalltalk(query):
+            chunks = [_smalltalk_reply(user_name)]
+        else:
+            matches = get_matches(query, top_k, request_id=request_id)
+            context = build_context(matches) if matches else ""
+
+            if not matches:
+                user = (
+                    f"USER_NAME:\n{user_name}\n\n"
+                    f"USER_MESSAGE:\n{query}\n\n"
+                    f"INFORMATION:\n"
+                )
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT_CHAT},
+                    {"role": "user", "content": user},
+                ]
+            else:
+                user = (
+                    f"USER_NAME:\n{user_name}\n\n"
+                    f"QUESTION:\n{query}\n\n"
+                    f"INFORMATION:\n{context}"
+                )
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT_QA},
+                    {"role": "user", "content": user},
+                ]
+
+            # Stream from OpenAI
+            chunks = _iter_text_as_sse_chunks(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2), min_chars=28)
+
+        # Emit chunks
+        for part in chunks:
+            part = _format_for_bubble(strip_markdown_chars(part))
+            data = json.dumps({"text": part}, ensure_ascii=False)
             yield f"event: chunk\ndata: {data}\n\n"
 
         done_payload = json.dumps({"done": True}, ensure_ascii=False)
         yield f"event: done\ndata: {done_payload}\n\n"
 
-    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers())
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=_sse_headers())
+
+
 
 
 # =========================
 # COACH ENDPOINTS
 # =========================
 @app.post("/coach/chat")
-def coach_chat(payload: Dict = Body(default={})):
+def coach_chat(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
     try:
         out = coach_turn_server_state(payload, session_id=session_id, stream=False)
@@ -1799,7 +1441,7 @@ def coach_chat(payload: Dict = Body(default={})):
 
 
 @app.post("/coach/sse")
-def coach_sse(payload: Dict = Body(default={})):
+def coach_sse(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
 
     def headers():
@@ -1824,9 +1466,8 @@ def coach_sse(payload: Dict = Body(default={})):
             if not isinstance(result, dict):
                 result = {"text": "Internal error.", "done": False}
 
-            for piece in _chunk_text_for_sse(result.get("text", "")):
-                chunk_payload = json.dumps({"text": piece}, ensure_ascii=False)
-                yield f"event: chunk\ndata: {chunk_payload}\n\n"
+            chunk_payload = json.dumps({"text": result.get("text", "")}, ensure_ascii=False)
+            yield f"event: chunk\ndata: {chunk_payload}\n\n"
 
             done_payload = json.dumps({"done": bool(result.get("done"))}, ensure_ascii=False)
             yield f"event: done\ndata: {done_payload}\n\n"
@@ -1844,7 +1485,7 @@ def coach_sse(payload: Dict = Body(default={})):
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers())
 
 @app.post("/coach/reset")
-def coach_reset(payload: Dict = Body(default={})):
+def coach_reset(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
     _jlog("coach_reset_endpoint", session_id=session_id)
     _db_delete(session_id)
@@ -1863,28 +1504,29 @@ def coach_reset(payload: Dict = Body(default={})):
 
 MASTER_MODE = "master_negotiator_template"
 
-MASTER_SYSTEM_PROMPT_TEXT = """
-Use UK English spelling and tone.
-Format output with clear paragraphs and line breaks (short lines; blank line between idea blocks).
-You are a Diadem-style negotiation assistant.
-
-Use the provided INFORMATION as your primary source.
-If INFORMATION is thin or partially relevant, still respond using Diadem method (do NOT mention missing documents).
+MASTER_SYSTEM_PROMPT_TEXT = """You are a Diadem MASTER Negotiator assistant.
+Your only job: help the user fill the MASTER negotiation template using Diadem language.
+Primary source: Master Negotiator Slides. Use the provided INFORMATION. Do not use generic corporate coaching.
 
 Hard rules:
 - Plain text only. NO markdown.
-- Output ONLY paste-ready text the user can put into the MASTER template field.
-- No teaching. No labels. No 'choose one'. No examples framing.
+- Do not claim you edited any table/field. You only provide what to type.
+- Do not output JSON.
+- No weak speak. Avoid: I believe, I think, maybe, try, hopefully, mutually beneficial, appreciate your perspective.
 - No humour.
-- No collaboration/rapport framing.
-- No weak speak (avoid: I think, I believe, maybe, perhaps, mutually beneficial, just, sort of, kind of).
-- No logic or justification (avoid: because, due to, quality, service, value explanation).
-- Declarative sentences.
-- If the user asks for a trade, use: If you..., then I...
-- If the user requests "no placeholders", do not use [X] / <X> / brackets. Choose a concrete value.
-  (If Payment Terms are the only variable and no number is given, default to 60 days.)
-- Keep it short (<=120 words).
+- No logic/justification (no 'because', no 'quality/service' arguments). Use short declarative response bullets.
+- Prefer Diadem tactics: Silence / Water / Earth / Fire as appropriate.
+- Trading only: If you... then I... (Reverse If/Then: IF = their commitment/money, THEN = our concession).
+- If user has a target % (e.g., 10%), start 3–5% higher as opening anchor.
+- Keep it concrete: give exact template-ready wording (no placeholders unless the user gave none).
+- Ask at most 1 short question only if a critical detail is missing.
+
+Output format:
+1) One-line tactic label (e.g., WATER / EARTH / SILENCE).
+2) 2–5 short bullets explaining what to type.
+3) 1–2 exact template lines the user can paste.
 """
+
 
 def _mnt_default_state_text() -> Dict[str, Any]:
     return {
@@ -1970,7 +1612,7 @@ def _truncate_words(text: str, max_words: int = 140) -> str:
     return " ".join(words[:max_words]).strip()
 
 def _master_llm_text(user_message: str, active_section_id: str, focus_field: str, deal_value: Optional[float], user_name: str, clarify_count: int, info: str) -> str:
-    # Build a compact instruction that nudges the model to answer for the active field.
+    # Compact user prompt. INFORMATION is retrieved from Pinecone.
     deal_line = "" if deal_value is None else f"DEAL_VALUE: {deal_value}\n"
     name_line = user_name.strip() if user_name else ""
     prompt_user = (
@@ -1980,32 +1622,48 @@ def _master_llm_text(user_message: str, active_section_id: str, focus_field: str
         f"{deal_line}"
         f"USER_MESSAGE: {user_message}\n\n"
         f"INFORMATION:\n{info}\n\n"
-        "TASK: Help the user fill the MASTER template.\n"
-        "- If FOCUS_FIELD is set: explain what to type there + give 1–2 examples.\n"
-        "- If user asks 'what variables': suggest 3–6 variables with short whys.\n"
-        "- Ask at most 1 short question if critical info is missing, otherwise give best-effort guidance now.\n"
+        "TASK: Give Diadem-only, template-ready guidance for the MASTER template.\n"
+        "If FOCUS_FIELD is set: tell the user exactly what to type there and give 1–2 paste-ready lines.\n"
+        "If user asks what variables: propose 3–6 variables (short) and show how to anchor them in time or price.\n"
+        "Do NOT refuse. If INFORMATION is thin, still give best-effort Diadem guidance.\n"
     )
 
+    messages = [
+        {"role": "system", "content": MASTER_SYSTEM_PROMPT_TEXT},
+        {"role": "user", "content": prompt_user},
+    ]
     resp = openai.chat.completions.create(
         model=CHAT_MODEL,
-        messages=[
-            {"role": "system", "content": MASTER_SYSTEM_PROMPT_TEXT},
-            {"role": "user", "content": prompt_user},
-        ],
+        messages=messages,
         temperature=0.2,
     )
     text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
-    return _truncate_words(text, 140)
+
+    # Never allow the generic refusal line in this mode
+    if text.strip().lower() in ("i can't find this in the provided documents.", "i can’t find this in the provided documents."):
+        # Minimal, still useful fallback
+        if focus_field:
+            text = (
+                "EARTH\n"
+                f"- Stay in the '{focus_field}' field.\n"
+                "- Use short, declarative bullets.\n"
+                "- Trade: If you... then I... (IF = their commitment, THEN = our concession).\n\n"
+                "Template line:\n"
+                "If you commit to [their concrete commitment], then I will [our concession]."
+            )
+        else:
+            text = (
+                "WATER\n"
+                "- Tell me which field you’re filling (deal value / variables / goals / walk-away / concessions).\n"
+                "- Then I’ll give you exact template wording."
+            )
+
+    text = _format_for_bubble(text)
+    return _truncate_words(text, 180)
+
 
 
 def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[str, Any]:
-    """Diadem-only MASTER template helper (paste-ready, no corporate guidance).
-
-    - No consent gating.
-    - Greeting on the first turn.
-    - FIRE-style output by default.
-    - Doc-only: if RAG yields nothing, refuse with the exact sentence.
-    """
     _cleanup_sessions()
 
     reset = _as_bool(payload.get("reset")) or _as_bool(payload.get("start_again")) or _as_bool(payload.get("restart"))
@@ -2026,86 +1684,136 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
     if dv is not None:
         st["deal_value"] = dv
 
-    user_name = _extract_user_name(payload)  # kept for compatibility; not used in tone
+
+    # help_accepted: explicit flag OR infer from user's "yes/no" text at the consent step
+    help_accepted = payload.get("help_accepted")
+    if help_accepted is None:
+        help_accepted = payload.get("helpAccepted")
+    if help_accepted is not None:
+        st["help_accepted"] = _as_bool(help_accepted)
+    elif st.get("help_accepted") is None:
+        # Bubble may only send user_message="yes"/"no". Infer consent from text once.
+        yn = _parse_yes_no(user_message)
+        if yn is not None:
+            st["help_accepted"] = yn
 
 
-    # Always greet on the first turn in MASTER template mode (Bubble may send a real first message).
-    greeting = "Hello! How can I assist you with the MASTER negotiation template today?"
-    first_turn = not _as_bool(st.get("greeted"))
-    if first_turn:
-        st["greeted"] = True
+    user_name = _extract_user_name(payload)
 
-    # Bubble sends the first user message immediately when the template loads.
-    # Requirement: FIRST response must be greeting ONLY (no refusal / no RAG / no extra text).
-    if first_turn:
+    # First touch: always greet (no Yes/No gating)
+    if st.get("help_accepted") is None:
+        st["help_offered"] = True
+        st["help_accepted"] = True  # user is already inside the MASTER template
         _mnt_save_state_text(session_id, st)
-        return {"session_id": session_id, "mode": MASTER_MODE, "text": greeting, "done": False}
+        return {
+            "session_id": session_id,
+            "mode": MASTER_MODE,
+            "text": "Hello! How can I assist you with the MASTER negotiation template today?",
+            "done": False,
+        }
 
+    # User explicitly disabled help
+    if st.get("help_accepted") is False:
+        _mnt_save_state_text(session_id, st)
+        return {
+            "session_id": session_id,
+            "mode": MASTER_MODE,
+            "text": "Okay. Tell me the section/field when you want help.",
+            "done": False,
+        }
 
-
-
-    # If no message, greet and ask for the active field (no yes/no gating)
-    if not user_message:
+    # Smalltalk inside the template: greet + refocus
+    if _is_smalltalk(user_message):
         _mnt_save_state_text(session_id, st)
         ff = (st.get("focus_field") or "").strip()
-        sec = (st.get("active_section_id") or "").strip()
         if ff:
-            return {"session_id": session_id, "mode": MASTER_MODE, "text": f"{greeting} {ff}: send your draft line or the outcome you want.", "done": False}
+            return {"session_id": session_id, "mode": MASTER_MODE, "text": f"Hello! You’re on '{ff}'. What do you want to write there?", "done": False}
+        sec = (st.get("active_section_id") or "").strip()
         if sec:
-            return {"session_id": session_id, "mode": MASTER_MODE, "text": f"{greeting} {sec}: send the exact field name and what you need to write.", "done": False}
-        return {"session_id": session_id, "mode": MASTER_MODE, "text": f"{greeting} Tell me the field you are filling (focus_field) and what happened.", "done": False}
+            return {"session_id": session_id, "mode": MASTER_MODE, "text": f"Hello! You’re in '{sec}'. What do you need to write?", "done": False}
+        return {"session_id": session_id, "mode": MASTER_MODE, "text": "Hello! Which part are you filling right now (deal value, variables, goals, walk-away, concessions)?", "done": False}
 
-# --- RAG retrieval for MASTER template ---
+
+    # If user hasn't sent anything, prompt gently — but NEVER lose focus
+    if not user_message:
+        _mnt_save_state_text(session_id, st)
+
+        ff = (st.get("focus_field") or "").strip()
+        sec = (st.get("active_section_id") or "").strip()
+
+        if ff:
+            return {
+                "session_id": session_id,
+                "mode": MASTER_MODE,
+                "text": f"You’re working on '{ff}'. What are you unsure about in this field?",
+                "done": False,
+            }
+
+        if sec:
+            return {
+                "session_id": session_id,
+                "mode": MASTER_MODE,
+                "text": f"You’re in the '{sec}' section. What decision are you trying to make here?",
+                "done": False,
+            }
+
+        return {
+            "session_id": session_id,
+            "mode": MASTER_MODE,
+            "text": "Which part are you filling right now (deal value, variables, goals, walk-away, concessions, etc.)?",
+            "done": False,
+        }
+
+    # If deal value missing and user is in that field (or mentions it), nudge but still answer
+    # (We keep this light because user may want help elsewhere.)
+    needs_deal_value_hint = st.get("deal_value") is None and (focus_field.lower() in ("deal_value", "dealvalue", "value") or "deal value" in user_message.lower())
+
+
+    # --- RAG retrieval for MASTER template (always) ---
     request_id = str(uuid.uuid4())[:8]
-    rag_query = f"master_template {st.get('active_section_id') or ''} {st.get('focus_field') or ''}: {user_message}".strip()
-    matches = get_matches(rag_query, TOP_K, request_id=request_id)
+    rag_query = f"master_template {active_section_id} {focus_field}: {user_message}".strip()
+
+    # 1) Prefer Master Negotiator Slides (primary source for this mode)
+    raw = get_matches(rag_query, TOP_K, request_id=request_id)
+    matches = [m for m in (raw or []) if "master negotiator slides" in str((m.get("metadata") or {}).get("file") or "").lower()
+               or "master negotiator slides" in str((m.get("metadata") or {}).get("source") or "").lower()]
+
+    # 2) If not enough, broaden to negotiation docs (fallback)
+    if len(matches) < 2:
+        matches = raw or []
+        if len(matches) < 2:
+            raw2 = get_matches(rag_query + " negotiation", TOP_K, request_id=request_id)
+            matches = raw2 or []
+
     info = build_context(matches, request_id=request_id) if matches else ""
+    clarify_count = int(st.get("clarify_count") or 0)
 
-    if not matches or not info.strip():
-        # No hard refusal: still respond in Diadem style using method defaults.
-        info = ""
 
-    # FIRE by default in MASTER mode
-    trade_variable = ""
-    if re.search(r"\bpayment\s*terms?\b", user_message, flags=re.IGNORECASE) or (st.get("focus_field") or "").lower() in ("payment_terms", "payment term", "payment terms"):
-        trade_variable = "payment terms"
-
-    # Ask LLM once, then enforce FIRE rules
-    deal_line = "" if st.get("deal_value") is None else f"DEAL_VALUE: {st.get('deal_value')}\n"
-    prompt_user = (
-        f"ACTIVE_SECTION_ID: {st.get('active_section_id') or ''}\n"
-        f"FOCUS_FIELD: {st.get('focus_field') or ''}\n"
-        f"{deal_line}"
-        f"USER_MESSAGE: {user_message}\n\n"
-        f"INFORMATION:\n{info}\n\n"
-        "TASK: Output paste-ready text for the focus field. No headings. No questions."
-    )
-
+    # Generate guidance text (text-only)
     try:
-        resp = openai.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT_FIRE},
-                {"role": "user", "content": prompt_user},
-            ],
-            temperature=0.0,
+        text = _master_llm_text(
+            user_message=user_message,
+            active_section_id=st.get("active_section_id") or "",
+            focus_field=st.get("focus_field") or "",
+            deal_value=st.get("deal_value"),
+            user_name=user_name,
+            clarify_count=clarify_count,
+            info=info,
         )
-        text_out = strip_markdown_chars((resp.choices[0].message.content or "").strip())
-        text_out = _enforce_fire_output(user_message, info, text_out, trade_variable=trade_variable)
     except Exception as e:
         _jlog("master_template_llm_error", session_id=session_id, err=str(e)[:800])
-        text_out = "Server error."
+        text = "Server error."
 
-    out_text = _truncate_words(text_out, 140)
-    if first_turn:
-        out_text = f"{greeting} {out_text}"
+    if needs_deal_value_hint and "deal value" not in (text or "").lower():
+        # add one short line if not already covered
+        text = (text + "\n\nDeal value: enter the total commercial value as a number (e.g., 120000).").strip()
+
     _mnt_save_state_text(session_id, st)
-    return {"session_id": session_id, "mode": MASTER_MODE, "text": out_text, "done": False}
-
+    return {"session_id": session_id, "mode": MASTER_MODE, "text": text, "done": False}
 
 
 @app.post("/master/template")
-def master_template(payload: Dict = Body(default={})):
+def master_template(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
     try:
         out = master_template_turn_text(payload, session_id=session_id)
@@ -2116,54 +1824,98 @@ def master_template(payload: Dict = Body(default={})):
 
 
 @app.post("/master/template/sse")
-def master_template_sse(payload: Dict = Body(default={})):
-    """
-    SSE version (text-only).
-    Streams the assistant text like a chat.
-
-    Events:
-      - start: {"session_id": "...", "mode": "master_negotiator_template"}
-      - chunk: {"text": "..."}   # assistant text only
-      - done:  {"done": true, "session_id": "...", "mode": "..."}
-    """
+def master_template_sse(payload: Dict = Body(...)):
+    """SSE for MASTER template (streams assistant text)."""
     session_id = _get_or_create_session_id(payload)
 
-    def headers():
-        return {
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        }
-
     def gen():
+        start_payload = json.dumps({"session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
+        yield f"event: start\ndata: {start_payload}\n\n"
+
         try:
-            start_payload = json.dumps({"session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
-            yield f"event: start\ndata: {start_payload}\n\n"
+            # Load/update state (same as non-SSE) but without the consent gate
+            _cleanup_sessions()
+            reset = _as_bool(payload.get("reset")) or _as_bool(payload.get("start_again")) or _as_bool(payload.get("restart"))
+            st = _mnt_reset_state_text(session_id) if reset else _mnt_load_state_text(session_id)
 
-            out = master_template_turn_text(payload, session_id=session_id)
-            assistant_text = (out.get("text") or "").strip()
+            user_message = _mnt_extract_user_message(payload)
+            active_section_id, focus_field = _mnt_extract_focus(payload)
+            if active_section_id:
+                st["active_section_id"] = active_section_id
+            if focus_field:
+                st["focus_field"] = focus_field
+            dv = _mnt_extract_deal_value(payload)
+            if dv is not None:
+                st["deal_value"] = dv
 
-            for piece in _chunk_text_for_sse(assistant_text):
-                chunk_payload = json.dumps({"text": piece}, ensure_ascii=False)
-                yield f"event: chunk\ndata: {chunk_payload}\n\n"
+            # First call greeting (if Bubble sends 'hi' as first message)
+            if st.get("help_accepted") is None:
+                st["help_offered"] = True
+                st["help_accepted"] = True
 
+            user_name = _extract_user_name(payload)
+
+            if not user_message or _is_smalltalk(user_message):
+                txt = "Hello! How can I assist you with the MASTER negotiation template today?"
+                data = json.dumps({"text": txt}, ensure_ascii=False)
+                yield f"event: chunk\ndata: {data}\n\n"
+                _mnt_save_state_text(session_id, st)
+                done_payload = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
+                yield f"event: done\ndata: {done_payload}\n\n"
+                return
+
+            # Retrieval (prefer Master Negotiator Slides)
+            request_id = str(uuid.uuid4())[:8]
+            rag_query = f"master_template {st.get('active_section_id','')} {st.get('focus_field','')}: {user_message}".strip()
+            raw = get_matches(rag_query, TOP_K, request_id=request_id)
+            matches = [m for m in (raw or []) if "master negotiator slides" in str((m.get("metadata") or {}).get("file") or "").lower()
+                       or "master negotiator slides" in str((m.get("metadata") or {}).get("source") or "").lower()]
+            if len(matches) < 2:
+                matches = raw or []
+            info = build_context(matches, request_id=request_id) if matches else ""
+
+            # Build the same prompt as _master_llm_text, but stream
+            deal_value = st.get("deal_value")
+            deal_line = "" if deal_value is None else f"DEAL_VALUE: {deal_value}\n"
+            name_line = user_name.strip() if user_name else ""
+            prompt_user = (
+                f"USER_NAME: {name_line}\n"
+                f"ACTIVE_SECTION_ID: {st.get('active_section_id','')}\n"
+                f"FOCUS_FIELD: {st.get('focus_field','')}\n"
+                f"{deal_line}"
+                f"USER_MESSAGE: {user_message}\n\n"
+                f"INFORMATION:\n{info}\n\n"
+                "TASK: Give Diadem-only, template-ready guidance for the MASTER template.\n"
+                "Do NOT refuse.\n"
+            )
+            messages = [
+                {"role": "system", "content": MASTER_SYSTEM_PROMPT_TEXT},
+                {"role": "user", "content": prompt_user},
+            ]
+
+            for part in _iter_text_as_sse_chunks(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2), min_chars=28):
+                part = _format_for_bubble(strip_markdown_chars(part))
+                data = json.dumps({"text": part}, ensure_ascii=False)
+                yield f"event: chunk\ndata: {data}\n\n"
+
+            _mnt_save_state_text(session_id, st)
             done_payload = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
             yield f"event: done\ndata: {done_payload}\n\n"
 
         except Exception as e:
             _jlog("master_template_sse_error", session_id=session_id, err=str(e)[:800])
-
             err_chunk = json.dumps({"text": "Internal error. Please retry."}, ensure_ascii=False)
             yield f"event: chunk\ndata: {err_chunk}\n\n"
-
             err_done = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
             yield f"event: done\ndata: {err_done}\n\n"
 
-    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers())
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=_sse_headers())
+
+
 
 
 @app.post("/master/template/reset")
-def master_template_reset(payload: Dict = Body(default={})):
+def master_template_reset(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
     _jlog("master_template_reset", session_id=session_id)
     _mnt_reset_state_text(session_id)
