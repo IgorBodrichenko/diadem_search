@@ -70,9 +70,6 @@ SEARCH_DEBUG_LOGS = os.getenv("SEARCH_DEBUG_LOGS", "0").strip().lower() in ("1",
 SEARCH_LOG_MAX_MATCHES = int(os.getenv("SEARCH_LOG_MAX_MATCHES", "8"))   # how many matches to print
 SEARCH_LOG_TEXT_PREVIEW = int(os.getenv("SEARCH_LOG_TEXT_PREVIEW", "140"))  # chars of text preview in logs
 
-# SSE streaming: send chunks early so Bubble/clients don't buffer the whole response
-SSE_MIN_CHARS = int(os.getenv("SSE_MIN_CHARS", "1"))  # 1 = flush ASAP; raise to 8-15 for smoother UI
-
 def _slog(event: str, **fields):
     """Search logs (opt-in) that you can copy from server logs."""
     if SEARCH_DEBUG_LOGS:
@@ -120,10 +117,6 @@ def _openai_stream_text(messages: List[Dict[str, str]], model: str, temperature:
             except Exception:
                 continue
     except Exception as e:
-        try:
-            _jlog("openai_stream_failed", model=model, err=str(e))
-        except Exception:
-            pass
         # If streaming fails, fallback to a single non-streamed response
         try:
             resp = openai.chat.completions.create(
@@ -134,11 +127,7 @@ def _openai_stream_text(messages: List[Dict[str, str]], model: str, temperature:
             full = (resp.choices[0].message.content or "")
             if full:
                 yield full
-        except Exception as e2:
-            try:
-                _jlog("openai_fallback_failed", model=model, err=str(e2))
-            except Exception:
-                pass
+        except Exception:
             yield "Server error."
 
 def _sse_headers():
@@ -149,7 +138,7 @@ def _sse_headers():
         "X-Accel-Buffering": "no",
     }
 
-def _iter_text_as_sse_chunks(text_iter, *, min_chars: int = SSE_MIN_CHARS):
+def _iter_text_as_sse_chunks(text_iter, *, min_chars: int = 24):
     """Coalesce tiny deltas into readable chunks for Bubble Stream."""
     buf = ""
     for piece in text_iter:
@@ -160,6 +149,7 @@ def _iter_text_as_sse_chunks(text_iter, *, min_chars: int = SSE_MIN_CHARS):
             yield out
     if buf:
         yield buf
+
 
 app = FastAPI()
 app.add_middleware(
@@ -507,9 +497,6 @@ _STOPWORDS = {
     "that",
 }
 
-
-# SSE chunking (Bubble-friendly)
-SSE_KEEPALIVE_SECS = float(os.getenv("SSE_KEEPALIVE_SECS", "0.0"))
 _GENERIC_PHRASES = [
     "key techniques to consider",
     "negotiation techniques",
@@ -858,9 +845,6 @@ SYSTEM_PROMPT_QA = (
 
     "Hard rules:\n"
     "- Output plain text only. NO markdown.\n"
-    "- Use short lines and bullets. No long paragraphs.\n"
-    "- Keep normal spaces between words. Never output run-on text.\n"
-    "- Leave one blank line between sections.\n"
     "- Do NOT mention document names, pages, sources, citations, or the word 'context'.\n"
     "- Do NOT copy sentences from INFORMATION. Paraphrase everything.\n"
     "- You may include at most ONE very short quoted phrase (max 6 words) only if it is essential.\n"
@@ -890,9 +874,6 @@ SYSTEM_PROMPT_CHAT = (
     "\"I can only help with questions related to the provided materials.\"\n"
     "\nRules:\n"
     "- Output plain text only. NO markdown.\n"
-    "- Use short lines and bullets. No long paragraphs.\n"
-    "- Keep normal spaces between words. Never output run-on text.\n"
-    "- Leave one blank line between sections.\n"
     "- Do NOT mention documents, pages, sources, citations, or the word 'context'.\n"
     "- Do NOT provide general knowledge, explanations, recipes, or advice outside INFORMATION.\n"
     "- Keep it short and neutral.\n"
@@ -912,9 +893,6 @@ SYSTEM_PROMPT_COACH_FINAL = (
 
     "Hard rules:\n"
     "- Output plain text only. NO markdown.\n"
-    "- Use short lines and bullets. No long paragraphs.\n"
-    "- Keep normal spaces between words. Never output run-on text.\n"
-    "- Leave one blank line between sections.\n"
     "- Do NOT mention documents, pages, sources, citations, or the word 'context'.\n"
     "- Do NOT introduce tactics, terms, or levers that are not supported by INFORMATION.\n"
     "- Do NOT copy sentences verbatim from INFORMATION.\n"
@@ -1391,7 +1369,7 @@ def chat_sse(payload: Dict = Body(...)):
     def gen():
         start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
         yield f"event: start\ndata: {start_payload}\n\n"
-        yield ": ping\n\n"
+
         # Smalltalk: single chunk
         if not query:
             chunks = [""]
@@ -1423,11 +1401,11 @@ def chat_sse(payload: Dict = Body(...)):
                 ]
 
             # Stream from OpenAI
-            chunks = _iter_text_as_sse_chunks(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2), min_chars=SSE_MIN_CHARS)
+            chunks = _iter_text_as_sse_chunks(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2), min_chars=28)
 
         # Emit chunks
         for part in chunks:
-            part = _format_for_bubble(strip_markdown_chars(part))
+            part = strip_markdown_chars(part)
             data = json.dumps({"text": part}, ensure_ascii=False)
             yield f"event: chunk\ndata: {data}\n\n"
 
@@ -1458,51 +1436,16 @@ def coach_sse(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
 
     def headers():
-        return _sse_headers()
-
-    def _iter_string_chunks(s: str, max_chars: int = 160):
-        s = (s or "").strip()
-        if not s:
-            return
-        # Prefer splitting by paragraphs/lines first
-        parts = re.split(r"(\n\n+)", s)
-        buf = ""
-        for p in parts:
-            if not p:
-                continue
-            if p.startswith("\n"):
-                # keep paragraph breaks in the buffer
-                buf += p
-                continue
-            # If adding this part would overflow, flush buffer first.
-            if buf and (len(buf) + len(p) > max_chars):
-                yield buf
-                buf = ""
-            if len(p) <= max_chars:
-                buf += p
-                continue
-            # Long part: split by words
-            words = p.split(" ")
-            line = ""
-            for w in words:
-                if not line:
-                    line = w
-                    continue
-                if len(line) + 1 + len(w) <= max_chars:
-                    line += " " + w
-                else:
-                    yield line
-                    line = w
-            if line:
-                buf += line
-        if buf.strip():
-            yield buf
+        return {
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
 
     def gen():
         try:
             start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
             yield f"event: start\ndata: {start_payload}\n\n"
-            yield ": ping\n\n"
 
             try:
                 result = coach_turn_server_state(payload, session_id=session_id, stream=False)
@@ -1510,36 +1453,24 @@ def coach_sse(payload: Dict = Body(...)):
                 _jlog("coach_sse_error", session_id=session_id, err=str(e))
                 result = {"text": "Server error.", "session_id": session_id, "done": False}
 
+            # гарантируем dict
             if not isinstance(result, dict):
                 result = {"text": "Internal error.", "done": False}
 
-            full_text = _format_for_bubble(strip_markdown_chars(result.get("text", "") or ""))
-            max_chars = _clamp_int(payload.get("sse_chunk_chars"), 160, 40, 600)
+            chunk_payload = json.dumps({"text": result.get("text", "")}, ensure_ascii=False)
+            yield f"event: chunk\ndata: {chunk_payload}\n\n"
 
-            # Stream as multiple chunk events (Bubble-friendly), even if the underlying LLM call was non-streamed.
-            sent_any = False
-            for piece in _iter_string_chunks(full_text, max_chars=max_chars):
-                sent_any = True
-                data = json.dumps({"text": piece}, ensure_ascii=False)
-                yield f"event: chunk\ndata: {data}\n\n"
-                if SSE_KEEPALIVE_SECS and SSE_KEEPALIVE_SECS > 0:
-                    try:
-                        time.sleep(min(0.05, float(SSE_KEEPALIVE_SECS)))
-                    except Exception:
-                        pass
-
-            if not sent_any:
-                data = json.dumps({"text": ""}, ensure_ascii=False)
-                yield f"event: chunk\ndata: {data}\n\n"
-
-            done_payload = json.dumps({"done": bool(result.get("done")), "session_id": session_id}, ensure_ascii=False)
+            done_payload = json.dumps({"done": bool(result.get("done"))}, ensure_ascii=False)
             yield f"event: done\ndata: {done_payload}\n\n"
 
         except Exception as e:
             _jlog("coach_sse_error", session_id=session_id, err=str(e)[:800])
+
+            # SSE-friendly error
             err_chunk = json.dumps({"text": "Internal error. Please retry."}, ensure_ascii=False)
             yield f"event: chunk\ndata: {err_chunk}\n\n"
-            err_done = json.dumps({"done": True, "session_id": session_id}, ensure_ascii=False)
+
+            err_done = json.dumps({"done": True}, ensure_ascii=False)
             yield f"event: done\ndata: {err_done}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers())
@@ -1565,45 +1496,27 @@ def coach_reset(payload: Dict = Body(...)):
 MASTER_MODE = "master_negotiator_template"
 
 MASTER_SYSTEM_PROMPT_TEXT = """You are a Diadem MASTER Negotiator assistant.
-Your job: help the user fill the MASTER negotiation template using Diadem language.
-Primary source: Master Negotiator Slides. Use INFORMATION provided. Do not use generic coaching.
+Your only job: help the user fill the MASTER negotiation template using Diadem language.
+Primary source: Master Negotiator Slides. Use the provided INFORMATION. Do not use generic corporate coaching.
 
 Hard rules:
 - Plain text only. NO markdown.
-- Never output compressed / run-on text. Keep normal spaces between words.
-- Never write a single long paragraph. Use short lines.
-- Every bullet must be on its own line and start with "- ".
-- Always leave ONE blank line between sections.
+- Do not claim you edited any table/field. You only provide what to type.
+- Do not output JSON.
 - No weak speak. Avoid: I believe, I think, maybe, try, hopefully, mutually beneficial, appreciate your perspective.
-- No humour. No justification (avoid "because"). No quality/service arguments.
-- Prefer Diadem tactics: SILENCE / WATER / EARTH / FIRE.
-- Trading only: "If you... then I..." (Reverse If/Then: IF = their commitment/money, THEN = our concession).
-- If user has a target % (e.g., 10%), open 3–5% higher as the anchor.
+- No humour.
+- No logic/justification (no 'because', no 'quality/service' arguments). Use short declarative response bullets.
+- Prefer Diadem tactics: Silence / Water / Earth / Fire as appropriate.
+- Trading only: If you... then I... (Reverse If/Then: IF = their commitment/money, THEN = our concession).
+- If user has a target % (e.g., 10%), start 3–5% higher as opening anchor.
+- Keep it concrete: give exact template-ready wording (no placeholders unless the user gave none).
 - Ask at most 1 short question only if a critical detail is missing.
 
-Required output structure (always):
-TACTIC (one word in CAPS)
-
-- 2–5 short bullets of what to type (each bullet 3–10 words)
-- Keep bullets concrete
-
-Template lines:
-Line 1 (paste-ready)
-Line 2 (optional, paste-ready)
-
-Example:
-
-WATER
-
-- Ask what matters most.
-- Slow the pace.
-- Get their constraints.
-
-Template lines:
-"What would make this work for you?"
-"If you can commit to [X], then I can offer [Y]."
+Output format:
+1) One-line tactic label (e.g., WATER / EARTH / SILENCE).
+2) 2–5 short bullets explaining what to type.
+3) 1–2 exact template lines the user can paste.
 """
-
 
 
 def _mnt_default_state_text() -> Dict[str, Any]:
@@ -1736,7 +1649,7 @@ def _master_llm_text(user_message: str, active_section_id: str, focus_field: str
                 "- Then I’ll give you exact template wording."
             )
 
-    text = _format_for_bubble(text)
+    text = text
     return _truncate_words(text, 180)
 
 
@@ -1909,7 +1822,7 @@ def master_template_sse(payload: Dict = Body(...)):
     def gen():
         start_payload = json.dumps({"session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
         yield f"event: start\ndata: {start_payload}\n\n"
-        yield ": ping\n\n"
+
         try:
             # Load/update state (same as non-SSE) but without the consent gate
             _cleanup_sessions()
@@ -1971,8 +1884,8 @@ def master_template_sse(payload: Dict = Body(...)):
                 {"role": "user", "content": prompt_user},
             ]
 
-            for part in _iter_text_as_sse_chunks(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2), min_chars=SSE_MIN_CHARS):
-                part = _format_for_bubble(strip_markdown_chars(part))
+            for part in _iter_text_as_sse_chunks(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2), min_chars=28):
+                part = strip_markdown_chars(part)
                 data = json.dumps({"text": part}, ensure_ascii=False)
                 yield f"event: chunk\ndata: {data}\n\n"
 
