@@ -41,6 +41,41 @@ def _with_debug(resp: Dict[str, Any], **dbg):
     return resp
 
 
+
+def _chunk_text_for_sse(text: str, max_chars: int = 160) -> List[str]:
+    """Split text into small chunks for Bubble Stream responses.
+    Keeps newlines; tries to split on paragraph boundaries first.
+    """
+    t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not t:
+        return [""]
+    # Prefer paragraph chunks
+    parts = []
+    buf = ""
+    for para in t.split("\n\n"):
+        p = para.strip("\n")
+        if not p:
+            continue
+        candidate = (buf + ("\n\n" if buf else "") + p) if buf else p
+        if len(candidate) <= max_chars:
+            buf = candidate
+            continue
+        if buf:
+            parts.append(buf)
+            buf = ""
+        # Now split long paragraph
+        while len(p) > max_chars:
+            cut = p.rfind(" ", 0, max_chars)
+            if cut < int(max_chars * 0.6):
+                cut = max_chars
+            parts.append(p[:cut].rstrip())
+            p = p[cut:].lstrip()
+        if p:
+            buf = p
+    if buf:
+        parts.append(buf)
+    return parts or [t[:max_chars]]
+
 # =========================
 # CONFIG
 # =========================
@@ -623,6 +658,26 @@ def _detect_concept(query: str) -> str:
 
 
 
+
+def _is_master_template_query(q: str) -> bool:
+    s = (q or "").strip().lower()
+    return s.startswith("master_negotiator_template") or s.startswith("master_template") or "master_negotiator_template" in s or "master_template" in s
+
+def _is_priority_master_doc(md: Dict[str, Any]) -> int:
+    """Return 2 for Master Negotiator Slides, 1 for Negotiation.pdf, 0 otherwise."""
+    fmeta = " ".join([
+        str(md.get("file_name") or ""),
+        str(md.get("title") or ""),
+        str(md.get("source") or ""),
+        str(md.get("file") or ""),
+        str(md.get("document") or ""),
+    ]).lower()
+    if "master negotiator slides" in fmeta or ("master negotiator" in fmeta and "slide" in fmeta):
+        return 2
+    if "negotiation.pdf" in fmeta:
+        return 1
+    return 0
+
 # =========================
 # RAG HELPERS
 # =========================
@@ -779,6 +834,8 @@ def _rerank(query: str, matches: List[Dict], final_k: int, detected_concept: str
     scored: List[Tuple[float, Dict]] = []
     qlow = (query or "").lower()
 
+    master_mode = _is_master_template_query(query)
+
     for m in matches or []:
         md = m.get("metadata") or {}
         # priority is optional metadata (default 1). Higher = slightly boosted during rerank.
@@ -793,21 +850,20 @@ def _rerank(query: str, matches: List[Dict], final_k: int, detected_concept: str
         except Exception:
             pr = 1
 
-        # Implicit priority for the two key negotiation sources,
-        # even if vectors were ingested without metadata.priority.
-        fmeta = " ".join([
-            str(md.get("file_name") or ""),
-            str(md.get("title") or ""),
-            str(md.get("source") or ""),
-            str(md.get("file") or ""),
-            str(md.get("document") or ""),
-        ]).lower()
-        if "negotiation.pdf" in fmeta:
-            pr = max(pr, PRIORITY_MAX)
-        if "master negotiator slides" in fmeta:
-            pr = max(pr, PRIORITY_MAX)
-        elif "master negotiator" in fmeta and "slide" in fmeta:
-            pr = max(pr, PRIORITY_MAX)
+        # Implicit priority for key negotiation sources (even if metadata.priority is missing).
+        # IMPORTANT: For master_template queries, Master Negotiator Slides is Priority #1.
+        doc_rank = _is_priority_master_doc(md)  # 2=Slides, 1=Negotiation, 0=other
+        if master_mode:
+            if doc_rank == 2:
+                pr = max(pr, PRIORITY_MAX)
+            elif doc_rank == 1:
+                pr = max(pr, max(1, PRIORITY_MAX - 1))
+            else:
+                # Keep other docs available but do not boost them.
+                pr = min(pr, 1)
+        else:
+            if doc_rank >= 1:
+                pr = max(pr, PRIORITY_MAX)
 
         if pr < 1:
             pr = 1
@@ -842,6 +898,10 @@ def _rerank(query: str, matches: List[Dict], final_k: int, detected_concept: str
         for gp in _GENERIC_PHRASES:
             if gp in tlow:
                 penalty += 1.1
+
+        if master_mode and doc_rank == 0:
+            # Push non-negotiation docs down for master_template.
+            penalty += 1.4
 
         try:
             pscore = float(m.get("score") or 0.0)
@@ -1015,6 +1075,25 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None, 
           sample=[_brief_match(x) for x in merged[:SEARCH_LOG_MAX_MATCHES]])
 
     reranked = _rerank(q_clean, merged, top_k_final, detected_concept=detected_concept)
+
+    # For master_template, keep the retrieval tightly anchored on negotiation sources.
+    master_mode = _is_master_template_query(q_clean)
+    if master_mode:
+        masters = [m for m in (reranked or []) if _is_priority_master_doc(m.get("metadata") or {}) > 0]
+        if len(masters) >= max(2, min(4, top_k_final)):
+            reranked = masters[:top_k_final]
+        else:
+            # Fallback: keep at least the best master docs, then fill remaining with reranked.
+            keep_ids = set((m.get("id") for m in masters if m.get("id")))
+            filled = masters[:]
+            for m in (reranked or []):
+                mid = m.get("id")
+                if mid and mid in keep_ids:
+                    continue
+                filled.append(m)
+                if len(filled) >= top_k_final:
+                    break
+            reranked = filled[:top_k_final]
     _slog("search_reranked",
           request_id=request_id,
           final_count=len(reranked),
@@ -1695,8 +1774,9 @@ def chat_sse(payload: Dict = Body(default={})):
         start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
         yield f"event: start\ndata: {start_payload}\n\n"
 
-        data = json.dumps({"text": result_text}, ensure_ascii=False)
-        yield f"event: chunk\ndata: {data}\n\n"
+        for piece in _chunk_text_for_sse(result_text):
+            data = json.dumps({"text": piece}, ensure_ascii=False)
+            yield f"event: chunk\ndata: {data}\n\n"
 
         done_payload = json.dumps({"done": True}, ensure_ascii=False)
         yield f"event: done\ndata: {done_payload}\n\n"
@@ -1744,8 +1824,9 @@ def coach_sse(payload: Dict = Body(default={})):
             if not isinstance(result, dict):
                 result = {"text": "Internal error.", "done": False}
 
-            chunk_payload = json.dumps({"text": result.get("text", "")}, ensure_ascii=False)
-            yield f"event: chunk\ndata: {chunk_payload}\n\n"
+            for piece in _chunk_text_for_sse(result.get("text", "")):
+                chunk_payload = json.dumps({"text": piece}, ensure_ascii=False)
+                yield f"event: chunk\ndata: {chunk_payload}\n\n"
 
             done_payload = json.dumps({"done": bool(result.get("done"))}, ensure_ascii=False)
             yield f"event: done\ndata: {done_payload}\n\n"
@@ -1786,9 +1867,9 @@ MASTER_SYSTEM_PROMPT_TEXT = """
 Use UK English spelling and tone.
 Format output with clear paragraphs and line breaks (short lines; blank line between idea blocks).
 You are a Diadem-style negotiation assistant.
-You can ONLY use the provided INFORMATION.
-If INFORMATION is empty, missing, or not clearly relevant, respond exactly:
-"I can't find this in the provided documents."
+
+Use the provided INFORMATION as your primary source.
+If INFORMATION is thin or partially relevant, still respond using Diadem method (do NOT mention missing documents).
 
 Hard rules:
 - Plain text only. NO markdown.
@@ -1796,10 +1877,12 @@ Hard rules:
 - No teaching. No labels. No 'choose one'. No examples framing.
 - No humour.
 - No collaboration/rapport framing.
-- No weak speak.
-- No logic or justification.
+- No weak speak (avoid: I think, I believe, maybe, perhaps, mutually beneficial, just, sort of, kind of).
+- No logic or justification (avoid: because, due to, quality, service, value explanation).
 - Declarative sentences.
 - If the user asks for a trade, use: If you..., then I...
+- If the user requests "no placeholders", do not use [X] / <X> / brackets. Choose a concrete value.
+  (If Payment Terms are the only variable and no number is given, default to 60 days.)
 - Keep it short (<=120 words).
 """
 
@@ -1979,11 +2062,8 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
     info = build_context(matches, request_id=request_id) if matches else ""
 
     if not matches or not info.strip():
-        _mnt_save_state_text(session_id, st)
-        msg = "I can't find this in the provided documents."
-        if first_turn:
-            msg = f"{greeting} {msg}"
-        return {"session_id": session_id, "mode": MASTER_MODE, "text": msg, "done": False}
+        # No hard refusal: still respond in Diadem style using method defaults.
+        info = ""
 
     # FIRE by default in MASTER mode
     trade_variable = ""
@@ -2063,8 +2143,9 @@ def master_template_sse(payload: Dict = Body(default={})):
             out = master_template_turn_text(payload, session_id=session_id)
             assistant_text = (out.get("text") or "").strip()
 
-            chunk_payload = json.dumps({"text": assistant_text}, ensure_ascii=False)
-            yield f"event: chunk\ndata: {chunk_payload}\n\n"
+            for piece in _chunk_text_for_sse(assistant_text):
+                chunk_payload = json.dumps({"text": piece}, ensure_ascii=False)
+                yield f"event: chunk\ndata: {chunk_payload}\n\n"
 
             done_payload = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
             yield f"event: done\ndata: {done_payload}\n\n"
