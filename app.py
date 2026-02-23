@@ -162,18 +162,10 @@ def _iter_text_as_sse_chunks(text_iter, *, min_chars: int = SSE_MIN_CHARS):
         yield buf
 
 def _format_for_bubble(text: str) -> str:
-    # Minimal formatting: keep user/model spacing as-is.
-    # Only normalise newlines so Bubble renders paragraphs correctly.
-    t = (text or "").replace("
-", "
-").replace("
-", "
-")
-    t = re.sub(r"
-{3,}", "
-
-", t)
-    return t.strip()
+    if not text:
+        return ""
+    # only normalize line endings — nothing else
+    return text.replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
 app = FastAPI()
