@@ -162,27 +162,19 @@ def _iter_text_as_sse_chunks(text_iter, *, min_chars: int = SSE_MIN_CHARS):
         yield buf
 
 def _format_for_bubble(text: str) -> str:
-    # Normalise whitespace to make Bubble chat look like paragraphs.
-    t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    # Minimal formatting: keep user/model spacing as-is.
+    # Only normalise newlines so Bubble renders paragraphs correctly.
+    t = (text or "").replace("
+", "
+").replace("
+", "
+")
+    t = re.sub(r"
+{3,}", "
 
-    # If the model returned a "glued" string (no spaces at all), try a safe repair.
-    # Example: "SILENCE-Identifythreekeyvariablesfornegotiation.-Ensure..."
-    if t and (" " not in t) and len(t) > 40:
-        # Add space between camelCase / PascalCase boundaries
-        t = re.sub(r"([a-z])([A-Z])", r"\1 \2", t)
-        # Add space after punctuation when followed by a letter/number
-        t = re.sub(r"([.!?])([A-Za-z0-9])", r"\1 \2", t)
-        # Add newline after periods that look like sentence boundaries (keeps it readable)
-        t = re.sub(r"\.\s+(?=[A-Z])", ".\n", t)
-
-    # Ensure a blank line before numbered/bulleted items if missing
-    t = re.sub(r"(?<!\n)\n(\d+\.)", r"\n\n\1", t)
-    t = re.sub(r"(?<!\n)\n([-•])", r"\n\n\1", t)
-
-    # Collapse 3+ newlines to 2
-    t = re.sub(r"\n{3,}", "\n\n", t)
-
+", t)
     return t.strip()
+
 
 app = FastAPI()
 app.add_middleware(
@@ -881,6 +873,9 @@ SYSTEM_PROMPT_QA = (
 
     "Hard rules:\n"
     "- Output plain text only. NO markdown.\n"
+    "- Use short lines and bullets. No long paragraphs.\n"
+    "- Keep normal spaces between words. Never output run-on text.\n"
+    "- Leave one blank line between sections.\n"
     "- Do NOT mention document names, pages, sources, citations, or the word 'context'.\n"
     "- Do NOT copy sentences from INFORMATION. Paraphrase everything.\n"
     "- You may include at most ONE very short quoted phrase (max 6 words) only if it is essential.\n"
@@ -910,6 +905,9 @@ SYSTEM_PROMPT_CHAT = (
     "\"I can only help with questions related to the provided materials.\"\n"
     "\nRules:\n"
     "- Output plain text only. NO markdown.\n"
+    "- Use short lines and bullets. No long paragraphs.\n"
+    "- Keep normal spaces between words. Never output run-on text.\n"
+    "- Leave one blank line between sections.\n"
     "- Do NOT mention documents, pages, sources, citations, or the word 'context'.\n"
     "- Do NOT provide general knowledge, explanations, recipes, or advice outside INFORMATION.\n"
     "- Keep it short and neutral.\n"
@@ -929,6 +927,9 @@ SYSTEM_PROMPT_COACH_FINAL = (
 
     "Hard rules:\n"
     "- Output plain text only. NO markdown.\n"
+    "- Use short lines and bullets. No long paragraphs.\n"
+    "- Keep normal spaces between words. Never output run-on text.\n"
+    "- Leave one blank line between sections.\n"
     "- Do NOT mention documents, pages, sources, citations, or the word 'context'.\n"
     "- Do NOT introduce tactics, terms, or levers that are not supported by INFORMATION.\n"
     "- Do NOT copy sentences verbatim from INFORMATION.\n"
@@ -1579,27 +1580,45 @@ def coach_reset(payload: Dict = Body(...)):
 MASTER_MODE = "master_negotiator_template"
 
 MASTER_SYSTEM_PROMPT_TEXT = """You are a Diadem MASTER Negotiator assistant.
-Your only job: help the user fill the MASTER negotiation template using Diadem language.
-Primary source: Master Negotiator Slides. Use the provided INFORMATION. Do not use generic corporate coaching.
+Your job: help the user fill the MASTER negotiation template using Diadem language.
+Primary source: Master Negotiator Slides. Use INFORMATION provided. Do not use generic coaching.
 
 Hard rules:
 - Plain text only. NO markdown.
-- Do not claim you edited any table/field. You only provide what to type.
-- Do not output JSON.
+- Never output compressed / run-on text. Keep normal spaces between words.
+- Never write a single long paragraph. Use short lines.
+- Every bullet must be on its own line and start with "- ".
+- Always leave ONE blank line between sections.
 - No weak speak. Avoid: I believe, I think, maybe, try, hopefully, mutually beneficial, appreciate your perspective.
-- No humour.
-- No logic/justification (no 'because', no 'quality/service' arguments). Use short declarative response bullets.
-- Prefer Diadem tactics: Silence / Water / Earth / Fire as appropriate.
-- Trading only: If you... then I... (Reverse If/Then: IF = their commitment/money, THEN = our concession).
-- If user has a target % (e.g., 10%), start 3–5% higher as opening anchor.
-- Keep it concrete: give exact template-ready wording (no placeholders unless the user gave none).
+- No humour. No justification (avoid "because"). No quality/service arguments.
+- Prefer Diadem tactics: SILENCE / WATER / EARTH / FIRE.
+- Trading only: "If you... then I..." (Reverse If/Then: IF = their commitment/money, THEN = our concession).
+- If user has a target % (e.g., 10%), open 3–5% higher as the anchor.
 - Ask at most 1 short question only if a critical detail is missing.
 
-Output format:
-1) One-line tactic label (e.g., WATER / EARTH / SILENCE).
-2) 2–5 short bullets explaining what to type.
-3) 1–2 exact template lines the user can paste.
+Required output structure (always):
+TACTIC (one word in CAPS)
+
+- 2–5 short bullets of what to type (each bullet 3–10 words)
+- Keep bullets concrete
+
+Template lines:
+Line 1 (paste-ready)
+Line 2 (optional, paste-ready)
+
+Example:
+
+WATER
+
+- Ask what matters most.
+- Slow the pace.
+- Get their constraints.
+
+Template lines:
+"What would make this work for you?"
+"If you can commit to [X], then I can offer [Y]."
 """
+
 
 
 def _mnt_default_state_text() -> Dict[str, Any]:
