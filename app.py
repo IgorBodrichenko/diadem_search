@@ -1597,9 +1597,18 @@ def _mnt_default_state_text() -> Dict[str, Any]:
         "mode": MASTER_MODE,
         "help_offered": False,
         "help_accepted": None,   # True/False/None
+
+        # template context (set by UI)
         "deal_value": None,      # float or None (optional; user enters)
         "active_section_id": "",
         "focus_field": "",
+
+        # conversation memory (server-side)
+        "stage": "",             # e.g. goal / variables / trade / script
+        "slots": {},             # extracted facts from user (percent, price, terms, etc.)
+        "last_question": "",     # last question we asked the user
+        "history": [],           # last few turns [{"u": "...", "a": "..."}]
+
         "clarify_count": 0,
         "updated_at": _now(),
     }
@@ -1666,6 +1675,223 @@ def _mnt_extract_deal_value(payload: Dict[str, Any]) -> Optional[float]:
             return None
     return None
 
+def _mnt_slots(st: Dict[str, Any]) -> Dict[str, Any]:
+    slots = st.get("slots")
+    if not isinstance(slots, dict):
+        slots = {}
+        st["slots"] = slots
+    return slots
+
+def _mnt_history(st: Dict[str, Any]) -> List[Dict[str, str]]:
+    hist = st.get("history")
+    if not isinstance(hist, list):
+        hist = []
+        st["history"] = hist
+    # keep it small
+    if len(hist) > 12:
+        st["history"] = hist[-12:]
+        hist = st["history"]
+    return hist
+
+def _mnt_push_history(st: Dict[str, Any], user_msg: str, assistant_msg: str) -> None:
+    hist = _mnt_history(st)
+    u = (user_msg or "").strip()
+    a = (assistant_msg or "").strip()
+    if u or a:
+        hist.append({"u": _truncate_words(u, 80), "a": _truncate_words(a, 90)})
+    if len(hist) > 12:
+        del hist[:-12]
+
+def _mnt_parse_percent(text: str) -> Optional[float]:
+    t = (text or "").lower()
+    # match "10%" or "10 %"
+    m = re.search(r"(\d{1,3}(?:\.\d+)?)\s*%\b", t)
+    if m:
+        try:
+            return float(m.group(1))
+        except Exception:
+            return None
+    # match "10 percent"
+    m = re.search(r"(\d{1,3}(?:\.\d+)?)\s*(?:percent|per cent)\b", t)
+    if m:
+        try:
+            return float(m.group(1))
+        except Exception:
+            return None
+    return None
+
+def _mnt_parse_money(text: str) -> Optional[float]:
+    t = (text or "").strip()
+    if not t:
+        return None
+    # $60000, 60000, 60,000, 60 000
+    m = re.search(r"(?:\$|usd\s*)?(\d{2,3}(?:[\s,]\d{3})+|\d{2,})\b", t.lower())
+    if not m:
+        return None
+    s = m.group(1).replace(" ", "").replace(",", "")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def _mnt_parse_days_terms(text: str) -> Optional[int]:
+    t = (text or "").lower()
+    m = re.search(r"(\d{1,3})\s*(?:days|day)\b", t)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
+
+def _mnt_is_repeat_complaint(text: str) -> bool:
+    t = (text or "").lower()
+    return any(p in t for p in (
+        "i have answered", "i already answered", "answered before", "you asked", "repeat", "again",
+        "hello??", "hello ?", "you ignore", "ignoring"
+    ))
+
+def _mnt_extract_slots_from_user(st: Dict[str, Any], user_message: str) -> None:
+    slots = _mnt_slots(st)
+    t = (user_message or "").strip()
+    tl = t.lower()
+
+    # Topic: price increase / price decrease
+    if "price increase" in tl or "increase price" in tl or "raise price" in tl:
+        slots.setdefault("topic", "price_increase")
+    if "price reduction" in tl or "price decrease" in tl or "discount" in tl:
+        slots.setdefault("topic", "price_change")
+
+    pct = _mnt_parse_percent(t)
+    if pct is not None:
+        slots["target_percent"] = pct
+        # anchor 3–5% higher for opening (store once)
+        if "anchor_percent" not in slots:
+            slots["anchor_percent"] = min(100.0, pct + 3.0)
+
+    money = _mnt_parse_money(t)
+    if money is not None:
+        # if we already have target_amount, keep both (current vs target)
+        if "current_amount" not in slots and ("current" in tl or "now" in tl or "is" in tl):
+            slots["current_amount"] = money
+        else:
+            slots["amount"] = money
+
+    days = _mnt_parse_days_terms(t)
+    if days is not None:
+        # try to infer whether it's "offer" or "current"
+        if "instead of" in tl or "from" in tl:
+            slots["payment_terms_offer_days"] = days
+        else:
+            # if user says "30 days" early, treat as current; else treat as offer
+            if "payment_terms_current_days" not in slots and days <= 45:
+                slots["payment_terms_current_days"] = days
+            else:
+                slots["payment_terms_offer_days"] = days
+
+    # Trade variable hint
+    if "payment terms" in tl or "terms" in tl:
+        slots.setdefault("trade_variable", "payment_terms")
+
+    # Start date hint
+    if "next month" in tl:
+        slots["start_timing"] = "next_month"
+
+def _mnt_build_state_memory_text(st: Dict[str, Any]) -> str:
+    slots = _mnt_slots(st)
+    parts = []
+    if slots:
+        # deterministic order
+        keys = [
+            "topic", "target_percent", "anchor_percent", "amount", "current_amount",
+            "payment_terms_current_days", "payment_terms_offer_days", "trade_variable", "start_timing"
+        ]
+        for k in keys:
+            if k in slots and slots.get(k) not in (None, "", [], {}):
+                parts.append(f"{k}={slots.get(k)}")
+        # any extras
+        for k, v in slots.items():
+            if k not in keys and v not in (None, "", [], {}):
+                parts.append(f"{k}={v}")
+    stage = (st.get("stage") or "").strip()
+    lastq = (st.get("last_question") or "").strip()
+    mem = ""
+    if stage:
+        mem += f"STAGE={stage}\n"
+    if lastq:
+        mem += f"LAST_QUESTION={lastq}\n"
+    if parts:
+        mem += "SLOTS=" + "; ".join(parts) + "\n"
+    # recent history (last 4 turns)
+    hist = _mnt_history(st)[-4:]
+    if hist:
+        mem += "RECENT_TURNS:\n"
+        for h in hist:
+            mem += f"- U: {h.get('u','')}\n  A: {h.get('a','')}\n"
+    return mem.strip()
+
+def _mnt_rule_based_response(user_message: str, st: Dict[str, Any]) -> Optional[str]:
+    """Returns a ready response when we can answer deterministically; else None."""
+    t = (user_message or "").strip()
+    tl = t.lower()
+    slots = _mnt_slots(st)
+
+    # If the user complains about repetition, recap what we already have and ask the NEXT missing thing.
+    if _mnt_is_repeat_complaint(t):
+        lines = []
+        if "target_percent" in slots:
+            lines.append(f"You said your target is {slots['target_percent']}%.")
+            if "anchor_percent" in slots:
+                lines.append(f"Open at {slots['anchor_percent']}%.")
+        if "amount" in slots:
+            lines.append(f"You mentioned {int(slots['amount']) if float(slots['amount']).is_integer() else slots['amount']}.")
+        if "payment_terms_offer_days" in slots:
+            lines.append(f"You can trade payment terms: {slots['payment_terms_offer_days']} days.")
+        if not lines:
+            lines.append("I’m with you. We’ll go step by step.")
+        # Decide next question
+        if "payment_terms_offer_days" not in slots and ("payment terms" in tl or slots.get("trade_variable") == "payment_terms"):
+            q = "What payment terms will you offer (e.g., 60 days instead of 30)?"
+        elif "trade_variable" not in slots:
+            q = "What variable will you trade first: payment terms, contract length, or scope?"
+        else:
+            q = "What is their concrete commitment you want in return?"
+        st["last_question"] = q
+        return "\n".join(lines + ["", q]).strip()
+
+    # Where to start / which question first: pick next missing slot based on what we already know.
+    if any(p in tl for p in ("where should i start", "which question", "help me", "i need help", "start", "i dont know", "i don't know")):
+        # If goal already set, move forward, don't restart.
+        if "target_percent" in slots or "amount" in slots:
+            q = "What will you trade first: payment terms, contract length, or scope?"
+            st["last_question"] = q
+            st["stage"] = st.get("stage") or "trade"
+            return "Stay on your goal. Now pick your first trade variable.\n\nA) Payment terms\nB) Contract length\nC) Scope\n\nWhich one: A, B, or C?"
+        else:
+            st["stage"] = "goal"
+            q = "Is your goal a price increase, a discount, or a term change?"
+            st["last_question"] = q
+            return "Pick your goal.\n\nA) Price increase\nB) Price reduction\nC) Term / scope change\n\nWhich one: A, B, or C?"
+
+    # Variables question: answer directly using slots.
+    if "variable" in tl and ("what" in tl or "put" in tl or "write" in tl):
+        # Provide a short list and ask user to choose 2 non-price variables (prevents jumping straight to price)
+        lines = [
+            "Variables are the things you can trade.",
+            "- Payment terms",
+            "- Contract length",
+            "- Scope / deliverables",
+            "- Volume / commitment",
+            "- Support / service level",
+            "- Start date / timing",
+        ]
+        q = "Pick two you can trade today (not price). Which two?"
+        st["last_question"] = q
+        st["stage"] = "variables"
+        return "\n".join(lines + ["", q])
+
+    return None
+
 def _truncate_words(text: str, max_words: int = 140) -> str:
     t = (text or "").strip()
     if not t:
@@ -1675,16 +1901,28 @@ def _truncate_words(text: str, max_words: int = 140) -> str:
         return t
     return " ".join(words[:max_words]).strip()
 
-def _master_llm_text(user_message: str, active_section_id: str, focus_field: str, deal_value: Optional[float], user_name: str, clarify_count: int, info: str) -> str:
+def _master_llm_text(
+    user_message: str,
+    active_section_id: str,
+    focus_field: str,
+    deal_value: Optional[float],
+    user_name: str,
+    clarify_count: int,
+    info: str,
+    state_memory: str = "",
+) -> str:
     # Compact user prompt. INFORMATION is retrieved from Pinecone.
     deal_line = "" if deal_value is None else f"DEAL_VALUE: {deal_value}\n"
     name_line = user_name.strip() if user_name else ""
+    mem_line = (state_memory or "").strip()
+
     prompt_user = (
         f"USER_NAME: {name_line}\n"
         f"ACTIVE_SECTION_ID: {active_section_id}\n"
         f"FOCUS_FIELD: {focus_field}\n"
         f"{deal_line}"
         f"USER_MESSAGE: {user_message}\n\n"
+        f"STATE_MEMORY:\n{mem_line}\n\n"
         f"INFORMATION:\n{info}\n\n"
         "TASK: Give Diadem-only, template-ready guidance for the MASTER template.\n"
         "If FOCUS_FIELD is set: tell the user exactly what to type there and give 1–2 paste-ready lines.\n"
@@ -1722,7 +1960,6 @@ def _master_llm_text(user_message: str, active_section_id: str, focus_field: str
                 "- Then I’ll give you exact template wording."
             )
 
-    text = text
     return _truncate_words(text, 180)
 
 
@@ -1786,16 +2023,26 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
             "done": False,
         }
 
+    # Update slot memory from the user's message (percent, money, terms, etc.)
+    _mnt_extract_slots_from_user(st, user_message)
+
+    # Deterministic handlers to avoid repeating questions
+    rb = _mnt_rule_based_response(user_message, st)
+    if rb:
+        _mnt_push_history(st, user_message, rb)
+        _mnt_save_state_text(session_id, st)
+        return {"session_id": session_id, "mode": MASTER_MODE, "text": rb, "done": False}
+
     # Smalltalk inside the template: greet + refocus
     if _is_smalltalk(user_message):
         _mnt_save_state_text(session_id, st)
         ff = (st.get("focus_field") or "").strip()
         if ff:
-            return {"session_id": session_id, "mode": MASTER_MODE, "text": f"Hello! You’re on '{ff}'. What do you want to write there?", "done": False}
+            return {"session_id": session_id, "mode": MASTER_MODE, "text": f"You’re on '{ff}'. What do you want to write there?", "done": False}
         sec = (st.get("active_section_id") or "").strip()
         if sec:
-            return {"session_id": session_id, "mode": MASTER_MODE, "text": f"Hello! You’re in '{sec}'. What do you need to write?", "done": False}
-        return {"session_id": session_id, "mode": MASTER_MODE, "text": "Hello! Which part are you filling right now (deal value, variables, goals, walk-away, concessions)?", "done": False}
+            return {"session_id": session_id, "mode": MASTER_MODE, "text": f"You’re in '{sec}'. What do you need to write?", "done": False}
+        return {"session_id": session_id, "mode": MASTER_MODE, "text": "Which part are you filling right now (deal value, variables, goals, walk-away, concessions)?", "done": False}
 
 
     # If user hasn't sent anything, prompt gently — but NEVER lose focus
@@ -1862,6 +2109,7 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
             deal_value=st.get("deal_value"),
             user_name=user_name,
             clarify_count=clarify_count,
+            state_memory=_mnt_build_state_memory_text(st),
             info=info,
         )
     except Exception as e:
@@ -1919,6 +2167,20 @@ def master_template_sse(payload: Dict = Body(...)):
 
             user_name = _extract_user_name(payload)
 
+            # Update slot memory from the user's message
+            _mnt_extract_slots_from_user(st, user_message)
+
+            # Deterministic handlers to avoid repeating questions (SSE mode)
+            rb = _mnt_rule_based_response(user_message, st)
+            if rb:
+                data = json.dumps({"text": rb}, ensure_ascii=False)
+                yield f"event: chunk\ndata: {data}\n\n"
+                _mnt_push_history(st, user_message, rb)
+                _mnt_save_state_text(session_id, st)
+                done_payload = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
+                yield f"event: done\ndata: {done_payload}\n\n"
+                return
+
             if not user_message or _is_smalltalk(user_message):
                 txt = "Hello! How can I assist you with the MASTER negotiation template today?"
                 data = json.dumps({"text": txt}, ensure_ascii=False)
@@ -1948,6 +2210,7 @@ def master_template_sse(payload: Dict = Body(...)):
                 f"FOCUS_FIELD: {st.get('focus_field','')}\n"
                 f"{deal_line}"
                 f"USER_MESSAGE: {user_message}\n\n"
+                f"STATE_MEMORY:\n{_mnt_build_state_memory_text(st)}\n\n"
                 f"INFORMATION:\n{info}\n\n"
                 "TASK: Give Diadem-only, template-ready guidance for the MASTER template.\n"
                 "Do NOT refuse.\n"
