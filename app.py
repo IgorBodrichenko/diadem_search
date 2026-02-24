@@ -782,6 +782,18 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
           final_count=len(reranked),
           final=[_brief_match(x) for x in reranked[:SEARCH_LOG_MAX_MATCHES]])
 
+    # If we have a curated hint for this query, do NOT block on the relevance gate.
+    # These hints exist specifically for short "definition/rules" questions (e.g. Earth/Water/Fire elements)
+    # where the top chunk can be short and fail overlap/length heuristics.
+    hint_gate = _hint_for_question(q_clean)
+    if hint_gate and reranked:
+        _slog("search_context_relevance",
+              request_id=request_id,
+              relevant=True,
+              kept=len(reranked),
+              reason="hint_override")
+        return reranked
+
     relevant = is_context_relevant(q_clean, reranked)
     _slog("search_context_relevance",
           request_id=request_id,
@@ -1515,6 +1527,8 @@ Primary source: Master Negotiator Slides. Use INFORMATION. Do not invent.
 
 Hard rules:
 - Plain text only. NO markdown.
+- Do NOT output labels like "DEFINITION", "Final line:", "Short explanation line:", "Practical example:", "Example:", "What to type:", "Template line:".
+- Always end with EXACTLY ONE short direct question on the last line. The final character of the entire response MUST be '?'.
 - Strict spacing between sections.
 - Never output a wall of text.
 - Only valid tactics: WATER, EARTH, FIRE, SILENCE. Never invent tactic names.
