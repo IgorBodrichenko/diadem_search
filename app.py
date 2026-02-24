@@ -424,6 +424,16 @@ SEARCH_HINTS = [
         ],
         "hint": "slides 28-34 difficult questions",
     },
+{
+    "match_any": [
+        "earth element", "element earth", "earth rules", "7 rules earth", "seven rules earth",
+        "water element", "element water", "water rules", "fire element", "element fire", "fire rules",
+        "silence element", "element silence", "silence rules",
+        "diadem earth", "diadem water", "diadem fire", "diadem silence"
+    ],
+    "hint": "Master Negotiator Slides elements water earth fire silence rules",
+},
+
 ]
 
 
@@ -588,6 +598,10 @@ def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
 
         bonus = 0.0
         for phrase in [
+            "earth",
+            "water",
+            "fire",
+            "silence",
             "balance",
             "power",
             "selling",
