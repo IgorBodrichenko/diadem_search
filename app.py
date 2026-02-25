@@ -5,11 +5,10 @@ import time
 import random
 import re
 import sqlite3
-import logging
 import urllib.request
 import urllib.parse
 import urllib.error
-
+import logging
 from typing import List, Dict, Any, Optional, Tuple
 
 from fastapi import FastAPI, Body, Request
@@ -44,38 +43,6 @@ def _with_debug(resp: Dict[str, Any], **dbg):
         resp["debug"] = dbg
     return resp
 
-
-# =========================
-# HTTP (stdlib) helper (no external deps)
-# =========================
-def _http_get_json(url: str, params: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None, timeout: int = 12) -> Tuple[int, str, Dict[str, Any]]:
-    """GET JSON via urllib. Returns (status, raw_text, json_dict)."""
-    try:
-        params = params or {}
-        qs = urllib.parse.urlencode(params, doseq=True)
-        full_url = f"{url}?{qs}" if qs else url
-        req = urllib.request.Request(full_url, headers=headers or {}, method="GET")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            status = getattr(resp, "status", 200)
-            raw = resp.read().decode("utf-8", errors="replace")
-        try:
-            data = json.loads(raw) if raw else {}
-        except Exception:
-            data = {}
-        return status, raw, data
-    except urllib.error.HTTPError as e:
-        try:
-            raw = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            raw = str(e)
-        status = getattr(e, "code", 500) or 500
-        try:
-            data = json.loads(raw) if raw else {}
-        except Exception:
-            data = {}
-        return status, raw, data
-    except Exception as e:
-        return 0, str(e), {}
 
 # =========================
 # CONFIG
@@ -138,71 +105,44 @@ def _bubble_url(obj_type: str, obj_id: Optional[str] = None) -> str:
         return f"{BUBBLE_API_BASE}/{obj_type}/{obj_id}"
     return f"{BUBBLE_API_BASE}/{obj_type}"
 
+
+def _http_get_json(url: str, headers: Dict[str, str], params: Optional[Dict[str, Any]] = None, timeout: int = 12) -> Dict[str, Any]:
+    qs = urllib.parse.urlencode(params or {}, doseq=True)
+    full_url = url if not qs else f"{url}?{qs}"
+    req = urllib.request.Request(full_url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            try:
+                return json.loads(raw) if raw else {}
+            except Exception:
+                return {}
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        _jlog("bubble_get_error", status=int(getattr(e, "code", 0) or 0), url=full_url, body=(body or "")[:500])
+        return {}
+    except Exception as e:
+        _jlog("bubble_get_exception", url=full_url, err=str(e)[:300])
+        return {}
+
+
 def _bubble_get(obj_type: str, obj_id: str, timeout: int = 12) -> Dict[str, Any]:
     if not _bubble_enabled():
         return {}
     url = _bubble_url(obj_type, obj_id)
-    status, raw, data = _http_get_json(
-        url,
-        params={"api_token": BUBBLE_API_KEY},
-        headers=_bubble_headers(),
-        timeout=timeout,
-    )
-    if status >= 400 or status == 0:
-        _jlog("bubble_get_error", status=status, url=url, body=(raw or "")[:500])
-        return {}
-    return data or {}
+    return _http_get_json(url, headers=_bubble_headers(), params={"api_token": BUBBLE_API_KEY}, timeout=timeout)
+
 
 def _bubble_search(obj_type: str, constraints: List[Dict[str, Any]], timeout: int = 12) -> Dict[str, Any]:
     if not _bubble_enabled():
         return {}
     url = _bubble_url(obj_type)
-    status, raw, data = _http_get_json(
-        url,
-        params={"api_token": BUBBLE_API_KEY, "constraints": json.dumps(constraints, ensure_ascii=False)},
-        headers=_bubble_headers(),
-        timeout=timeout,
-    )
-    if status >= 400 or status == 0:
-        _jlog("bubble_search_error", status=status, url=url, body=(raw or "")[:500])
-        return {}
-    return data or {}
-
-def _bubble_extract_id(v: Any) -> Optional[str]:
-    if v is None:
-        return None
-    if isinstance(v, str):
-        return v
-    if isinstance(v, dict):
-        # Bubble sometimes returns objects with "_id" or "id"
-        return v.get("_id") or v.get("id") or v.get("unique_id")
-    return None
-
-def _format_deal(deal_obj: Dict[str, Any]) -> str:
-    if not deal_obj:
-        return ""
-    # Bubble returns fields at top-level under "response" for get, but sometimes directly.
-    d = deal_obj.get("response") if isinstance(deal_obj.get("response"), dict) else deal_obj
-    low = (d.get("low") or "").strip()
-    mid = (d.get("mid") or "").strip()
-    high = (d.get("high") or "").strip()
-    if not (low or mid or high):
-        return ""
-    return f"Low: {low} | Mid: {mid} | High: {high}"
-
-def _format_items(items: List[Dict[str, Any]]) -> str:
-    lines = []
-    for it in items:
-        name = str(it.get("name") or "").strip()
-        low = str(it.get("low") or "").strip()
-        mid = str(it.get("mid") or "").strip()
-        high = str(it.get("high") or "").strip()
-        if not (name or low or mid or high):
-            continue
-        if not name:
-            name = "(unnamed)"
-        lines.append(f"- {name}: Low={low} | Mid={mid} | High={high}")
-    return "\n".join(lines).strip()
+    params = {"api_token": BUBBLE_API_KEY, "constraints": json.dumps(constraints)}
+    return _http_get_json(url, headers=_bubble_headers(), params=params, timeout=timeout)
 
 def _fetch_template_state_text(template_id: str, request_id: str = "") -> str:
     """Read-only: fetch master_negotiation_template + deals + variable items and render compact state text."""
@@ -425,19 +365,14 @@ def _cleanup_sessions() -> None:
 
 
 def _get_or_create_session_id(payload: Dict[str, Any]) -> str:
+    # MASTER template: use Bubble template_id as stable session_id so memory persists per template.
+    tid = str(payload.get("template_id") or payload.get("templateId") or payload.get("template") or "").strip()
+    if tid:
+        return tid
     sid = str(payload.get("session_id") or "").strip()
     if not sid:
         sid = uuid.uuid4().hex
     return sid
-
-
-
-def _get_master_session_id(payload: Dict[str, Any]) -> str:
-    """MASTER template sessions are keyed by template_id (Bubble thing id)."""
-    tid = str(payload.get("template_id") or payload.get("templateId") or payload.get("template") or "").strip()
-    if tid:
-        return tid
-    return _get_or_create_session_id(payload)
 
 def _safe_str(x: Any) -> str:
     if x is None:
@@ -1510,7 +1445,7 @@ def chat(payload: Dict = Body(...)):
     top_k = int(payload.get("top_k") or TOP_K)
     user_name = _extract_user_name(payload)
 
-    session_id = _get_master_session_id(payload)
+    session_id = _get_or_create_session_id(payload)
     request_id = str(uuid.uuid4())[:8]
     _cleanup_sessions()
 
@@ -1569,7 +1504,7 @@ def chat(payload: Dict = Body(...)):
 
 @app.post("/chat/sse")
 def chat_sse(payload: Dict = Body(...)):
-    session_id = _get_master_session_id(payload)
+    session_id = _get_or_create_session_id(payload)
     request_id = str(uuid.uuid4())[:8]
     _cleanup_sessions()
 
@@ -2108,6 +2043,15 @@ def _truncate_words(text: str, max_words: int = 140) -> str:
         return t
     return " ".join(words[:max_words]).strip()
 
+
+def _extract_last_question(text: str) -> str:
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    for ln in reversed(lines):
+        if ln.endswith("?"):
+            return ln
+    return ""
+
+
 def _master_llm_text(
     user_message: str,
     active_section_id: str,
@@ -2347,6 +2291,14 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
         # add one short line if not already covered
         text = (text + "\n\nDeal value: enter the total commercial value as a number (e.g., 120000).").strip()
 
+    
+    # Persist conversational memory so the assistant can reference what was already asked/answered.
+    if user_message and text:
+        _mnt_push_history(st, user_message, text)
+    q = _extract_last_question(text)
+    if q:
+        st["last_question"] = q
+
     _mnt_save_state_text(session_id, st)
     return {"session_id": session_id, "mode": MASTER_MODE, "text": text, "done": False}
 
@@ -2470,10 +2422,20 @@ def master_template_sse(payload: Dict = Body(...)):
                 {"role": "user", "content": prompt_user},
             ]
 
+            full_parts: List[str] = []
             for part in _iter_text_as_sse_chunks(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2), min_chars=28):
                 part = strip_markdown_chars(part)
+                if part:
+                    full_parts.append(part)
                 data = json.dumps({"text": part}, ensure_ascii=False)
                 yield f"event: chunk\ndata: {data}\n\n"
+
+            full_text = strip_markdown_chars("".join(full_parts)).strip()
+            if user_message and full_text:
+                _mnt_push_history(st, user_message, full_text)
+            q = _extract_last_question(full_text)
+            if q:
+                st["last_question"] = q
 
             _mnt_save_state_text(session_id, st)
             done_payload = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
