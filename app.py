@@ -6,6 +6,7 @@ import random
 import re
 import sqlite3
 import logging
+import requests
 from typing import List, Dict, Any, Optional, Tuple
 
 from fastapi import FastAPI, Body, Request
@@ -82,6 +83,150 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
 PINECONE_HOST = os.getenv("PINECONE_HOST")
+
+# =========================
+# BUBBLE DATA API (READ-ONLY TEMPLATE STATE)
+# =========================
+BUBBLE_API_BASE = os.getenv("BUBBLE_API_BASE", "").strip().rstrip("/")
+BUBBLE_API_KEY = os.getenv("BUBBLE_API_KEY", "").strip()
+
+# Expect base like: https://<app>.bubbleapps.io/<version>/api/1.1/obj
+def _bubble_enabled() -> bool:
+    return bool(BUBBLE_API_BASE and BUBBLE_API_KEY)
+
+def _bubble_headers() -> Dict[str, str]:
+    # Bubble Data API supports Bearer token auth. We also send api_token as query param for compatibility.
+    return {"Authorization": f"Bearer {BUBBLE_API_KEY}"}
+
+def _bubble_url(obj_type: str, obj_id: Optional[str] = None) -> str:
+    if obj_id:
+        return f"{BUBBLE_API_BASE}/{obj_type}/{obj_id}"
+    return f"{BUBBLE_API_BASE}/{obj_type}"
+
+def _bubble_get(obj_type: str, obj_id: str, timeout: int = 12) -> Dict[str, Any]:
+    if not _bubble_enabled():
+        return {}
+    url = _bubble_url(obj_type, obj_id)
+    try:
+        r = requests.get(url, headers=_bubble_headers(), params={"api_token": BUBBLE_API_KEY}, timeout=timeout)
+        if r.status_code >= 400:
+            _jlog("bubble_get_error", status=r.status_code, url=url, body=r.text[:500])
+            return {}
+        return r.json() or {}
+    except Exception as e:
+        _jlog("bubble_get_exception", url=url, err=str(e)[:300])
+        return {}
+
+def _bubble_search(obj_type: str, constraints: List[Dict[str, Any]], timeout: int = 12) -> Dict[str, Any]:
+    if not _bubble_enabled():
+        return {}
+    url = _bubble_url(obj_type)
+    try:
+        r = requests.get(
+            url,
+            headers=_bubble_headers(),
+            params={"api_token": BUBBLE_API_KEY, "constraints": json.dumps(constraints, ensure_ascii=False)},
+            timeout=timeout,
+        )
+        if r.status_code >= 400:
+            _jlog("bubble_search_error", status=r.status_code, url=url, body=r.text[:500])
+            return {}
+        return r.json() or {}
+    except Exception as e:
+        _jlog("bubble_search_exception", url=url, err=str(e)[:300])
+        return {}
+
+def _bubble_extract_id(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return v
+    if isinstance(v, dict):
+        # Bubble sometimes returns objects with "_id" or "id"
+        return v.get("_id") or v.get("id") or v.get("unique_id")
+    return None
+
+def _format_deal(deal_obj: Dict[str, Any]) -> str:
+    if not deal_obj:
+        return ""
+    # Bubble returns fields at top-level under "response" for get, but sometimes directly.
+    d = deal_obj.get("response") if isinstance(deal_obj.get("response"), dict) else deal_obj
+    low = (d.get("low") or "").strip()
+    mid = (d.get("mid") or "").strip()
+    high = (d.get("high") or "").strip()
+    if not (low or mid or high):
+        return ""
+    return f"Low: {low} | Mid: {mid} | High: {high}"
+
+def _format_items(items: List[Dict[str, Any]]) -> str:
+    lines = []
+    for it in items:
+        name = str(it.get("name") or "").strip()
+        low = str(it.get("low") or "").strip()
+        mid = str(it.get("mid") or "").strip()
+        high = str(it.get("high") or "").strip()
+        if not (name or low or mid or high):
+            continue
+        if not name:
+            name = "(unnamed)"
+        lines.append(f"- {name}: Low={low} | Mid={mid} | High={high}")
+    return "\n".join(lines).strip()
+
+def _fetch_template_state_text(template_id: str, request_id: str = "") -> str:
+    """Read-only: fetch master_negotiation_template + deals + variable items and render compact state text."""
+    if not template_id:
+        return ""
+    if not _bubble_enabled():
+        return ""
+    tpl = _bubble_get("master_negotiation_template", template_id)
+    resp = tpl.get("response") if isinstance(tpl.get("response"), dict) else {}
+    if not resp:
+        return ""
+
+    my_deal_id = _bubble_extract_id(resp.get("my_deal"))
+    their_deal_id = _bubble_extract_id(resp.get("their_deal"))
+    my_items_ids_raw = resp.get("my_items") or []
+    their_items_ids_raw = resp.get("their_items") or []
+
+    my_item_ids = [x for x in (_bubble_extract_id(v) for v in my_items_ids_raw) if x]
+    their_item_ids = [x for x in (_bubble_extract_id(v) for v in their_items_ids_raw) if x]
+
+    my_deal_txt = _format_deal(_bubble_get("Deal", my_deal_id)) if my_deal_id else ""
+    their_deal_txt = _format_deal(_bubble_get("Deal", their_deal_id)) if their_deal_id else ""
+
+    # Bulk fetch all Variable_items for this template, then map by id.
+    items_map: Dict[str, Dict[str, Any]] = {}
+    search = _bubble_search("Variable_items", [{"key": "template", "constraint_type": "equals", "value": template_id}])
+    results = search.get("response", {}).get("results") if isinstance(search.get("response"), dict) else []
+    if isinstance(results, list):
+        for it in results:
+            _id = _bubble_extract_id(it) or it.get("_id")
+            if _id:
+                items_map[_id] = it
+
+    my_items = [items_map.get(i) for i in my_item_ids if i in items_map]
+    their_items = [items_map.get(i) for i in their_item_ids if i in items_map]
+
+    my_items_txt = _format_items([x for x in my_items if x])
+    their_items_txt = _format_items([x for x in their_items if x])
+
+    parts = []
+    parts.append("CURRENT MASTER NEGOTIATOR TEMPLATE STATE (read-only):")
+    if my_deal_txt:
+        parts.append(f"My Deal: {my_deal_txt}")
+    if their_deal_txt:
+        parts.append(f"Their Deal: {their_deal_txt}")
+    if my_items_txt:
+        parts.append("My Win Zone Variables:")
+        parts.append(my_items_txt)
+    if their_items_txt:
+        parts.append("Their Win Zone Variables:")
+        parts.append(their_items_txt)
+
+    out = "\n".join(parts).strip()
+    if request_id:
+        _slog("bubble_template_state", request_id=request_id, template_id=template_id, has_state=bool(out), chars=len(out))
+    return out
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY missing")
@@ -1976,6 +2121,10 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
     user_message = _mnt_extract_user_message(payload)
     active_section_id, focus_field = _mnt_extract_focus(payload)
 
+    template_id = (payload.get("template_id") or payload.get("templateId") or payload.get("template") or "").strip()
+    if template_id:
+        st["template_id"] = template_id
+
     if active_section_id:
         st["active_section_id"] = active_section_id
     if focus_field:
@@ -2100,6 +2249,22 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
     clarify_count = int(st.get("clarify_count") or 0)
 
 
+    # Fetch template state from Bubble (read-only) and inject into prompt
+    template_state_text = ""
+    try:
+        cache = st.get("_tpl_cache") or {}
+        cache_tid = str(cache.get("template_id") or "")
+        cache_ts = float(cache.get("ts") or 0)
+        if st.get("template_id"):
+            now = time.time()
+            if cache_tid == st.get("template_id") and (now - cache_ts) < 4 and cache.get("text"):
+                template_state_text = str(cache.get("text") or "")
+            else:
+                template_state_text = _fetch_template_state_text(st.get("template_id"), request_id=request_id)
+                st["_tpl_cache"] = {"template_id": st.get("template_id"), "ts": now, "text": template_state_text}
+    except Exception as _e:
+        template_state_text = ""
+
     # Generate guidance text (text-only)
     try:
         text = _master_llm_text(
@@ -2109,7 +2274,7 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
             deal_value=st.get("deal_value"),
             user_name=user_name,
             clarify_count=clarify_count,
-            state_memory=_mnt_build_state_memory_text(st),
+            state_memory=(_mnt_build_state_memory_text(st) + ("\n\n" + template_state_text if template_state_text else "")),
             info=info,
         )
     except Exception as e:
@@ -2152,6 +2317,10 @@ def master_template_sse(payload: Dict = Body(...)):
 
             user_message = _mnt_extract_user_message(payload)
             active_section_id, focus_field = _mnt_extract_focus(payload)
+
+            template_id = (payload.get("template_id") or payload.get("templateId") or payload.get("template") or "").strip()
+            if template_id:
+                st["template_id"] = template_id
             if active_section_id:
                 st["active_section_id"] = active_section_id
             if focus_field:
@@ -2204,13 +2373,32 @@ def master_template_sse(payload: Dict = Body(...)):
             deal_value = st.get("deal_value")
             deal_line = "" if deal_value is None else f"DEAL_VALUE: {deal_value}\n"
             name_line = user_name.strip() if user_name else ""
+
+            # Fetch template state from Bubble (read-only) and inject into prompt
+            template_state_text = ""
+            try:
+                cache = st.get("_tpl_cache") or {}
+                cache_tid = str(cache.get("template_id") or "")
+                cache_ts = float(cache.get("ts") or 0)
+                if st.get("template_id"):
+                    now = time.time()
+                    if cache_tid == st.get("template_id") and (now - cache_ts) < 4 and cache.get("text"):
+                        template_state_text = str(cache.get("text") or "")
+                    else:
+                        template_state_text = _fetch_template_state_text(st.get("template_id"), request_id=request_id)
+                        st["_tpl_cache"] = {"template_id": st.get("template_id"), "ts": now, "text": template_state_text}
+            except Exception:
+                template_state_text = ""
+
+            state_mem = _mnt_build_state_memory_text(st) + ("\n\n" + template_state_text if template_state_text else "")
+
             prompt_user = (
                 f"USER_NAME: {name_line}\n"
                 f"ACTIVE_SECTION_ID: {st.get('active_section_id','')}\n"
                 f"FOCUS_FIELD: {st.get('focus_field','')}\n"
                 f"{deal_line}"
                 f"USER_MESSAGE: {user_message}\n\n"
-                f"STATE_MEMORY:\n{_mnt_build_state_memory_text(st)}\n\n"
+                f"STATE_MEMORY:\n{state_mem}\n\n"
                 f"INFORMATION:\n{info}\n\n"
                 "TASK: Give Diadem-only, template-ready guidance for the MASTER template.\n"
                 "Do NOT refuse.\n"
@@ -2247,4 +2435,3 @@ def master_template_reset(payload: Dict = Body(...)):
     _jlog("master_template_reset", session_id=session_id)
     _mnt_reset_state_text(session_id)
     return JSONResponse({"ok": True, "session_id": session_id, "mode": MASTER_MODE})
-
