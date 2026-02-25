@@ -6,7 +6,10 @@ import random
 import re
 import sqlite3
 import logging
-import requests
+import urllib.request
+import urllib.parse
+import urllib.error
+
 from typing import List, Dict, Any, Optional, Tuple
 
 from fastapi import FastAPI, Body, Request
@@ -41,6 +44,38 @@ def _with_debug(resp: Dict[str, Any], **dbg):
         resp["debug"] = dbg
     return resp
 
+
+# =========================
+# HTTP (stdlib) helper (no external deps)
+# =========================
+def _http_get_json(url: str, params: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None, timeout: int = 12) -> Tuple[int, str, Dict[str, Any]]:
+    """GET JSON via urllib. Returns (status, raw_text, json_dict)."""
+    try:
+        params = params or {}
+        qs = urllib.parse.urlencode(params, doseq=True)
+        full_url = f"{url}?{qs}" if qs else url
+        req = urllib.request.Request(full_url, headers=headers or {}, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", 200)
+            raw = resp.read().decode("utf-8", errors="replace")
+        try:
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {}
+        return status, raw, data
+    except urllib.error.HTTPError as e:
+        try:
+            raw = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw = str(e)
+        status = getattr(e, "code", 500) or 500
+        try:
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {}
+        return status, raw, data
+    except Exception as e:
+        return 0, str(e), {}
 
 # =========================
 # CONFIG
@@ -107,34 +142,31 @@ def _bubble_get(obj_type: str, obj_id: str, timeout: int = 12) -> Dict[str, Any]
     if not _bubble_enabled():
         return {}
     url = _bubble_url(obj_type, obj_id)
-    try:
-        r = requests.get(url, headers=_bubble_headers(), params={"api_token": BUBBLE_API_KEY}, timeout=timeout)
-        if r.status_code >= 400:
-            _jlog("bubble_get_error", status=r.status_code, url=url, body=r.text[:500])
-            return {}
-        return r.json() or {}
-    except Exception as e:
-        _jlog("bubble_get_exception", url=url, err=str(e)[:300])
+    status, raw, data = _http_get_json(
+        url,
+        params={"api_token": BUBBLE_API_KEY},
+        headers=_bubble_headers(),
+        timeout=timeout,
+    )
+    if status >= 400 or status == 0:
+        _jlog("bubble_get_error", status=status, url=url, body=(raw or "")[:500])
         return {}
+    return data or {}
 
 def _bubble_search(obj_type: str, constraints: List[Dict[str, Any]], timeout: int = 12) -> Dict[str, Any]:
     if not _bubble_enabled():
         return {}
     url = _bubble_url(obj_type)
-    try:
-        r = requests.get(
-            url,
-            headers=_bubble_headers(),
-            params={"api_token": BUBBLE_API_KEY, "constraints": json.dumps(constraints, ensure_ascii=False)},
-            timeout=timeout,
-        )
-        if r.status_code >= 400:
-            _jlog("bubble_search_error", status=r.status_code, url=url, body=r.text[:500])
-            return {}
-        return r.json() or {}
-    except Exception as e:
-        _jlog("bubble_search_exception", url=url, err=str(e)[:300])
+    status, raw, data = _http_get_json(
+        url,
+        params={"api_token": BUBBLE_API_KEY, "constraints": json.dumps(constraints, ensure_ascii=False)},
+        headers=_bubble_headers(),
+        timeout=timeout,
+    )
+    if status >= 400 or status == 0:
+        _jlog("bubble_search_error", status=status, url=url, body=(raw or "")[:500])
         return {}
+    return data or {}
 
 def _bubble_extract_id(v: Any) -> Optional[str]:
     if v is None:
@@ -398,6 +430,14 @@ def _get_or_create_session_id(payload: Dict[str, Any]) -> str:
         sid = uuid.uuid4().hex
     return sid
 
+
+
+def _get_master_session_id(payload: Dict[str, Any]) -> str:
+    """MASTER template sessions are keyed by template_id (Bubble thing id)."""
+    tid = str(payload.get("template_id") or payload.get("templateId") or payload.get("template") or "").strip()
+    if tid:
+        return tid
+    return _get_or_create_session_id(payload)
 
 def _safe_str(x: Any) -> str:
     if x is None:
@@ -1470,7 +1510,7 @@ def chat(payload: Dict = Body(...)):
     top_k = int(payload.get("top_k") or TOP_K)
     user_name = _extract_user_name(payload)
 
-    session_id = _get_or_create_session_id(payload)
+    session_id = _get_master_session_id(payload)
     request_id = str(uuid.uuid4())[:8]
     _cleanup_sessions()
 
@@ -1529,7 +1569,7 @@ def chat(payload: Dict = Body(...)):
 
 @app.post("/chat/sse")
 def chat_sse(payload: Dict = Body(...)):
-    session_id = _get_or_create_session_id(payload)
+    session_id = _get_master_session_id(payload)
     request_id = str(uuid.uuid4())[:8]
     _cleanup_sessions()
 
