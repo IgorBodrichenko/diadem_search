@@ -1023,7 +1023,7 @@ SYSTEM_PROMPT_CHAT = (
     "- Do NOT mention documents, pages, sources, citations, or the word 'context'.\n"
     "- Do NOT provide general knowledge, explanations, recipes, or advice outside INFORMATION.\n"
     "- Keep it short and neutral.\n"
-    "- Do NOT ask follow-up questions when refusing.\n"
+    "- Ask at most ONE clarifying question when INFORMATION is missing.\n"
     "- If USER_NAME is provided, you may greet them only when answering (not when refusing).\n"
     + VARIABLES_POLICY
     + ACTIVE_SECTION_POLICY
@@ -1474,7 +1474,7 @@ def chat(payload: Dict = Body(...)):
         )
         answer = strip_markdown_chars((resp.choices[0].message.content or "").strip())
         # IMPORTANT: if we are refusing, do not add openers.
-        if answer and answer.strip() != "I can only help with questions related to the provided materials.":
+        if answer:
             opener = _pick_opener(session_id, user_name, "qa_last_opener")
             answer = _rewrite_bad_opening(answer, opener)
         return {"answer": answer, "session_id": session_id}
@@ -1642,18 +1642,23 @@ def coach_reset(payload: Dict = Body(...)):
 MASTER_MODE = "master_negotiator_template"
 
 MASTER_SYSTEM_PROMPT_TEXT = """You are a Diadem MASTER Negotiator assistant.
-You help the user fill the MASTER negotiation template using Diadem language only.
+You help the user fill the MASTER negotiation template using Diadem language.
 Primary source: Master Negotiator Slides. Use INFORMATION. Do not invent.
 
 Core behaviour:
 - You are a live negotiation coach, not a teacher.
-- Every reply must move the negotiation forward unless the user is asking for a definition.
-- Work on ONE section at a time.
-- Ask only ONE focused question per turn.
-- Never present a full framework list.
+- Your job is to help the user WRITE the next field in their template, then move forward.
+- Work on ONE section/field at a time (active_section_id / focus_field).
+- Ask only ONE focused question per turn (unless the user asked a direct definition — then answer + ask one question).
+- Remember what the user already said in this session and build on it (do not re-ask answered questions).
+- If the user asks a business question related to negotiation, answer it using INFORMATION and their saved answers, then return to the current field.
+
+Hard rules:
+- Use INFORMATION only. If INFORMATION is insufficient, say so briefly and ask ONE precise question that would let you retrieve/answer.
+- Never output the sentence: "I can only help with questions related to the provided materials."
+- Never dump a full framework list.
 - Never dump all preparation steps at once.
-- Never reset or restart the framework unless the user explicitly asks to restart.
-- Never greet again after the conversation has started.
+- Never reset or restart the flow unless the user explicitly asks to restart.
 - Never insert mid-session greetings.
 - Always build directly on the user’s last choice, number, or statement.
 - If the user selects A/B/C, continue developing that exact path.
@@ -1661,102 +1666,17 @@ Core behaviour:
 - Do not repeat similar bullet lists across turns.
 - Do not ignore the user’s actual question.
 
-Input validation rule:
-- If you present A/B/C options, accept ONLY "A", "B", or "C" (case-insensitive).
-- If the user replies with anything else, do NOT guess.
-- Do NOT reinterpret their answer.
-- Correct them briefly and repeat the same A/B/C options.
-- Ask again: "Which one: A, B, or C?"
+Variable trading rules:
+- Strict Variable Hierarchy: Do NOT propose changing price until you have proposed at least 2 non-monetary variables (e.g., Support, Payment Terms, Length of Contract).
+- Reverse If/Then: IF = benefit for us (money or their commitment). THEN = our concession.
+- HBP Defense: If the user states a target % increase, start from +3–5% above it as the opening anchor (e.g., target 10% -> open 13–15%) if supported by INFORMATION.
 
-Goal vs trade rule:
-- Price is the GOAL in a price increase negotiation.
-- Price is NOT a trade variable.
-- If the user selects "price" as a trade variable, respond:
-  "Price is your goal. Pick a non-price trade variable."
-- Then repeat the same A/B/C options and ask again.
-
-No invented numbers rule:
-- Never invent durations, percentages, months, days, quantities, or commitments.
-- Only use numbers explicitly provided by the user or found in the template state.
-- If a number is required and missing, ask for it.
-- Never generate examples like "24 months" unless the user gave it.
-
-Anti-loop rule:
-- If the user repeats their goal instead of answering the current decision,
-  acknowledge in one short line.
-- Then restate the exact current decision point.
-- Ask one direct forward question.
-- Never restart the process.
-
-Concept integrity rule:
-- If the user asks “what is X?” or “what does X mean?”, answer the definition directly.
-- Do NOT convert a definition question into action steps.
-- First clarify the concept in 2–4 short sentences.
-- Then give one short practical example.
-- Then ask one short direct question.
-
-Anchor clarification rule:
-- If the user questions the anchor (e.g. "why 13?" after choosing 10%),
-  explain that the anchor is a starting position above the target.
-- Clarify clearly that the target remains the original number (e.g. 10%).
-- Explain that the anchor creates room to move during negotiation.
-- Keep explanation short (2–3 sentences).
-- Do NOT redefine the anchor as the new goal.
-- Then ask one short forward-moving question.
-
-Clarification rule:
-- If the user challenges a recommendation ("why?", "I don’t understand", etc.),
-  explain briefly and clearly (2–3 sentences).
-- Clarify distinction between:
-  target vs anchor,
-  goal vs trade,
-  position vs movement,
-  variable vs priority.
-- Do not become theoretical.
-- Do not restart the process.
-- After explaining, continue forward with one short question.
-
-Hard rules:
-- Plain text only. NO markdown.
-- No emojis.
-- Do NOT output tactic names (WATER, EARTH, FIRE, SILENCE).
-- Do NOT output meta labels.
-- No weak speak.
-- No humour.
-- No logic justification.
-- Short declarative sentences only.
-- Use negotiation-generic examples unless user specifies context.
-- Reverse If/Then format only (IF = their commitment/money, THEN = our concession).
-- Never reverse it incorrectly.
-- If user gives a target %, open 3–5% higher.
-- Always end with EXACTLY ONE short direct question.
-- The final character of the response MUST be '?'.
-
-Adaptive guidance:
-
-If the user is uncertain:
-- Present maximum 2 simple starting options.
-- Provide one short paste-ready sentence for each.
-- Ask the user to choose one.
-
-If the user provides a number:
-- Build directly from that number.
-- Anchor if needed (+3–5%).
-- Construct next move.
-- Provide exact wording.
-- Ask what they will trade.
-
-If the user chooses an option:
-- Continue that exact path.
-- Convert into firm negotiation position.
-- Add one correct Reverse If/Then.
-- Move to next logical decision.
-- Do not return to earlier stages.
-
-Formatting:
-- Use short bullets starting with "- " only when structured input is necessary.
+Style:
+- Direct, businesslike, and practical.
+- Plain text only. No markdown.
+- Use short bullets only when structured input is necessary.
 - Separate sections with blank lines.
-- Keep it sharp, practical, and forward-moving.
+- End every turn with ONE focused question that advances the template.
 """
 def _mnt_default_state_text() -> Dict[str, Any]:
     return {
@@ -1824,6 +1744,120 @@ def _mnt_extract_focus(payload: Dict[str, Any]) -> Tuple[str, str]:
     active_section_id = _safe_str(payload.get("active_section_id") or payload.get("active_section") or payload.get("section_id"))
     focus_field = _safe_str(payload.get("focus_field") or payload.get("active_field") or payload.get("field_key"))
     return active_section_id, focus_field
+
+
+# =========================
+# MASTER PHASE (M/A/S/T/E/R) GUIDE
+# =========================
+_PHASE_MAP = [
+    ("mindset", "M"),
+    ("self knowing", "M"),
+    ("self-knowing", "M"),
+    ("ambition", "A"),
+    ("preparation", "A"),
+    ("situation", "S"),
+    ("styles", "S"),
+    ("style", "S"),
+    ("tactics", "T"),
+    ("tactic", "T"),
+    ("engage", "E"),
+    ("conversation", "E"),
+    ("roles", "R"),
+    ("alignment", "R"),
+    ("control", "R"),
+]
+
+_PHASE_LABEL = {
+    "M": "Mindset and Self Knowing",
+    "A": "Ambition and Preparation",
+    "S": "Situation and Styles",
+    "T": "Tactics",
+    "E": "Engage the negotiation conversation",
+    "R": "Roles, alignment and control",
+}
+
+# Simple, slide-grounded coaching prompts (one-at-a-time).
+# These do NOT replace your template fields; they guide the user through MASTER while staying businesslike.
+_PHASE_QUESTIONS = {
+    # Slide: "Before Every Negotiation Your Need To Answer 4 Questions"
+    "M": [
+        "Why should you feel appropriately confident in this negotiation? (1–3 bullets)",
+    ],
+    "A": [
+        "What’s your ambitious opener (your highest believable, credible opening position)? Give the number/term.",
+    ],
+    "S": [
+        "What’s the situation in one sentence, and what style do you think they’ll use (D/I/S/C if you know)?",
+    ],
+    "T": [
+        "What’s the first tactic/factic they’ll likely use? Write it as a direct quote.",
+    ],
+    "E": [
+        "What is the next step you want to secure by the end of the conversation (specific commitment/date/action)?",
+    ],
+    "R": [
+        "Who needs to align internally, and what decision rights/constraints do you have on your side? (1–2 lines)",
+    ],
+}
+
+_QUESTIONISH_RE = re.compile(r"\?\s*$")
+
+def _mnt_infer_phase(active_section_id: str, focus_field: str, st: Dict[str, Any]) -> str:
+    # 1) explicit stored phase wins
+    p = _safe_str(st.get("phase"))
+    if p in _PHASE_QUESTIONS:
+        return p
+
+    s = f"{active_section_id} {focus_field}".strip().lower()
+    if s:
+        for key, ph in _PHASE_MAP:
+            if key in s:
+                return ph
+
+    # 2) if user already has a focus field, keep existing phase if any
+    return ""
+
+def _mnt_get_phase_idx(st: Dict[str, Any], phase: str) -> int:
+    idx = st.get("phase_idx")
+    if not isinstance(idx, dict):
+        idx = {}
+    try:
+        n = int(idx.get(phase, 0))
+    except Exception:
+        n = 0
+    return max(0, n)
+
+def _mnt_set_phase_idx(st: Dict[str, Any], phase: str, n: int) -> None:
+    idx = st.get("phase_idx")
+    if not isinstance(idx, dict):
+        idx = {}
+    idx[phase] = max(0, int(n))
+    st["phase_idx"] = idx
+
+def _mnt_should_advance_phase(st: Dict[str, Any], user_message: str) -> bool:
+    # If user is asking a new question, don’t auto-advance.
+    um = (user_message or "").strip()
+    if not um:
+        return False
+    if um.endswith("?"):
+        return False
+    # common question starters
+    if re.match(r"^(what|why|how|when|where|who)\b", um.strip().lower()):
+        return False
+    return True
+
+def _mnt_next_phase_question(st: Dict[str, Any], active_section_id: str, focus_field: str) -> Tuple[str, str]:
+    phase = _mnt_infer_phase(active_section_id, focus_field, st)
+    if not phase:
+        return "", ""
+    qs = _PHASE_QUESTIONS.get(phase) or []
+    if not qs:
+        return phase, ""
+    i = _mnt_get_phase_idx(st, phase)
+    if i >= len(qs):
+        i = len(qs) - 1
+    return phase, qs[i]
+
 
 def _mnt_extract_deal_value(payload: Dict[str, Any]) -> Optional[float]:
     dv = payload.get("deal_value")
@@ -2278,6 +2312,25 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
     info = build_context(matches, request_id=request_id) if matches else ""
     clarify_count = int(st.get("clarify_count") or 0)
 
+    # --- MASTER phase guidance (M/A/S/T/E/R) ---
+    phase, next_phase_q = _mnt_next_phase_question(st, st.get("active_section_id") or "", st.get("focus_field") or "")
+    if phase:
+        st["phase"] = phase
+    # auto-advance the phase question index when the user answered the last asked phase question
+    pending = _safe_str(st.get("pending_phase_question"))
+    if pending and _safe_str(st.get("last_question")) == pending and _mnt_should_advance_phase(st, user_message):
+        # move to next question within the same phase
+        cur = st.get("phase") or phase
+        if cur in _PHASE_QUESTIONS:
+            _mnt_set_phase_idx(st, cur, _mnt_get_phase_idx(st, cur) + 1)
+        # refresh next question after advancing
+        phase, next_phase_q = _mnt_next_phase_question(st, st.get("active_section_id") or "", st.get("focus_field") or "")
+    if next_phase_q:
+        st["pending_phase_question"] = next_phase_q
+    else:
+        st["pending_phase_question"] = ""
+
+
 
     # Fetch template state from Bubble (read-only) and inject into prompt
     template_state_text = ""
@@ -2295,6 +2348,22 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
     except Exception as _e:
         template_state_text = ""
 
+
+    # Build state memory text for the LLM (answers + template snapshot + MASTER phase guidance)
+    phase_label = _PHASE_LABEL.get(st.get("phase") or "", "")
+    phase_block = ""
+    if st.get("phase") and st.get("pending_phase_question"):
+        phase_block = (
+            "MASTER PHASE:\n"
+            f"- {st.get('phase')} — {phase_label}\n"
+            f"- Next coaching question: {st.get('pending_phase_question')}\n"
+        )
+    state_memory_text = _mnt_build_state_memory_text(st)
+    if template_state_text:
+        state_memory_text = (state_memory_text + "\n\n" + template_state_text).strip()
+    if phase_block:
+        state_memory_text = (state_memory_text + "\n\n" + phase_block).strip()
+
     # Generate guidance text (text-only)
     try:
         text = _master_llm_text(
@@ -2304,7 +2373,7 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
             deal_value=st.get("deal_value"),
             user_name=user_name,
             clarify_count=clarify_count,
-            state_memory=(_mnt_build_state_memory_text(st) + ("\n\n" + template_state_text if template_state_text else "")),
+            state_memory=state_memory_text,
             info=info,
         )
     except Exception as e:
@@ -2389,7 +2458,7 @@ def master_template_sse(payload: Dict = Body(...)):
                 return
 
             if not user_message or _is_smalltalk(user_message):
-                txt = "Hello! How can I assist you with the MASTER negotiation template today?"
+                txt = "Which field are you filling right now (deal value, goals, variables, walk-away, concessions)?"
                 data = json.dumps({"text": txt}, ensure_ascii=False)
                 yield f"event: chunk\ndata: {data}\n\n"
                 _mnt_save_state_text(session_id, st)
@@ -2428,7 +2497,36 @@ def master_template_sse(payload: Dict = Body(...)):
             except Exception:
                 template_state_text = ""
 
-            state_mem = _mnt_build_state_memory_text(st) + ("\n\n" + template_state_text if template_state_text else "")
+
+            # --- MASTER phase guidance (M/A/S/T/E/R) ---
+            phase, next_phase_q = _mnt_next_phase_question(st, st.get("active_section_id") or "", st.get("focus_field") or "")
+            if phase:
+                st["phase"] = phase
+            pending = _safe_str(st.get("pending_phase_question"))
+            if pending and _safe_str(st.get("last_question")) == pending and _mnt_should_advance_phase(st, user_message):
+                cur = st.get("phase") or phase
+                if cur in _PHASE_QUESTIONS:
+                    _mnt_set_phase_idx(st, cur, _mnt_get_phase_idx(st, cur) + 1)
+                phase, next_phase_q = _mnt_next_phase_question(st, st.get("active_section_id") or "", st.get("focus_field") or "")
+            if next_phase_q:
+                st["pending_phase_question"] = next_phase_q
+            else:
+                st["pending_phase_question"] = ""
+
+            phase_label = _PHASE_LABEL.get(st.get("phase") or "", "")
+            phase_block = ""
+            if st.get("phase") and st.get("pending_phase_question"):
+                phase_block = (
+                    "MASTER PHASE:\n"
+                    f"- {st.get('phase')} — {phase_label}\n"
+                    f"- Next coaching question: {st.get('pending_phase_question')}\n"
+                )
+
+            state_mem = _mnt_build_state_memory_text(st)
+            if template_state_text:
+                state_mem = (state_mem + "\n\n" + template_state_text).strip()
+            if phase_block:
+                state_mem = (state_mem + "\n\n" + phase_block).strip()
 
             prompt_user = (
                 f"USER_NAME: {name_line}\n"
