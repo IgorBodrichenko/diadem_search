@@ -17,7 +17,8 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 from openai import OpenAI
 from pinecone import Pinecone
-
+from dotenv import load_dotenv
+load_dotenv()
 # =========================
 # DEBUG / LOGGING
 # =========================
@@ -53,7 +54,7 @@ CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 TOP_K = int(os.getenv("TOP_K", "10"))
 PINECONE_TOPK_RAW = int(os.getenv("PINECONE_TOPK_RAW", "30"))
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "14000"))
-EMBED_DIM = int(os.getenv("EMBED_DIM", "512"))
+EMBED_DIM = int(os.getenv("EMBED_DIM", "1536"))
 
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
 
@@ -211,7 +212,11 @@ if not PINECONE_HOST:
 
 openai = OpenAI(api_key=OPENAI_API_KEY)
 pc = Pinecone(api_key=PINECONE_API_KEY)
-index = pc.Index(PINECONE_INDEX_NAME, host=PINECONE_HOST)
+
+index = pc.Index(
+    name=PINECONE_INDEX_NAME,
+    host=os.getenv("PINECONE_HOST")
+)
 
 # =========================
 # OPENAI STREAM HELPERS (SSE)
@@ -512,6 +517,87 @@ def _rewrite_bad_opening(full_text: str, opener: str) -> str:
         return f"{opener} {rest}".strip() if rest else opener
     return opener
 
+# =========================
+# CHAT CONVERSATION HISTORY
+# =========================
+def _get_chat_history(session_id: str, max_turns: int = 4) -> List[Dict[str, str]]:
+    """Get recent conversation history from session for /chat endpoint."""
+    entry = _db_get(session_id) or {}
+    history = entry.get("chat_history", [])
+    if not isinstance(history, list):
+        history = []
+    # Return last N turns (each turn has user query + assistant answer)
+    return history[-max_turns:] if history else []
+
+def _save_chat_history(session_id: str, query: str, answer: str) -> None:
+    """Save query and answer to conversation history for /chat endpoint."""
+    entry = _db_get(session_id) or {}
+    history = entry.get("chat_history", [])
+    if not isinstance(history, list):
+        history = []
+    
+    # Add new turn
+    history.append({
+        "user": query,
+        "assistant": answer
+    })
+    
+    # Keep only last 10 turns to avoid growing too large
+    if len(history) > 10:
+        history = history[-10:]
+    
+    entry["chat_history"] = history
+    _db_set(session_id, entry)
+
+def _build_conversation_context(history: List[Dict[str, str]]) -> str:
+    """Build conversation context string from history."""
+    if not history:
+        return ""
+    
+    parts = []
+    for turn in history:
+        user_msg = turn.get("user", "").strip()
+        assistant_msg = turn.get("assistant", "").strip()
+        if user_msg:
+            parts.append(f"User: {user_msg}")
+        if assistant_msg:
+            parts.append(f"Assistant: {assistant_msg}")
+    
+    return "\n".join(parts)
+
+def _expand_query_with_context(query: str, history: List[Dict[str, str]]) -> str:
+    """Expand short queries using conversation context for better retrieval."""
+    query_lower = query.lower().strip()
+    
+    # Handle "tell me" and "what are" queries - extract the key phrase
+    if query_lower.startswith("tell me"):
+        # Extract the actual question after "tell me"
+        key_phrase = query_lower.replace("tell me", "").strip()
+        if key_phrase:
+            return key_phrase
+    
+    if query_lower.startswith("what are"):
+        # Extract the actual question after "what are"
+        key_phrase = query_lower.replace("what are", "").strip()
+        if key_phrase:
+            return key_phrase
+    
+    # Don't expand if query is already detailed (more than 3 words)
+    if len(query.split()) > 3:
+        return query
+    
+    # If query is short and we have history, add context
+    if history:
+        last_assistant = history[-1].get("assistant", "")
+        # If last assistant asked about variables, expand the query
+        if "variable" in last_assistant.lower() and len(query.split()) <= 2:
+            return f"{query} negotiation variable"
+        # If last assistant asked about something specific, include that context
+        if "payment" in last_assistant.lower() and "term" in query.lower():
+            return f"{query} negotiation variable"
+    
+    return query
+
 
 # =========================
 # SEARCH HINTS
@@ -589,6 +675,54 @@ def _filter_matches_by_score(matches: List[Dict]) -> List[Dict]:
             out.append(m)
     return out
 
+def is_explanatory_question(q: str) -> bool:
+    ql = q.lower().strip()
+    return any(
+        ql.startswith(p)
+        for p in (
+            "what is",
+            "what does",
+            "define",
+            "explain",
+            "meaning of",
+        )
+    )
+
+def _is_template_filling_query(query: str) -> bool:
+    """Dynamically detect if user is filling out template positions (Low/Mid/High)."""
+    ql = query.lower().strip()
+    
+    # Pattern 1: Value followed by position indicator (e.g., "90 days as my low")
+    # Matches: number/word + "as" + "my/their" + "low/mid/high"
+    position_pattern = r"\b(\d+|[\w\s]+)\s+as\s+(my|their)\s+(low|mid|high|highest)\b"
+    if re.search(position_pattern, ql):
+        return True
+    
+    # Pattern 2: Multiple positions mentioned together (e.g., "low is X, mid is Y, high is Z")
+    # Matches: "low/mid/high" + "is/are" + value
+    multi_position_pattern = r"\b(low|mid|high|highest)\s+(is|are|will be|should be)\s+[\w\s\d]+"
+    matches = len(re.findall(multi_position_pattern, ql))
+    if matches >= 2:  # At least 2 positions mentioned
+        return True
+    
+    # Pattern 3: Validation questions about positions
+    validation_patterns = [
+        r"is\s+(that|this)\s+correct",
+        r"does\s+(that|this)\s+(look|sound)\s+(right|correct|good)",
+        r"am\s+i\s+(right|correct)",
+        r"should\s+(it|they)\s+be",
+    ]
+    if any(re.search(p, ql) for p in validation_patterns):
+        # Check if query also mentions positions
+        if re.search(r"\b(low|mid|high|highest|position)\b", ql):
+            return True
+    
+    # Pattern 4: Direct position statements (e.g., "my low is 90, my high is 30")
+    direct_position_pattern = r"\b(my|their)\s+(low|mid|high|highest)\s+(is|are|will be)\s+[\w\s\d]+"
+    if re.search(direct_position_pattern, ql):
+        return True
+    
+    return False
 
 _STOPWORDS = {
     "the",
@@ -693,74 +827,64 @@ def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
     hint_toks = set(_tokenize(hint)) if hint else set()
 
     scored: List[Tuple[float, Dict]] = []
-    qlow = (query or "").lower()
 
     for m in matches or []:
         md = m.get("metadata") or {}
-        # priority is optional metadata (default 1). Higher = slightly boosted during rerank.
+
+        # Priority metadata (clamped)
         try:
             pr = int(md.get("priority") or 1)
         except Exception:
             pr = 1
-        if pr < 1:
-            pr = 1
-        if pr > PRIORITY_MAX:
-            pr = PRIORITY_MAX
+        pr = max(1, min(PRIORITY_MAX, pr))
+
         text = (md.get("text") or "").strip()
         if not text:
             continue
 
-        tlow = text.lower()
         ttoks = _tokenize(text)
 
+        # Core relevance signals
         overlap_q = sum(1.0 for t in ttoks if t in qt)
         overlap_hint = sum(1.2 for t in ttoks if t in hint_toks) if hint_toks else 0.0
 
-        bonus = 0.0
-        for phrase in [
-            "earth",
-            "water",
-            "fire",
-            "silence",
-            "balance",
-            "power",
-            "selling",
-            "negotiation",
-            "difficult questions",
-            "push back",
-            "relationship",
-            "tactics",
-            "mindset",
-        ]:
-            if phrase in qlow and phrase in tlow:
-                bonus += 0.7
-
+        # Penalise generic, non-instructional language
         penalty = 0.0
+        tlow = text.lower()
         for gp in _GENERIC_PHRASES:
             if gp in tlow:
                 penalty += 1.1
 
+        # Base semantic similarity
         try:
             pscore = float(m.get("score") or 0.0)
         except Exception:
             pscore = 0.0
 
-        final = (overlap_q * 1.25) + (overlap_hint * 1.6) + bonus + (pscore * 0.25) - penalty + (max(0, pr - 1) * PRIORITY_BOOST)
-        scored.append((final, m))
+        # Final score (fully signal-based)
+        final_score = (
+            (overlap_q * 1.3) +
+            (overlap_hint * 1.6) +
+            (pscore * 0.35) +
+            ((pr - 1) * PRIORITY_BOOST) -
+            penalty
+        )
+
+        scored.append((final_score, m))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
+    # Diversity cap per source
     out: List[Dict] = []
     per_source: Dict[str, int] = {}
 
     for _, m in scored:
         md = m.get("metadata") or {}
         sid = _source_id(md) or "_"
-        per_source[sid] = per_source.get(sid, 0)
-        if per_source[sid] >= DIVERSITY_SAME_SOURCE_CAP:
+        if per_source.get(sid, 0) >= DIVERSITY_SAME_SOURCE_CAP:
             continue
         out.append(m)
-        per_source[sid] += 1
+        per_source[sid] = per_source.get(sid, 0) + 1
         if len(out) >= final_k:
             break
 
@@ -768,29 +892,75 @@ def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
 
 
 def build_context(matches: List[Dict], request_id: Optional[str] = None) -> str:
-    parts: List[str] = []
-    total = 0
+    if request_id is None:
+        request_id = str(uuid.uuid4())[:8]
 
+    text_blocks: List[str] = []
+    image_blocks: List[str] = []
+
+    # Separate text and image chunks with intelligent truncation
     for m in matches:
         md = (m.get("metadata") or {})
         text = (md.get("text") or "").strip()
         if not text:
             continue
 
-        snippet = text[:2500] + "…" if len(text) > 2500 else text
-        block = snippet + "\n"
-        if total + len(block) > MAX_CONTEXT_CHARS:
-            break
-        parts.append(block)
-        total += len(block)
+        # Intelligent truncation: try to preserve sentence boundaries
+        if len(text) > 2500:
+            truncated = text[:2500]
+            # Try to find a sentence boundary near the end
+            last_period = truncated.rfind('.')
+            last_newline = truncated.rfind('\n')
+            cut_point = max(last_period, last_newline)
+            if cut_point > 2000:  # Only if we have enough content
+                snippet = text[:cut_point+1] + "…"
+            else:
+                snippet = truncated + "…"
+        else:
+            snippet = text
 
-    if request_id is None:
-        request_id = str(uuid.uuid4())[:8]
-    _slog("context_built",
-          request_id=request_id,
-          chunks_used=len(parts),
-          context_chars=len("\n---\n".join(parts)))
-    return "\n---\n".join(parts)
+        if md.get("type") == "image":
+            image_blocks.append(snippet)
+        else:
+            text_blocks.append(snippet)
+
+    # Always try to include at least ONE text block
+    ordered_blocks: List[str] = []
+    total = 0
+    sep_len = len("\n---\n")
+
+    if text_blocks:
+        ordered_blocks.append(text_blocks[0])
+        total = len(text_blocks[0])  # First block has no separator before it
+
+    # Fill remaining space with highest-ranked remaining blocks
+    for block in text_blocks[1:] + image_blocks:
+        # Calculate size if we add this block
+        new_total = total + sep_len + len(block)
+        if new_total > MAX_CONTEXT_CHARS:
+            break
+        ordered_blocks.append(block)
+        total = new_total
+
+    if not ordered_blocks:
+        _slog(
+            "context_built",
+            request_id=request_id,
+            chunks_used=0,
+            context_chars=0
+        )
+        return ""
+
+    context = "\n---\n".join(ordered_blocks)
+
+    _slog(
+        "context_built",
+        request_id=request_id,
+        chunks_used=len(ordered_blocks),
+        context_chars=len(context)
+    )
+
+    return context
 
 
 def is_context_relevant(query: str, matches: List[Dict]) -> bool:
@@ -801,15 +971,34 @@ def is_context_relevant(query: str, matches: List[Dict]) -> bool:
     if not text:
         return False
 
+    # Get semantic similarity score from Pinecone - if it's high, trust it even with short context
+    try:
+        semantic_score = float(top.get("score") or 0.0)
+    except Exception:
+        semantic_score = 0.0
+
     qt = set(_tokenize(query))
     tt = _tokenize(text)
     overlap = sum(1.0 for t in tt if t in qt)
 
     ctx = build_context(matches)
-    if len(ctx.strip()) < MIN_CONTEXT_CHARS and overlap < MIN_OVERLAP_SCORE:
+    ctx_len = len(ctx.strip())
+    
+    # High semantic match: trust Pinecone's judgment even if context is short (handles titles/short chunks)
+    if semantic_score >= 0.4:
+        if overlap >= 1.0 or ctx_len >= 100:
+            return True
+    
+    # Medium semantic match: be more lenient with thresholds
+    if semantic_score >= 0.35:
+        if overlap >= 1.0 or ctx_len >= 300:
+            return True
+    
+    # Original strict logic for lower scores
+    if ctx_len < MIN_CONTEXT_CHARS and overlap < MIN_OVERLAP_SCORE:
         return False
 
-    return overlap >= MIN_OVERLAP_SCORE or len(ctx.strip()) >= MIN_CONTEXT_CHARS
+    return overlap >= MIN_OVERLAP_SCORE or ctx_len >= MIN_CONTEXT_CHARS
 
 
 def _brief_match(m: Dict, label: str = "") -> Dict[str, Any]:
@@ -897,13 +1086,19 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
           sample=[_brief_match(x) for x in merged[:SEARCH_LOG_MAX_MATCHES]])
 
     reranked = _rerank(q_clean, merged, top_k_final)
+
+    if reranked and not any(m.get("metadata", {}).get("type") == "text" for m in reranked):
+        for m in merged:
+            if m.get("metadata", {}).get("type") == "text":
+                reranked[-1] = m
+                break
+
     _slog("search_reranked",
           request_id=request_id,
           final_count=len(reranked),
           final=[_brief_match(x) for x in reranked[:SEARCH_LOG_MAX_MATCHES]])
 
     # If we have a curated hint for this query, do NOT block on the relevance gate.
-    # These hints exist specifically for short "definition/rules" questions (e.g. Earth/Water/Fire elements)
     # where the top chunk can be short and fail overlap/length heuristics.
     hint_gate = _hint_for_question(q_clean)
     if hint_gate and reranked:
@@ -953,9 +1148,8 @@ def _make_final_user_message(mode: str, state: Dict[str, Any], info: str, user_n
         f"- If template is 'Prepare for difficult behaviours': create a final cheat sheet.\n"
     )
 
-# =========================
-# PROMPTS
-# =========================
+
+
 VARIABLES_POLICY = (
     "\nTemplate Variables rules:\n"
     "- A Variable is a user-defined negotiation lever (e.g., price, term, volume, timing, scope, risk, concessions).\n"
@@ -985,83 +1179,124 @@ LIMITS_POLICY = (
     "- Ask at most 2 clarifying questions before producing a best-effort paste-ready output.\n"
 )
 
+
 SYSTEM_PROMPT_QA = (
-    "You are a negotiation assistant that can ONLY use the provided INFORMATION.\n"
-    "Your job is to produce specific, usable negotiation output (scripts + options), grounded in INFORMATION.\n\n"
+    "You are a negotiation coach operating strictly within the MASTER methodology.\n"
+    "Guide users through preparation using natural, conversational dialogue.\n\n"
 
-    "Hard rules:\n"
-    "- Output plain text only. NO markdown.\n"
-    "- Do NOT mention document names, pages, sources, citations, or the word 'context'.\n"
-    "- Do NOT copy sentences from INFORMATION. Paraphrase everything.\n"
-    "- You may include at most ONE very short quoted phrase (max 6 words) only if it is essential.\n"
-    "- If INFORMATION is missing / too generic / not clearly relevant, respond exactly:\n"
-    "  \"I can't find this in the provided documents.\".\n\n"
+    "CRITICAL RULES:\n"
+    "- Use ONLY INFORMATION. If INFORMATION has methodology guidance (standards, ranges, best practices, lists, tables, or any structured content), you MUST use it - do NOT ask generic questions instead.\n"
+    "- When INFORMATION contains lists, bullet points, or structured content that answers the question, you MUST present that content in your response (in a conversational way, not as a list).\n"
+    "- When user mentions a variable: ALWAYS check INFORMATION first. If INFORMATION contains guidance, you MUST provide that guidance in your response before asking any questions.\n"
+    "- Do NOT give generic negotiation advice outside the methodology.\n"
+    "- For initial variable setup questions: Ask what variables they have in mind. Do NOT mention positions, happy zone, MY LIST, THEIR LIST, or structure concepts.\n"
+    "- Do NOT introduce positions (Low/High/Highest) until user mentions them explicitly.\n"
+    "- When user mentions positions: Validate using definitions below, challenge ambition, ask about other party's perspective.\n\n"
 
-    "Make it actionable:\n"
-    "- Always include:\n"
-    "  1) Recommended move (1 line)\n"
-    "  2) 2–3 concrete options you can propose (numbers/terms where possible)\n"
-    "  3) A word-for-word script (2–4 lines) the user can say\n"
-    "  4) One pushback handling line (1–2 lines)\n"
-    "- If the user didn’t give key numbers, provide placeholders like [X], [date], [volume], [payment terms].\n"
-    "- Keep it concise (<=180 words).\n\n"
+    "When INFORMATION is provided and relevant:\n"
+    "- ALWAYS use INFORMATION to answer the question. If INFORMATION contains the answer (even if it's a list, table, or structured content), you MUST provide it.\n"
+    "- Do NOT say 'I can't find this' if INFORMATION contains relevant content that answers the question.\n"
+    "- Present the information from INFORMATION in a natural, conversational way.\n"
+    "- Do NOT repeat the user's question or prompt in your response - give the answer directly.\n\n"
 
-    "Tone:\n"
-    "- Direct, practical, confident.\n"
-    "- End with ONE short question only if absolutely needed to choose between options.\n"
-)
+    "When INFORMATION is empty or truly unrelated:\n"
+    "- Only then say: 'I can't find this in the provided materials.'\n"
+    "- Do NOT ask about variables if the user's question is NOT about variables.\n"
+    "- Only ask about variables if the user's question is specifically about setting up variables.\n\n"
 
+    "When INFORMATION doesn't have specific variable guidance but has general methodology:\n"
+    "- Use methodology principles from INFORMATION (prepare variables, understand value/cost, set positions, plan for both parties).\n"
+    "- Guide users through the methodology process step-by-step.\n"
+    "- Do NOT give generic advice - instead guide them to think about what's favorable for their situation using methodology principles.\n"
+    "- Reference methodology concepts from INFORMATION when available.\n\n"
 
-# Strict doc-only chat (no apple pie)
-SYSTEM_PROMPT_CHAT = (
-    "You are a focused assistant specialised only in the provided materials.\n"
-    "You may answer ONLY if INFORMATION is provided and clearly relevant to the user's question.\n"
-    "If INFORMATION is empty, missing, or not relevant to the question, you must respond exactly with:\n"
-    "\"I can only help with questions related to the provided materials.\"\n"
-    "\nRules:\n"
-    "- Output plain text only. NO markdown.\n"
-    "- Do NOT mention documents, pages, sources, citations, or the word 'context'.\n"
-    "- Do NOT provide general knowledge, explanations, recipes, or advice outside INFORMATION.\n"
-    "- Keep it short and neutral.\n"
-    "- Ask at most ONE clarifying question when INFORMATION is missing.\n"
-    "- If USER_NAME is provided, you may greet them only when answering (not when refusing).\n"
+    "Position Definitions (use ONLY when user mentions Low/High/Highest):\n"
+    "MY LIST: Low = least favorable but acceptable, High = most favorable, Highest = most ambitious credible position.\n"
+    "Favorable depends on variable: Payment terms (shorter = High, longer = Low), Price (higher = High, lower = Low).\n"
+    "When validating: Challenge ambition, check spread, ask about other party's perspective.\n\n"
+
+    "Response style:\n"
+    "- Natural, conversational sentences. NO lists, bullets, or rigid formats.\n"
+    "- Do NOT repeat or paraphrase the user's question - answer directly.\n"
+    "- Start with empathy or acknowledgment if appropriate, but get straight to the answer.\n"
+    "- End with ONE question that moves forward - but ONLY if it's relevant to the current topic. Do NOT redirect to variables unless the question is specifically about variables.\n"
+    "- IMPORTANT: If INFORMATION contains relevant content (even if it's a list or structured), you MUST use it. Only refuse if INFORMATION is truly empty or completely unrelated to the question.\n\n"
+    
     + VARIABLES_POLICY
     + ACTIVE_SECTION_POLICY
     + LIMITS_POLICY
 )
 
-# Final output must be AI-written (not pasted) and no technical keys
+SYSTEM_PROMPT_EXPLAIN = (
+    "You are an expert analyst."
+    "Your task is to EXPLAIN concepts strictly based on the provided information."
+
+    "Rules:"
+    "- Do NOT coach, persuade, recommend, or guide."
+    "- Do NOT suggest actions, scripts, or emotional techniques."
+    "- Do NOT add interpretation beyond what is explicitly stated."
+    "- Summarize the concept in neutral, factual language."
+    "- If multiple interpretations exist, state them neutrally."
+    "If the information defines a concept metaphorically, explain the metaphor without extending it."
+)
+
+SYSTEM_PROMPT_CHAT = (
+    "You are a specialised assistant that operates ONLY within the MASTER negotiation methodology.\n"
+    "You may answer ONLY when the provided INFORMATION clearly supports the user’s question.\n\n"
+
+    "Authority rules:\n"
+    "- The MASTER methodology is the single source of truth.\n"
+    "- You may interpret, apply, and operationalise frameworks, diagrams, and models described in INFORMATION.\n"
+    "- You must NOT use general negotiation knowledge outside the methodology.\n\n"
+
+    "Refusal rules:\n"
+    "- Refuse ONLY if the methodology does not cover the question at all.\n"
+    "- In that case, respond exactly:\n"
+    "\"I can only help with questions covered by the MASTER methodology.\"\n\n"
+
+    "Output rules:\n"
+    "- Plain text only. NO markdown.\n"
+    "- Do NOT mention documents, slides, sources, pages, or the word 'context'.\n"
+    "- Do NOT quote more than 6 consecutive words.\n"
+    "- Keep responses concise and neutral.\n"
+    "- Ask at most ONE clarification question if required.\n"
+    + VARIABLES_POLICY
+    + ACTIVE_SECTION_POLICY
+    + LIMITS_POLICY
+)
+
+
 SYSTEM_PROMPT_COACH_FINAL = (
-    "You are a professional negotiation coach.\n"
-    "You may ONLY use the provided INFORMATION to shape your guidance.\n"
-    "Do not rely on general negotiation knowledge outside INFORMATION.\n"
-    "The guided dialogue is complete. Produce the final output now.\n\n"
+    "You are a professional negotiation coach trained exclusively in the MASTER methodology.\n"
+    "You must apply the methodology exactly as defined, without adding external ideas.\n\n"
 
-    "Hard rules:\n"
-    "- Output plain text only. NO markdown.\n"
-    "- Do NOT mention documents, pages, sources, citations, or the word 'context'.\n"
-    "- Do NOT introduce tactics, terms, or levers that are not supported by INFORMATION.\n"
-    "- Do NOT copy sentences verbatim from INFORMATION.\n"
-    "- Rephrase, synthesise, and apply INFORMATION to the user's situation.\n\n"
+    "Authority rules:\n"
+    "- MASTER is a hard rule-set, not inspiration.\n"
+    "- You may interpret and apply its models, diagrams, and behavioural guidance.\n"
+    "- You must challenge weak ambition, poor prioritisation, or tactical errors when the methodology supports it.\n\n"
 
-    "Specificity rules:\n"
-    "- Convert INFORMATION into concrete, usable negotiation language.\n"
-    "- Where INFORMATION implies options (e.g. timing, scope, commitment), make them explicit.\n"
-    "- If INFORMATION does not support a specific term (price, payment, %), use placeholders like [X], [date].\n"
-    "- Avoid generic advice (e.g. 'focus on value') unless INFORMATION explains how to do so.\n\n"
+    "Hard constraints:\n"
+    "- Plain text only. NO markdown.\n"
+    "- Do NOT mention documents, slides, pages, or sources.\n"
+    "- Do NOT introduce unsupported tactics or variables.\n"
+    "- Do NOT copy wording verbatim from INFORMATION.\n\n"
 
-    "Output format for 'Prepare for difficult behaviours':\n"
-    "1) Scenario (1–2 sentences, rewritten).\n"
+    "Behavioural rules:\n"
+    "- Show empathy before guidance when pressure or frustration is implied.\n"
+    "- Scrutinise the user’s inputs (e.g. ambition, spread, prioritisation).\n"
+    "- Do NOT ask questions the template already answers.\n\n"
+
+    "Output format for difficult behaviours:\n"
+    "1) Situation (rewritten in 1–2 sentences)\n"
     "2) Cheat sheet:\n"
-    "   likely line -> your response -> steer-back phrase.\n"
-    "   (All lines must be something the user could say out loud.)\n"
-    "3) Optional: one short line explaining the other party’s tactic, grounded in INFORMATION.\n"
-    "4) Optional: 1–2 concrete trade-offs supported by INFORMATION.\n\n"
+    "   likely line -> your response -> steer-back phrase\n"
+    "3) Optional: one short explanation of the other party’s behaviour using MASTER logic\n"
+    "4) Optional: 1–2 trade-offs supported by the methodology\n\n"
 
     "Style:\n"
     "- Calm, confident, practical.\n"
     "- Sound like a real coach preparing someone for a live conversation.\n"
-    "- End with one short optional next-step question.\n"
+    "- End with ONE optional next-step question.\n"
     + VARIABLES_POLICY
     + TEMPLATE_FIRST_POLICY
     + ACTIVE_SECTION_POLICY
@@ -1453,21 +1688,56 @@ def chat(payload: Dict = Body(...)):
         return JSONResponse({"answer": "", "session_id": session_id})
 
     if _is_smalltalk(query):
-        return {"answer": _smalltalk_reply(user_name), "session_id": session_id}
+        answer = _smalltalk_reply(user_name)
+        _save_chat_history(session_id, query, answer)
+        return {"answer": answer, "session_id": session_id}
 
-    matches = get_matches(query, top_k, request_id=request_id)
+    # Get conversation history
+    history = _get_chat_history(session_id)
+    
+    # Expand query if it's short and we have context
+    expanded_query = _expand_query_with_context(query, history)
+    
+    # Use expanded query for retrieval
+    matches = get_matches(expanded_query, top_k, request_id=request_id)
     context = build_context(matches, request_id=request_id) if matches else ""
 
-    if not matches:
-        user = (
+    # Fetch template state if template_id is provided (helps bot understand current template state)
+    template_id = (payload.get("template_id") or payload.get("templateId") or payload.get("template") or "").strip()
+    template_state = ""
+    if template_id:
+        template_state = _fetch_template_state_text(template_id, request_id=request_id)
+        if template_state:
+            context = f"{context}\n\n{template_state}" if context else template_state
+
+    # Build conversation context string
+    conversation_context = _build_conversation_context(history)
+    
+    # Build user message with conversation history
+    if conversation_context:
+        user_message_base = (
+            f"USER_NAME:\n{user_name}\n\n"
+            f"PREVIOUS_CONVERSATION:\n{conversation_context}\n\n"
+            f"CURRENT_USER_MESSAGE:\n{query}\n\n"
+        )
+    else:
+        user_message_base = (
             f"USER_NAME:\n{user_name}\n\n"
             f"USER_MESSAGE:\n{query}\n\n"
-            f"INFORMATION:\n"
         )
+
+    if not matches and not template_state:
+        user = user_message_base + f"INFORMATION:\n"
+        system_prompt = (
+            SYSTEM_PROMPT_EXPLAIN
+            if is_explanatory_question(query)
+            else SYSTEM_PROMPT_QA
+        )
+
         resp = openai.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT_CHAT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user},
             ],
             temperature=0.2,
@@ -1477,19 +1747,24 @@ def chat(payload: Dict = Body(...)):
         if answer:
             opener = _pick_opener(session_id, user_name, "qa_last_opener")
             answer = _rewrite_bad_opening(answer, opener)
+        
+        # Save to history
+        _save_chat_history(session_id, query, answer)
         return {"answer": answer, "session_id": session_id}
 
-    user = (
-        f"USER_NAME:\n{user_name}\n\n"
-        f"QUESTION:\n{query}\n\n"
-        f"INFORMATION:\n{context}"
-    )
+    user = user_message_base + f"INFORMATION:\n{context}"
 
     resp = openai.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT_QA},
-            {"role": "user", "content": user},
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT_QA,
+            },
+            {
+                "role": "user",
+                "content": user,
+            },
         ],
         temperature=0.2,
     )
@@ -1499,6 +1774,9 @@ def chat(payload: Dict = Body(...)):
         opener = _pick_opener(session_id, user_name, "qa_last_opener")
         answer = _rewrite_bad_opening(answer, opener)
 
+    # Save to history
+    _save_chat_history(session_id, query, answer)
+    
     return {"answer": answer, "session_id": session_id}
 
 
@@ -1512,6 +1790,21 @@ def chat_sse(payload: Dict = Body(...)):
     top_k = int(payload.get("top_k") or TOP_K)
     user_name = _extract_user_name(payload)
 
+    # Get conversation history
+    history = _get_chat_history(session_id)
+    
+    # Expand query if it's short and we have context
+    expanded_query = _expand_query_with_context(query, history)
+    
+    # Fetch template state if template_id is provided
+    template_id = (payload.get("template_id") or payload.get("templateId") or payload.get("template") or "").strip()
+    template_state = ""
+    if template_id:
+        template_state = _fetch_template_state_text(template_id, request_id=request_id)
+    
+    # Build conversation context string
+    conversation_context = _build_conversation_context(history)
+
     def gen():
         start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
         yield f"event: start\ndata: {start_payload}\n\n"
@@ -1519,41 +1812,69 @@ def chat_sse(payload: Dict = Body(...)):
         # Smalltalk: single chunk
         if not query:
             chunks = [""]
+            answer = ""
         elif _is_smalltalk(query):
-            chunks = [_smalltalk_reply(user_name)]
+            answer = _smalltalk_reply(user_name)
+            chunks = [answer]
+            _save_chat_history(session_id, query, answer)
+            # Emit chunks for smalltalk
+            for part in chunks:
+                part = strip_markdown_chars(part)
+                data = json.dumps({"text": part}, ensure_ascii=False)
+                yield f"event: chunk\ndata: {data}\n\n"
         else:
-            matches = get_matches(query, top_k, request_id=request_id)
-            context = build_context(matches) if matches else ""
+            # Use expanded query for retrieval
+            matches = get_matches(expanded_query, top_k, request_id=request_id)
+            context = build_context(matches, request_id=request_id) if matches else ""
+            
+            # Add template state to context if available
+            if template_state:
+                context = f"{context}\n\n{template_state}" if context else template_state
 
-            if not matches:
-                user = (
+            # Build user message with conversation history
+            if conversation_context:
+                user_message_base = (
+                    f"USER_NAME:\n{user_name}\n\n"
+                    f"PREVIOUS_CONVERSATION:\n{conversation_context}\n\n"
+                    f"CURRENT_USER_MESSAGE:\n{query}\n\n"
+                )
+            else:
+                user_message_base = (
                     f"USER_NAME:\n{user_name}\n\n"
                     f"USER_MESSAGE:\n{query}\n\n"
-                    f"INFORMATION:\n"
                 )
+
+            if not matches and not template_state:
+                user = user_message_base + f"INFORMATION:\n"
                 messages = [
                     {"role": "system", "content": SYSTEM_PROMPT_CHAT},
                     {"role": "user", "content": user},
                 ]
             else:
-                user = (
-                    f"USER_NAME:\n{user_name}\n\n"
-                    f"QUESTION:\n{query}\n\n"
-                    f"INFORMATION:\n{context}"
-                )
+                user = user_message_base + f"INFORMATION:\n{context}"
                 messages = [
                     {"role": "system", "content": SYSTEM_PROMPT_QA},
                     {"role": "user", "content": user},
                 ]
 
-            # Stream from OpenAI
-            chunks = _iter_text_as_sse_chunks(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2), min_chars=28)
-
-        # Emit chunks
-        for part in chunks:
-            part = strip_markdown_chars(part)
-            data = json.dumps({"text": part}, ensure_ascii=False)
-            yield f"event: chunk\ndata: {data}\n\n"
+            # Stream from OpenAI and collect full answer
+            answer_parts = []
+            text_iter = _openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2)
+            chunks = _iter_text_as_sse_chunks(text_iter, min_chars=28)
+            
+            # Collect chunks and yield them
+            for chunk in chunks:
+                answer_parts.append(chunk)
+                part = strip_markdown_chars(chunk)
+                data = json.dumps({"text": part}, ensure_ascii=False)
+                yield f"event: chunk\ndata: {data}\n\n"
+            
+            answer = "".join(answer_parts).strip() if answer_parts else ""
+            
+            # Save to history after streaming
+            if query and answer:
+                answer_clean = strip_markdown_chars(answer)
+                _save_chat_history(session_id, query, answer_clean)
 
         done_payload = json.dumps({"done": True}, ensure_ascii=False)
         yield f"event: done\ndata: {done_payload}\n\n"
