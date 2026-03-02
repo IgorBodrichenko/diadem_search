@@ -1467,48 +1467,27 @@ def chat(payload: Dict = Body(...)):
     matches = get_matches(query, top_k, request_id=request_id)
     context = build_context(matches, request_id=request_id) if matches else ""
 
-    if not matches:
-        user = (
-            f"USER_NAME:\n{user_name}\n\n"
-            f"USER_MESSAGE:\n{query}\n\n"
-            f"INFORMATION:\n"
-        )
-        resp = openai.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT_CHAT},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.2,
-        )
-        answer = strip_markdown_chars((resp.choices[0].message.content or "").strip())
-        # IMPORTANT: if we are refusing, do not add openers.
-        if answer:
-            opener = _pick_opener(session_id, user_name, "qa_last_opener")
-            answer = _rewrite_bad_opening(answer, opener)
-        return {"answer": answer, "session_id": session_id}
-
     user = (
         f"USER_NAME:\n{user_name}\n\n"
         f"QUESTION:\n{query}\n\n"
         f"INFORMATION:\n{context}"
     )
 
-   resp = openai.chat.completions.create(
-    model=CHAT_MODEL,
-    messages=[
-        {"role": "system", "content": SYSTEM_PROMPT_CHAT},  # <-- было SYSTEM_PROMPT_QA
-        {"role": "user", "content": user},
-    ],
-    temperature=0.2,
-)
+    resp = openai.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT_CHAT},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.2,
+    )
 
-answer = strip_markdown_chars((resp.choices[0].message.content or "").strip())
-if answer:
-    opener = _pick_opener(session_id, user_name, "qa_last_opener")
-    answer = _rewrite_bad_opening(answer, opener)
+    answer = strip_markdown_chars((resp.choices[0].message.content or "").strip())
+    if answer:
+        opener = _pick_opener(session_id, user_name, "qa_last_opener")
+        answer = _rewrite_bad_opening(answer, opener)
 
-return {"answer": answer, "session_id": session_id}
+    return {"answer": answer, "session_id": session_id}
 
 
 @app.post("/chat/sse")
@@ -1525,38 +1504,29 @@ def chat_sse(payload: Dict = Body(...)):
         start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
         yield f"event: start\ndata: {start_payload}\n\n"
 
-        # Smalltalk: single chunk
+        # Smalltalk / empty
         if not query:
             chunks = [""]
         elif _is_smalltalk(query):
             chunks = [_smalltalk_reply(user_name)]
         else:
             matches = get_matches(query, top_k, request_id=request_id)
-            context = build_context(matches) if matches else ""
+            context = build_context(matches, request_id=request_id) if matches else ""
 
-            if not matches:
-                user = (
-                    f"USER_NAME:\n{user_name}\n\n"
-                    f"USER_MESSAGE:\n{query}\n\n"
-                    f"INFORMATION:\n"
-                )
-                messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT_CHAT},
-                    {"role": "user", "content": user},
-                ]
-            else:
-                user = (
-                    f"USER_NAME:\n{user_name}\n\n"
-                    f"QUESTION:\n{query}\n\n"
-                    f"INFORMATION:\n{context}"
-                )
-                messages = [
-    {"role": "system", "content": SYSTEM_PROMPT_CHAT},  # <-- было SYSTEM_PROMPT_QA
-    {"role": "user", "content": user},
-]
+            user = (
+                f"USER_NAME:\n{user_name}\n\n"
+                f"QUESTION:\n{query}\n\n"
+                f"INFORMATION:\n{context}"
+            )
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT_CHAT},
+                {"role": "user", "content": user},
+            ]
 
-            # Stream from OpenAI
-            chunks = _iter_text_as_sse_chunks(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2), min_chars=28)
+            chunks = _iter_text_as_sse_chunks(
+                _openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2),
+                min_chars=28,
+            )
 
         # Emit chunks
         for part in chunks:
@@ -1568,8 +1538,6 @@ def chat_sse(payload: Dict = Body(...)):
         yield f"event: done\ndata: {done_payload}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=_sse_headers())
-
-
 
 
 # =========================
