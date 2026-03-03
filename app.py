@@ -2446,7 +2446,7 @@ def _master_llm_text(
     # Special handling for business/coaching questions (not template filling)
     business_question_handling = ""
     if any(phrase in user_msg_lower for phrase in ["what about", "how can i prepare", "should i", "can i", "is it", "will they", "pay up front", "part pay", "upfront payment"]):
-        business_question_handling = "\n\nIMPORTANT: User is asking a business/coaching question. Acknowledge their thinking first, then answer it fully using INFORMATION. Provide coaching, suggestions, and guidance using INFORMATION dynamically. Do NOT redirect to template filling or variable selection unless the user explicitly asks to add variables or continue filling the template. Answer their question completely and let them decide the next step."
+        business_question_handling = "\n\nIMPORTANT: User is asking a business/coaching question. Acknowledge their thinking first, then answer it fully using INFORMATION. Provide coaching, suggestions, and guidance using INFORMATION dynamically. Do NOT redirect to template filling or variable selection unless the user explicitly asks to add variables or continue filling the template. Do NOT ask follow-up questions like 'Would you like to explore this further?' or 'Would you like to add it as a variable?' Answer their question completely and end your response. Let them decide the next step."
     
     # Special handling for tricky behaviors question
     tricky_behaviors_handling = ""
@@ -2981,7 +2981,7 @@ def master_template_sse(payload: Dict = Body(...)):
             # Special handling for business/coaching questions (not template filling)
             business_question_handling = ""
             if any(phrase in user_msg_lower for phrase in ["what about", "how can i prepare", "should i", "can i", "is it", "will they", "pay up front", "part pay", "upfront payment"]):
-                business_question_handling = "\n\nIMPORTANT: User is asking a business/coaching question. Acknowledge their thinking first, then answer it fully using INFORMATION. Provide coaching, suggestions, and guidance using INFORMATION dynamically. Do NOT redirect to template filling or variable selection unless the user explicitly asks to add variables or continue filling the template. Answer their question completely and let them decide the next step."
+                business_question_handling = "\n\nIMPORTANT: User is asking a business/coaching question. Acknowledge their thinking first, then answer it fully using INFORMATION. Provide coaching, suggestions, and guidance using INFORMATION dynamically. Do NOT redirect to template filling or variable selection unless the user explicitly asks to add variables or continue filling the template. Do NOT ask follow-up questions like 'Would you like to explore this further?' or 'Would you like to add it as a variable?' Answer their question completely and end your response. Let them decide the next step."
             
             # Special handling for tricky behaviors question
             tricky_behaviors_handling = ""
