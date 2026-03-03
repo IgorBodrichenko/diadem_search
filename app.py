@@ -441,6 +441,69 @@ def strip_markdown_chars(text: str) -> str:
     return text.replace("*", "").replace("`", "").replace("_", "")
 
 
+def chat_format(text: str, *, max_chars: int = 1400, max_numbered: int = 6, max_bullets: int = 6) -> str:
+    """Format model output for chat UI: short paragraphs, blank lines, tidy lists, no mid-item truncation."""
+    if not text:
+        return ""
+    t = (text or "").strip()
+
+    # Normalize newlines
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Ensure numbered items start on new lines: " 1." -> "\n1."
+    t = re.sub(r"\s+(?=\d+\.)", "\n", t)
+
+    # Ensure bullet items start on new lines
+    t = re.sub(r"\s+(?=[•\-]\s)", "\n", t)
+
+    # Split very long paragraphs into shorter ones by sentence boundaries
+    paras = re.split(r"\n{2,}", t)
+    out_paras = []
+    for p in paras:
+        p = p.strip()
+        if not p:
+            continue
+        if len(p) <= 260:
+            out_paras.append(p)
+            continue
+        # Insert blank lines after sentences to avoid walls of text
+        p2 = re.sub(r"(\.|\?|!)(\s+)", r"\1\n\n", p)
+        out_paras.append(p2.strip())
+    t = "\n\n".join(out_paras).strip()
+
+    # Cap list length (numbered and bullet)
+    lines = [ln.rstrip() for ln in t.split("\n")]
+    numbered = 0
+    bullets = 0
+    kept = []
+    for ln in lines:
+        s = ln.strip()
+        if re.match(r"^\d+\.\s+", s):
+            numbered += 1
+            if numbered > max_numbered:
+                continue
+        if re.match(r"^[•\-]\s+", s):
+            bullets += 1
+            if bullets > max_bullets:
+                continue
+        kept.append(ln)
+    t = "\n".join(kept).strip()
+
+    # Hard cap by chars, but cut safely on a boundary
+    if max_chars and len(t) > max_chars:
+        cut = t[:max_chars]
+        # Prefer cutting at a blank line, then newline, then sentence end.
+        for sep in ["\n\n", "\n", ". ", "? ", "! "]:
+            idx = cut.rfind(sep)
+            if idx > 200:
+                cut = cut[:idx].rstrip()
+                break
+        t = cut.rstrip() + "…"
+
+    return t.strip()
+
+
+
 # =========================
 # SMALL TALK
 # =========================
@@ -1629,15 +1692,6 @@ Core behaviour:
 - Ask only ONE focused question per turn (unless the user asked a direct definition — then answer + ask one question).
 - Remember what the user already said in this session and build on it (do not re-ask answered questions).
 - If the user asks a business question related to negotiation, answer it using INFORMATION and their saved answers, then return to the current field.
-- Output must be easy to read in a chat UI.
-- Never write a single long paragraph.
-- Use short paragraphs: max 2–3 sentences per paragraph.
-- Put a blank line between paragraphs.
-- If giving steps, use a numbered list (1–6 max).
-- If giving options, use bullet points (max 6).
-- Keep total length tight: aim for 80–160 words unless user explicitly asks for detail.
-- End with ONE focused question only when you need user input to continue.
-- Do not add extra greetings, closings, or filler.
 
 Hard rules:
 - Use INFORMATION only. If INFORMATION is insufficient, say so briefly and ask ONE precise question that would let you retrieve/answer.
@@ -1664,21 +1718,6 @@ Style:
 - Separate sections with blank lines.
 - End every turn with ONE focused question that advances the template.
 """
-
-MASTER_CHAT_SYSTEM_PROMPT_TEXT = """You are a Diadem negotiation assistant.
-Primary knowledge source: INFORMATION retrieved from Pinecone (Diadem / MASTER materials). Do not invent details.
-
-Goal:
-- First, answer the user's question like a normal chat assistant, using INFORMATION.
-- Second (only if FOCUS_FIELD or ACTIVE_SECTION_ID is set), steer back to the template with ONE focused next question.
-
-Rules:
-- Plain text only. No markdown.
-- Do NOT mention document names, pages, sources, citations, Pinecone, or the word 'context'.
-- If INFORMATION is thin, give the best possible answer grounded in what you have, and ask ONE precise question to proceed.
-- Be direct and businesslike. No fluff.
-"""
-
 def _mnt_default_state_text() -> Dict[str, Any]:
     return {
         "mode": MASTER_MODE,
@@ -1745,75 +1784,6 @@ def _mnt_extract_focus(payload: Dict[str, Any]) -> Tuple[str, str]:
     active_section_id = _safe_str(payload.get("active_section_id") or payload.get("active_section") or payload.get("section_id"))
     focus_field = _safe_str(payload.get("focus_field") or payload.get("active_field") or payload.get("field_key"))
     return active_section_id, focus_field
-
-def _mnt_detect_intent(user_message: str, active_section_id: str, focus_field: str, st: Dict[str, Any]) -> str:
-    """Return 'chat' or 'template'.
-
-    - Template intent when UI provides focus/section OR user explicitly asks to fill/write a field.
-    - Chat intent otherwise (answer questions naturally, then optionally steer back if focus exists).
-    """
-    um = (user_message or "").strip().lower()
-    sec = (active_section_id or "").strip()
-    ff = (focus_field or "").strip()
-
-    # Strong template signals from UI
-    if sec or ff:
-        return "template"
-
-    # If state already has a focused field/section, we can still treat as template when user refers to writing/fields.
-    st_ff = _safe_str(st.get("focus_field"))
-    st_sec = _safe_str(st.get("active_section_id"))
-
-    template_keywords = (
-        "fill", "filling", "write", "typing", "paste", "put in", "enter", "field", "cell", "table",
-        "template", "in this box", "in this field", "what should i write", "what do i write",
-        "заполни", "заполнить", "что писать", "в поле", "в ячейку", "в таблицу", "шаблон"
-    )
-    if any(k in um for k in template_keywords) and (st_ff or st_sec):
-        return "template"
-
-    # Default: chat
-    return "chat"
-
-
-def _master_chat_llm_text(
-    user_message: str,
-    active_section_id: str,
-    focus_field: str,
-    deal_value: Optional[float],
-    user_name: str,
-    info: str,
-    state_memory: str = "",
-) -> str:
-    """Chat-first answer grounded in INFORMATION, with optional template steer-back."""
-    deal_line = "" if deal_value is None else f"DEAL_VALUE: {deal_value}\n"
-    name_line = user_name.strip() if user_name else ""
-    mem_line = (state_memory or "").strip()
-
-    prompt_user = (
-        f"USER_NAME: {name_line}\n"
-        f"ACTIVE_SECTION_ID: {active_section_id}\n"
-        f"FOCUS_FIELD: {focus_field}\n"
-        f"{deal_line}"
-        f"USER_MESSAGE: {user_message}\n\n"
-        f"STATE_MEMORY:\n{mem_line}\n\n"
-        f"INFORMATION:\n{info}\n\n"
-        "TASK:\n"
-        "1) Answer the user's question clearly and practically, grounded in INFORMATION.\n"
-        "2) If FOCUS_FIELD or ACTIVE_SECTION_ID is set, end with ONE focused question that helps the user write the next line in that field.\n"
-    )
-
-    messages = [
-        {"role": "system", "content": MASTER_CHAT_SYSTEM_PROMPT_TEXT},
-        {"role": "user", "content": prompt_user},
-    ]
-    resp = openai.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=messages,
-        temperature=0.2,
-    )
-    text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
-    return _truncate_words(text, 220)
 
 
 # =========================
@@ -2217,6 +2187,7 @@ def _master_llm_text(
         model=CHAT_MODEL,
         messages=messages,
         temperature=0.2,
+        max_tokens=520,
     )
     text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
 
@@ -2239,7 +2210,7 @@ def _master_llm_text(
                 "- Then I’ll give you exact template wording."
             )
 
-    return _truncate_words(text, 180)
+    return chat_format(text)
 
 
 
@@ -2284,11 +2255,17 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
 
     user_name = _extract_user_name(payload)
 
-    # First touch: mark help as accepted (user is already inside the MASTER template) and continue normally.
+    # First touch: always greet (no Yes/No gating)
     if st.get("help_accepted") is None:
         st["help_offered"] = True
-        st["help_accepted"] = True
-
+        st["help_accepted"] = True  # user is already inside the MASTER template
+        _mnt_save_state_text(session_id, st)
+        return {
+            "session_id": session_id,
+            "mode": MASTER_MODE,
+            "text": "Hello! How can I assist you with the MASTER negotiation template today?",
+            "done": False,
+        }
 
     # User explicitly disabled help
     if st.get("help_accepted") is False:
@@ -2302,7 +2279,6 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
 
     # Update slot memory from the user's message (percent, money, terms, etc.)
     _mnt_extract_slots_from_user(st, user_message)
-    intent = _mnt_detect_intent(user_message, active_section_id, focus_field, st)
 
     # Deterministic handlers to avoid repeating questions
     rb = _mnt_rule_based_response(user_message, st)
@@ -2311,33 +2287,21 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
         _mnt_save_state_text(session_id, st)
         return {"session_id": session_id, "mode": MASTER_MODE, "text": rb, "done": False}
 
-    # Smalltalk: in chat mode, behave like a normal chatbot. In template mode, greet + refocus.
+    # Smalltalk inside the template: greet + refocus
     if _is_smalltalk(user_message):
         _mnt_save_state_text(session_id, st)
-        if intent == "chat":
-            return {"session_id": session_id, "mode": MASTER_MODE, "text": _smalltalk_reply(user_name), "done": False}
-
         ff = (st.get("focus_field") or "").strip()
         if ff:
             return {"session_id": session_id, "mode": MASTER_MODE, "text": f"You’re on '{ff}'. What do you want to write there?", "done": False}
         sec = (st.get("active_section_id") or "").strip()
         if sec:
             return {"session_id": session_id, "mode": MASTER_MODE, "text": f"You’re in '{sec}'. What do you need to write?", "done": False}
-        return {"session_id": session_id, "mode": MASTER_MODE, "text": "What’s your question?", "done": False}
+        return {"session_id": session_id, "mode": MASTER_MODE, "text": "Which part are you filling right now (deal value, variables, goals, walk-away, concessions)?", "done": False}
 
-    # If user hasn't sent anything:
-    # - Chat mode: ask what they need.
-    # - Template mode: keep focus and prompt gently.
+
+    # If user hasn't sent anything, prompt gently — but NEVER lose focus
     if not user_message:
         _mnt_save_state_text(session_id, st)
-
-        if intent == "chat":
-            return {
-                "session_id": session_id,
-                "mode": MASTER_MODE,
-                "text": "What do you want to work on?",
-                "done": False,
-            }
 
         ff = (st.get("focus_field") or "").strip()
         sec = (st.get("active_section_id") or "").strip()
@@ -2365,67 +2329,12 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
             "done": False,
         }
 
-
     # If deal value missing and user is in that field (or mentions it), nudge but still answer
     # (We keep this light because user may want help elsewhere.)
     needs_deal_value_hint = st.get("deal_value") is None and (focus_field.lower() in ("deal_value", "dealvalue", "value") or "deal value" in user_message.lower())
 
 
-    
-    # Chat-first mode: answer questions like a normal bot over Pinecone docs,
-    # then optionally steer back to the template if a focus field exists.
-    if intent == "chat":
-        request_id = str(uuid.uuid4())[:8]
-        rag_query = f"master_chat: {user_message}".strip()
-        raw = get_matches(rag_query, TOP_K, request_id=request_id)
-        matches = raw or []
-        info = build_context(matches, request_id=request_id) if matches else ""
-
-        # Fetch template state from Bubble (read-only) and inject into prompt (optional)
-        template_state_text = ""
-        try:
-            cache = st.get("_tpl_cache") or {}
-            cache_tid = str(cache.get("template_id") or "")
-            cache_ts = float(cache.get("ts") or 0)
-            if st.get("template_id"):
-                now = time.time()
-                if cache_tid == st.get("template_id") and (now - cache_ts) < 4 and cache.get("text"):
-                    template_state_text = str(cache.get("text") or "")
-                else:
-                    template_state_text = _fetch_template_state_text(st.get("template_id"), request_id=request_id)
-                    st["_tpl_cache"] = {"template_id": st.get("template_id"), "ts": now, "text": template_state_text}
-        except Exception:
-            template_state_text = ""
-
-        state_memory_text = _mnt_build_state_memory_text(st)
-        if template_state_text:
-            state_memory_text = (state_memory_text + "\n\n" + template_state_text).strip()
-
-        try:
-            text = _master_chat_llm_text(
-                user_message=user_message,
-                active_section_id=st.get("active_section_id") or "",
-                focus_field=st.get("focus_field") or "",
-                deal_value=st.get("deal_value"),
-                user_name=user_name,
-                info=info,
-                state_memory=state_memory_text,
-            )
-        except Exception as e:
-            _jlog("master_template_chat_llm_error", session_id=session_id, err=str(e)[:800])
-            text = "Server error."
-
-        # Persist conversational memory
-        if user_message and text:
-            _mnt_push_history(st, user_message, text)
-        q = _extract_last_question(text)
-        if q:
-            st["last_question"] = q
-
-        _mnt_save_state_text(session_id, st)
-        return {"session_id": session_id, "mode": MASTER_MODE, "text": text, "done": False}
-
-# --- RAG retrieval for MASTER template (always) ---
+    # --- RAG retrieval for MASTER template (always) ---
     request_id = str(uuid.uuid4())[:8]
     rag_query = f"master_template {active_section_id} {focus_field}: {user_message}".strip()
 
@@ -2517,6 +2426,10 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
         text = (text + "\n\nDeal value: enter the total commercial value as a number (e.g., 120000).").strip()
 
     
+
+    # Final chat formatting (avoid walls of text; keep lists tidy)
+    text = chat_format(text)
+
     # Persist conversational memory so the assistant can reference what was already asked/answered.
     if user_message and text:
         _mnt_push_history(st, user_message, text)
@@ -2568,6 +2481,9 @@ def master_template_sse(payload: Dict = Body(...)):
             if dv is not None:
                 st["deal_value"] = dv
 
+            # If deal value missing and user is in that field (or mentions it), nudge but still answer
+            needs_deal_value_hint = st.get("deal_value") is None and (focus_field.lower() in ("deal_value", "dealvalue", "value") or "deal value" in (user_message or "").lower())
+
             # First call greeting (if Bubble sends 'hi' as first message)
             if st.get("help_accepted") is None:
                 st["help_offered"] = True
@@ -2577,7 +2493,6 @@ def master_template_sse(payload: Dict = Body(...)):
 
             # Update slot memory from the user's message
             _mnt_extract_slots_from_user(st, user_message)
-            intent = _mnt_detect_intent(user_message, active_section_id, focus_field, st)
 
             # Deterministic handlers to avoid repeating questions (SSE mode)
             rb = _mnt_rule_based_response(user_message, st)
@@ -2591,10 +2506,7 @@ def master_template_sse(payload: Dict = Body(...)):
                 return
 
             if not user_message or _is_smalltalk(user_message):
-                if intent == "chat":
-                    txt = _smalltalk_reply(user_name) if _is_smalltalk(user_message) else "What’s your question?"
-                else:
-                    txt = "Which field are you filling right now (deal value, goals, variables, walk-away, concessions)?"
+                txt = "Which field are you filling right now (deal value, goals, variables, walk-away, concessions)?"
                 data = json.dumps({"text": txt}, ensure_ascii=False)
                 yield f"event: chunk\ndata: {data}\n\n"
                 _mnt_save_state_text(session_id, st)
@@ -2602,79 +2514,7 @@ def master_template_sse(payload: Dict = Body(...)):
                 yield f"event: done\ndata: {done_payload}\n\n"
                 return
 
-
-            
-            # Chat-first mode: answer over Pinecone docs, then optionally steer back to template.
-            if intent == "chat":
-                request_id = str(uuid.uuid4())[:8]
-                rag_query = f"master_chat: {user_message}".strip()
-                raw = get_matches(rag_query, TOP_K, request_id=request_id)
-                matches = raw or []
-                info = build_context(matches, request_id=request_id) if matches else ""
-
-                # Optional template snapshot
-                template_state_text = ""
-                try:
-                    cache = st.get("_tpl_cache") or {}
-                    cache_tid = str(cache.get("template_id") or "")
-                    cache_ts = float(cache.get("ts") or 0)
-                    if st.get("template_id"):
-                        now = time.time()
-                        if cache_tid == st.get("template_id") and (now - cache_ts) < 4 and cache.get("text"):
-                            template_state_text = str(cache.get("text") or "")
-                        else:
-                            template_state_text = _fetch_template_state_text(st.get("template_id"), request_id=request_id)
-                            st["_tpl_cache"] = {"template_id": st.get("template_id"), "ts": now, "text": template_state_text}
-                except Exception:
-                    template_state_text = ""
-
-                state_mem = _mnt_build_state_memory_text(st)
-                if template_state_text:
-                    state_mem = (state_mem + "\n\n" + template_state_text).strip()
-
-                # Stream chat response
-                deal_value = st.get("deal_value")
-                deal_line = "" if deal_value is None else f"DEAL_VALUE: {deal_value}\n"
-                name_line = user_name.strip() if user_name else ""
-
-                prompt_user = (
-                    f"USER_NAME: {name_line}\n"
-                    f"ACTIVE_SECTION_ID: {st.get('active_section_id','')}\n"
-                    f"FOCUS_FIELD: {st.get('focus_field','')}\n"
-                    f"{deal_line}"
-                    f"USER_MESSAGE: {user_message}\n\n"
-                    f"STATE_MEMORY:\n{state_mem}\n\n"
-                    f"INFORMATION:\n{info}\n\n"
-                    "TASK:\n"
-                    "1) Answer the user's question clearly and practically, grounded in INFORMATION.\n"
-                    "2) If FOCUS_FIELD or ACTIVE_SECTION_ID is set, end with ONE focused question that helps the user write the next line in that field.\n"
-                )
-                messages = [
-                    {"role": "system", "content": MASTER_CHAT_SYSTEM_PROMPT_TEXT},
-                    {"role": "user", "content": prompt_user},
-                ]
-
-                full_parts: List[str] = []
-                for part in _iter_text_as_sse_chunks(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2), min_chars=28):
-                    part = strip_markdown_chars(part)
-                    if part:
-                        full_parts.append(part)
-                    data = json.dumps({"text": part}, ensure_ascii=False)
-                    yield f"event: chunk\ndata: {data}\n\n"
-
-                full_text = strip_markdown_chars("".join(full_parts)).strip()
-                if user_message and full_text:
-                    _mnt_push_history(st, user_message, full_text)
-                q = _extract_last_question(full_text)
-                if q:
-                    st["last_question"] = q
-
-                _mnt_save_state_text(session_id, st)
-                done_payload = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
-                yield f"event: done\ndata: {done_payload}\n\n"
-                return
-
-# Retrieval (prefer Master Negotiator Slides)
+            # Retrieval (prefer Master Negotiator Slides)
             request_id = str(uuid.uuid4())[:8]
             rag_query = f"master_template {st.get('active_section_id','')} {st.get('focus_field','')}: {user_message}".strip()
             raw = get_matches(rag_query, TOP_K, request_id=request_id)
@@ -2747,20 +2587,27 @@ def master_template_sse(payload: Dict = Body(...)):
                 "TASK: Give Diadem-only, template-ready guidance for the MASTER template.\n"
                 "Do NOT refuse.\n"
             )
+            
             messages = [
                 {"role": "system", "content": MASTER_SYSTEM_PROMPT_TEXT},
                 {"role": "user", "content": prompt_user},
             ]
 
-            full_parts: List[str] = []
-            for part in _iter_text_as_sse_chunks(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2), min_chars=28):
-                part = strip_markdown_chars(part)
-                if part:
-                    full_parts.append(part)
-                data = json.dumps({"text": part}, ensure_ascii=False)
-                yield f"event: chunk\ndata: {data}\n\n"
+            # Non-stream generation for MASTER SSE, then format into chat-friendly paragraphs.
+            # (Bubble often doesn't render incremental SSE chunks nicely; this avoids truncation mid-list.)
+            resp = openai.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=messages,
+                temperature=0.2,
+                max_tokens=520,
+            )
+            full_text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
+            full_text = chat_format(full_text)
 
-            full_text = strip_markdown_chars("".join(full_parts)).strip()
+            if needs_deal_value_hint and "deal value" not in (full_text or "").lower():
+                full_text = (full_text + "\n\nDeal value: enter the total commercial value as a number (e.g., 120000).").strip()
+                full_text = chat_format(full_text)
+
             if user_message and full_text:
                 _mnt_push_history(st, user_message, full_text)
             q = _extract_last_question(full_text)
@@ -2768,6 +2615,9 @@ def master_template_sse(payload: Dict = Body(...)):
                 st["last_question"] = q
 
             _mnt_save_state_text(session_id, st)
+
+            data = json.dumps({"text": full_text}, ensure_ascii=False)
+            yield f"event: chunk\ndata: {data}\n\n"
             done_payload = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
             yield f"event: done\ndata: {done_payload}\n\n"
 
