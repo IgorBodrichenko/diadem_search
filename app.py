@@ -1137,7 +1137,7 @@ ACTIVE_SECTION_POLICY = (
 
 LIMITS_POLICY = (
     "\nInteraction limits:\n"
-    "- Keep responses <= 150 words unless the user asks for more.\n"
+    "- Keep responses <= 180 words unless the user asks for more.\n"
     "- Ask at most 2 clarifying questions before producing a best-effort paste-ready output.\n"
 )
 
@@ -1707,14 +1707,14 @@ def chat_sse(payload: Dict = Body(...)):
                 f"INFORMATION:\n{context}"
             )
             messages = [
-                {"role": "system", "content": SYSTEM_PROMPT_CHAT},
+            {"role": "system", "content": SYSTEM_PROMPT_CHAT},
                 {"role": "user", "content": user},
             ]
 
-            chunks = _iter_text_as_sse_chunks(
-                _openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2),
-                min_chars=28,
-            )
+        chunks = _iter_text_as_sse_chunks(
+            _openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2),
+            min_chars=28,
+        )
 
         # Emit chunks
         for part in chunks:
@@ -1814,10 +1814,13 @@ Primary source: Master Negotiator Slides. Use INFORMATION. Do not invent.
 
 Core behaviour:
 - You are a live negotiation coach, providing dialogue and coaching through conversation.
-- Your job is to help the user WRITE the next field in their template, then move forward.
-- Work on ONE section/field at a time (active_section_id / focus_field).
+- Your job is to help the user complete their MASTER negotiation template, but be flexible: answer questions, provide strategy guidance, and help with negotiations even when template fields aren't being filled.
+- Work on ONE section/field at a time (active_section_id / focus_field) when actively filling the template.
 - Remember what the user already said in this session and build on it (do not re-ask answered questions).
-- If the user asks a business question related to negotiation (e.g., "what about X?", "how can I prepare for Y?", "should I do Z?"), you MUST answer it fully using INFORMATION first. Provide coaching, suggestions, and guidance. Only after answering should you return to the current field. Do NOT redirect business questions to variable selection.
+- If the user asks a business question related to negotiation (e.g., "what about X?", "how can I prepare for Y?", "should I do Z?"), you MUST answer it fully using INFORMATION first. Provide coaching, suggestions, and guidance. Do NOT redirect back to template filling unless the user explicitly wants to continue filling the template.
+- If the user indicates they've completed variables (e.g., "I've given you all variables", "no more variables", "help me with negotiations", "what to do now", "give me a result", "STOP asking for more variables"), transition to providing strategy, coaching, and negotiation guidance. Do NOT ask for more variables.
+- If the user says "I've already written" or "I already chose" something, acknowledge it and move forward. Do NOT ask for it again.
+- If the user wants to focus on "their list" or "THEIR LIST", help them with that section. Do NOT keep asking for MY LIST variables.
 - Provide dialogue and coaching, not just questions. After 3 clarification questions, you MUST generate a paste-ready answer even if information is incomplete.
 - When user first accepts help and no active_section_id is set or active_section_id is empty: Guide them to start with their first variable in MY LIST. Say "Let's start with your first variable. What variable would you like to add to MY LIST?" Do NOT jump to other sections like confidence or goals.
 
@@ -1828,7 +1831,9 @@ CRITICAL RULES (from Journey doc + /chat):
 - When user asks about variables for MY LIST: Use INFORMATION to provide helpful variable suggestions conversationally, then ask which one they want to start with. Do NOT just ask "what variable" without providing helpful context from INFORMATION.
 - Do NOT repeat or paraphrase the user's question - answer directly.
 - Do NOT simply echo back what the user just said. Instead, provide coaching, challenge their thinking, suggest improvements, or guide them forward using INFORMATION.
-- Start with empathy or acknowledgment if appropriate, but get straight to the answer.
+- ALWAYS prioritize the user's CURRENT message. Do NOT ignore what they just said or redirect to unrelated previous topics.
+- When user expresses frustration, concern, or difficulty, ALWAYS show empathy first (acknowledge their feeling), then provide guidance using INFORMATION. Do NOT ignore their message.
+- When user asks about strategy or mentions specific positions/conflicts, provide comprehensive guidance using INFORMATION. Look at all their variables if available, challenge prioritization, and suggest tactical approaches.
 - Do NOT give generic negotiation advice outside the methodology.
 - Never output the sentence: "I can only help with questions related to the provided materials."
 - Never dump a full framework list.
@@ -1850,7 +1855,7 @@ Template-First Writing Contract:
 - When user asks "what variables" or "what variables should I put": Use ONLY INFORMATION to suggest relevant variables conversationally. Do NOT use generic examples like "Price" or "Delivery Time" - only suggest variables that are mentioned in INFORMATION. Present 2-4 variable suggestions from INFORMATION in a natural, dialogue way (not as a bullet list). Then ask which variable they'd like to add first. Do NOT show Low/High/Highest positions or ranges.
 - When focus_field is "variable_name": ONLY provide the variable name to type, nothing else. Do NOT show positions.
 - When user provides a variable name (FOCUS_FIELD was variable_name and user just gave a name, not a question): Acknowledge the variable name, then ask for their positions (Low, High, Highest) for that variable. Do NOT ask for the next variable until positions are complete.
-- When user provides multiple positions at once: Do NOT repeat or echo back the positions the user just provided. Instead, use INFORMATION to scrutinize and challenge the positions directly. Ask: Is ambition appropriate? Is the spread between Low/High/Highest sufficient? Could they be more ambitious? Suggest specific improvements using INFORMATION. For payment terms: shorter is better (High position), longer is worse (Low position). Provide coaching value, then confirm the variable is complete and ask for the next variable. Do NOT ask for positions that were already provided.
+- When user provides multiple positions at once: Do NOT repeat or echo back the positions the user just provided. Instead, use INFORMATION to scrutinize and challenge the positions directly. Ask: Is ambition appropriate? Is the spread between Low/High/Highest sufficient? Could they be more ambitious? For payment terms: challenge if they could try shorter terms (e.g., "Could you be more ambitious with your high point? Why not try 14 days? Especially if it is a new customer."). Also ask about the other party's perspective: "Where do you feel the other party will be looking to lock down payment terms? Think from the other party's perspective their low, mid and high (worst for you, best for them) position?" Provide coaching value, then confirm the variable is complete and ask for the next variable. Do NOT ask for positions that were already provided.
 - When user explicitly asks "what is X" or "explain X": You MUST explain X first using INFORMATION, then ask ONE question.
 - If user asks about Low/High/Highest: Explain each position clearly using INFORMATION (MY LIST: Low = least favorable but acceptable, High = most favorable, Highest = most ambitious credible position), then ask what they want to type.
 
@@ -1871,7 +1876,7 @@ Minimum Viable AI Interaction:
 - Max 3 clarification questions before generating output
 - Max 3 content variants per response
 - Prefer bullet-ready output over explanation
-- Default response length: ≤150 words
+- Default response length: ≤180 words
 - When user completes positions for a variable: Do NOT repeat or echo back the positions. Scrutinize the inputs using INFORMATION. Challenge if ambition is appropriate, check if spread between Low/High/Highest is sufficient, suggest specific improvements. Provide coaching value, then move forward.
 
 Variable trading rules:
@@ -1888,6 +1893,7 @@ Style:
 - End every turn with ONE focused question that advances the template (unless you've already asked 3 questions, then provide the answer).
 - Show empathy and coaching through dialogue, not scripted questions.
 - After completing a variable: Provide coaching value, then naturally guide to the next step. Do NOT use generic questions like "what variable would you like to add next" - instead, suggest what makes sense based on INFORMATION and the template structure.
+- When user indicates completion or wants strategy help: Transition to providing negotiation strategy, scripts, tactics, or coaching. Do NOT keep asking for more variables. Answer their questions fully and provide actionable guidance.
 """
 def _mnt_default_state_text() -> Dict[str, Any]:
     return {
@@ -2379,7 +2385,7 @@ def _master_llm_text(
     deal_line = "" if deal_value is None else f"DEAL_VALUE: {deal_value}\n"
     name_line = user_name.strip() if user_name else ""
     mem_line = (state_memory or "").strip()
-    
+
     # Build user message with conversation context like /chat
     if conversation_context:
         user_message_base = (
@@ -2392,11 +2398,11 @@ def _master_llm_text(
         )
     else:
         user_message_base = (
-            f"USER_NAME: {name_line}\n"
-            f"ACTIVE_SECTION_ID: {active_section_id}\n"
-            f"FOCUS_FIELD: {focus_field}\n"
-            f"{deal_line}"
-            f"USER_MESSAGE: {user_message}\n\n"
+        f"USER_NAME: {name_line}\n"
+        f"ACTIVE_SECTION_ID: {active_section_id}\n"
+        f"FOCUS_FIELD: {focus_field}\n"
+        f"{deal_line}"
+        f"USER_MESSAGE: {user_message}\n\n"
         )
     
     # Special handling for definition questions
@@ -2415,6 +2421,19 @@ def _master_llm_text(
         else:
             variable_name_handling = "\n\nIMPORTANT: FOCUS_FIELD is variable_name. ONLY provide the variable name to type. Do NOT show Low/High/Highest positions. Do NOT show ranges or examples with positions."
     
+    # Special handling: If user mentions "payment terms" as variable, provide context first
+    payment_terms_context = ""
+    if "payment terms" in user_msg_lower and focus_field and "variable" in focus_field.lower() and not any(word in user_msg_lower for word in ["low", "high", "highest", "position"]):
+        payment_terms_context = "\n\nIMPORTANT: User mentioned payment terms. Before asking for positions, briefly explain that payment terms are usually measured in days with standard terms being 30, 60, 90, or 120 days. It would be advantageous to try for the shortest possible payment terms (e.g., 30 days). Then ask what the current payment terms are in place, or ask for their positions."
+    
+    # Special handling: User provides single position (e.g., "30 days")
+    single_position_handling = ""
+    # Check if user provided a number with unit (days, %, dollars) but not multiple positions
+    if re.search(r"\b\d+\s*(days?|%|percent|dollars?|usd)\b", user_msg_lower):
+        position_count = len(re.findall(r"\b(low|mid|high|highest)\b", user_msg_lower))
+        if position_count == 0:  # Single position without label
+            single_position_handling = "\n\nIMPORTANT: User provided a single position value. Acknowledge it, then provide guidance on how to adjust or what to consider for the other positions. Use INFORMATION to suggest appropriate ranges or adjustments. Do NOT just ask for the next position - provide coaching value first."
+    
     # Special handling: Detect when all positions are provided at once
     all_positions_handling = ""
     if re.search(r"\b(low|mid|high|highest)\b", user_msg_lower):
@@ -2422,29 +2441,63 @@ def _master_llm_text(
         position_matches = re.findall(r"\b(low|mid|high|highest)\b", user_msg_lower)
         unique_positions = set(position_matches)
         if len(unique_positions) >= 3:  # All three positions mentioned (low, mid/high, highest)
-            all_positions_handling = "\n\nIMPORTANT: User provided all positions at once. Do NOT repeat or echo back the positions. Instead, use INFORMATION to scrutinize and challenge directly: Is ambition appropriate? Is the spread sufficient? Could they be more ambitious? Suggest specific improvements using INFORMATION. Provide coaching value, then confirm the variable is complete and ask for the next variable."
+            all_positions_handling = "\n\nIMPORTANT: User provided all positions at once. Do NOT repeat or echo back the positions. Instead, use INFORMATION to scrutinize and challenge directly: Is ambition appropriate? Is the spread sufficient? Could they be more ambitious? For payment terms: Challenge if they could try shorter terms (e.g., 'Could you be more ambitious with your high point? Why not try 14 days? Especially if it is a new customer.'). Also ask about the other party's perspective: 'Where do you feel the other party will be looking to lock down payment terms? Think from the other party's perspective their low, mid and high (worst for you, best for them) position?' Provide coaching value, then confirm the variable is complete and ask for the next variable."
     
     # Special handling for business/coaching questions (not template filling)
     business_question_handling = ""
-    if any(phrase in user_msg_lower for phrase in ["what about", "how can i prepare", "should i", "can i", "is it", "will they"]):
-        business_question_handling = "\n\nIMPORTANT: User is asking a business/coaching question. Answer it fully using INFORMATION first. Provide coaching, suggestions, and guidance. Only after answering should you return to template filling. Do NOT redirect to variable selection."
+    if any(phrase in user_msg_lower for phrase in ["what about", "how can i prepare", "should i", "can i", "is it", "will they", "pay up front", "part pay", "upfront payment"]):
+        business_question_handling = "\n\nIMPORTANT: User is asking a business/coaching question. Acknowledge their thinking first, then answer it fully using INFORMATION. Provide coaching, suggestions, and guidance using INFORMATION dynamically. Do NOT redirect to template filling or variable selection unless the user explicitly asks to add variables or continue filling the template. Answer their question completely and let them decide the next step."
     
     # Special handling for tricky behaviors question
     tricky_behaviors_handling = ""
-    if any(phrase in user_msg_lower for phrase in ["tricky", "difficult", "prepare for", "behaviours", "behaviors", "questions"]):
-        tricky_behaviors_handling = "\n\nIMPORTANT: User is asking about preparing for tricky behaviors/questions. Use INFORMATION to offer shortcuts/options conversationally. Present options from INFORMATION dynamically. Do NOT just ask what scenarios they foresee - provide helpful options from INFORMATION first."
+    if any(phrase in user_msg_lower for phrase in ["tricky", "difficult", "prepare for", "behaviours", "behaviors", "questions", "individual is tricky"]):
+        tricky_behaviors_handling = "\n\nIMPORTANT: User is asking about preparing for tricky behaviors/questions. Provide shortcuts/options: a) Work on developing a confident mindset, b) Tell me more about the relationship (look for COAL, GRAPHITE, DIAMOND responses), c) Show a model to help approach this confidently. Present these options conversationally, then allow user to respond. Do NOT just ask what scenarios they foresee - provide helpful options first."
     
     # Special handling for initial help acceptance
     initial_help_handling = ""
     if not active_section_id or active_section_id.strip() == "":
         if "yes" in user_msg_lower or user_message.strip().lower() in ["yes", "y", "ok", "okay", "sure"]:
             initial_help_handling = "\n\nIMPORTANT: User just accepted help and no active_section_id is set. Guide them to start with their first variable in MY LIST. Say 'Let's start with your first variable. What variable would you like to add to MY LIST?' Do NOT jump to other sections."
+    
+    # Special handling for completion signals - user wants to move to strategy/coaching
+    completion_handling = ""
+    completion_signals = [
+        "i've given you all", "i've given all", "no more variables", "there are no more variables",
+        "help me with negotiations", "help me with the negotiations", "what to do now", "give me a result",
+        "stop asking for more variables", "stop asking", "i don't want to add more",
+        "i've already written", "i already wrote", "i already chose", "i already added",
+        "let's focus on their list", "focus on their list", "their list", "their side"
+    ]
+    if any(signal in user_msg_lower for signal in completion_signals):
+        completion_handling = "\n\nCRITICAL: User has indicated they've completed variables or want to move to strategy/coaching. Do NOT ask for more variables. Instead, provide negotiation strategy, coaching, scripts, or guidance based on what they've already provided. Use INFORMATION to help with negotiation tactics, opening statements, trade scripts, or next steps. Only return to template filling if the user explicitly asks to add more variables."
+    
+    # Special handling for strategy/coaching requests
+    strategy_handling = ""
+    strategy_signals = [
+        "what to do now", "help me", "tell me what to do", "give me strategy", "give me a strategy",
+        "help me with negotiations", "what should i say", "how do i negotiate", "counter their offer"
+    ]
+    if any(signal in user_msg_lower for signal in strategy_signals):
+        strategy_handling = "\n\nIMPORTANT: User is asking for strategy/coaching help. Provide comprehensive negotiation guidance, scripts, tactics, or next steps using INFORMATION. When user mentions specific positions or conflicts, look at ALL their variables if available, challenge prioritization dynamically, and suggest tactical approaches using INFORMATION. Do NOT redirect to variable collection. Answer their question fully."
+    
+    # Special handling for conflict detection (e.g., "30 days - they will want 120 days")
+    conflict_handling = ""
+    # Detect patterns like "X - they will want Y" or "X vs Y" or "they want X"
+    if re.search(r"\d+\s*(days?|%|dollars?)\s*[-–—]\s*they", user_msg_lower) or re.search(r"they\s+(will\s+)?want", user_msg_lower) or " vs " in user_msg_lower or re.search(r"\d+\s*(days?|%|dollars?)\s*[-–—]\s*they\s+will\s+want", user_msg_lower):
+        conflict_handling = "\n\nCRITICAL: User is describing a conflict or position mismatch (e.g., their position vs what the other party wants). This is a STRATEGY question, not a template filling question. Provide comprehensive negotiation strategy: Look at ALL their variables if available, challenge prioritization, suggest holding with their position but offering concession on a less important variable. Use INFORMATION to provide tactical guidance and scripts. Do NOT treat this as adding a new variable position. Do NOT ask for High/Highest positions or redirect to template filling. Provide the strategy answer completely and let them decide next steps."
+    
+    # Special handling for frustration/concern (show empathy first) - dynamic detection
+    empathy_handling = ""
+    # Detect frustration/concern through context, not just keywords
+    frustration_indicators = ["frustrat", "concern", "worry", "difficult", "challeng", "problem", "issue", "trouble", "ensure", "fair", "wait", "clock"]
+    if any(indicator in user_msg_lower for indicator in frustration_indicators) or any(word in user_msg_lower for word in ["make me", "will make", "want to ensure", "need to ensure"]):
+        empathy_handling = "\n\nCRITICAL: User is expressing frustration, concern, or difficulty. Show empathy first by acknowledging their feeling (e.g., 'That can be frustrating' or 'I understand your concern'), then provide guidance using INFORMATION on how to deal with the specific situation they mentioned. Do NOT redirect to adding variables or template filling. Answer their question directly and provide actionable guidance. Only return to template filling if the user explicitly asks to add variables."
 
     prompt_user = (
         f"{user_message_base}"
         f"STATE_MEMORY:\n{mem_line}\n\n"
         f"INFORMATION:\n{info}\n\n"
-        f"TASK: Give Diadem-only, template-ready guidance for the MASTER template.{initial_help_handling}{definition_handling}{variable_name_handling}{all_positions_handling}{business_question_handling}{tricky_behaviors_handling}\n"
+        f"TASK: Give Diadem-only, template-ready guidance for the MASTER template.{initial_help_handling}{definition_handling}{variable_name_handling}{payment_terms_context}{single_position_handling}{all_positions_handling}{business_question_handling}{tricky_behaviors_handling}{completion_handling}{strategy_handling}{conflict_handling}{empathy_handling}\n"
         f"If FOCUS_FIELD is set: tell the user exactly what to type there and give 1–2 paste-ready lines.\n"
         f"If user asks what variables: Use INFORMATION to suggest relevant variables conversationally, then ask which one they'd like to add. Do NOT show Low/High/Highest positions.\n"
         f"Do NOT refuse. If INFORMATION is thin, still give best-effort Diadem guidance."
@@ -2480,7 +2533,7 @@ def _master_llm_text(
                 "- Then I’ll give you exact template wording."
             )
 
-    return _truncate_words(text, 150)  # 150 words per Journey doc
+    return _truncate_words(text, 180)  # 180 words per Journey doc
 
 
 
@@ -2635,21 +2688,21 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
     phase, next_phase_q = "", ""
     if not skip_phase_guidance:
         phase, next_phase_q = _mnt_next_phase_question(st, st.get("active_section_id") or "", st.get("focus_field") or "")
-        if phase:
-            st["phase"] = phase
-        # auto-advance the phase question index when the user answered the last asked phase question
-        pending = _safe_str(st.get("pending_phase_question"))
-        if pending and _safe_str(st.get("last_question")) == pending and _mnt_should_advance_phase(st, user_message):
-            # move to next question within the same phase
-            cur = st.get("phase") or phase
-            if cur in _PHASE_QUESTIONS:
-                _mnt_set_phase_idx(st, cur, _mnt_get_phase_idx(st, cur) + 1)
-            # refresh next question after advancing
-            phase, next_phase_q = _mnt_next_phase_question(st, st.get("active_section_id") or "", st.get("focus_field") or "")
-        if next_phase_q:
-            st["pending_phase_question"] = next_phase_q
-        else:
-            st["pending_phase_question"] = ""
+    if phase:
+        st["phase"] = phase
+    # auto-advance the phase question index when the user answered the last asked phase question
+    pending = _safe_str(st.get("pending_phase_question"))
+    if pending and _safe_str(st.get("last_question")) == pending and _mnt_should_advance_phase(st, user_message):
+        # move to next question within the same phase
+        cur = st.get("phase") or phase
+        if cur in _PHASE_QUESTIONS:
+            _mnt_set_phase_idx(st, cur, _mnt_get_phase_idx(st, cur) + 1)
+        # refresh next question after advancing
+        phase, next_phase_q = _mnt_next_phase_question(st, st.get("active_section_id") or "", st.get("focus_field") or "")
+    if next_phase_q:
+        st["pending_phase_question"] = next_phase_q
+    else:
+        st["pending_phase_question"] = ""
 
 
 
@@ -2672,7 +2725,7 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
 
     # Build conversation context like /chat
     conversation_context = _mnt_build_conversation_context(st)
-    
+
     # Build state memory text for the LLM (answers + template snapshot + MASTER phase guidance)
     phase_label = _PHASE_LABEL.get(st.get("phase") or "", "")
     phase_block = ""
@@ -2858,18 +2911,18 @@ def master_template_sse(payload: Dict = Body(...)):
             phase, next_phase_q = "", ""
             if not skip_phase_guidance:
                 phase, next_phase_q = _mnt_next_phase_question(st, active_section_id_sse, st.get("focus_field") or "")
-                if phase:
-                    st["phase"] = phase
-                pending = _safe_str(st.get("pending_phase_question"))
-                if pending and _safe_str(st.get("last_question")) == pending and _mnt_should_advance_phase(st, user_message):
-                    cur = st.get("phase") or phase
-                    if cur in _PHASE_QUESTIONS:
-                        _mnt_set_phase_idx(st, cur, _mnt_get_phase_idx(st, cur) + 1)
+            if phase:
+                st["phase"] = phase
+            pending = _safe_str(st.get("pending_phase_question"))
+            if pending and _safe_str(st.get("last_question")) == pending and _mnt_should_advance_phase(st, user_message):
+                cur = st.get("phase") or phase
+                if cur in _PHASE_QUESTIONS:
+                    _mnt_set_phase_idx(st, cur, _mnt_get_phase_idx(st, cur) + 1)
                     phase, next_phase_q = _mnt_next_phase_question(st, active_section_id_sse, st.get("focus_field") or "")
-                if next_phase_q:
-                    st["pending_phase_question"] = next_phase_q
-                else:
-                    st["pending_phase_question"] = ""
+            if next_phase_q:
+                st["pending_phase_question"] = next_phase_q
+            else:
+                st["pending_phase_question"] = ""
 
             phase_label = _PHASE_LABEL.get(st.get("phase") or "", "")
             phase_block = ""
@@ -2903,6 +2956,19 @@ def master_template_sse(payload: Dict = Body(...)):
                 else:
                     variable_name_handling = "\n\nIMPORTANT: FOCUS_FIELD is variable_name. ONLY provide the variable name to type. Do NOT show Low/High/Highest positions. Do NOT show ranges or examples with positions."
             
+            # Special handling: If user mentions "payment terms" as variable, provide context first
+            payment_terms_context = ""
+            if "payment terms" in user_msg_lower and focus_field_sse and "variable" in focus_field_sse.lower() and not any(word in user_msg_lower for word in ["low", "high", "highest", "position"]):
+                payment_terms_context = "\n\nIMPORTANT: User mentioned payment terms. Before asking for positions, briefly explain that payment terms are usually measured in days with standard terms being 30, 60, 90, or 120 days. It would be advantageous to try for the shortest possible payment terms (e.g., 30 days). Then ask what the current payment terms are in place, or ask for their positions."
+            
+            # Special handling: User provides single position (e.g., "30 days")
+            single_position_handling = ""
+            # Check if user provided a number with unit (days, %, dollars) but not multiple positions
+            if re.search(r"\b\d+\s*(days?|%|percent|dollars?|usd)\b", user_msg_lower):
+                position_count = len(re.findall(r"\b(low|mid|high|highest)\b", user_msg_lower))
+                if position_count == 0:  # Single position without label
+                    single_position_handling = "\n\nIMPORTANT: User provided a single position value. Acknowledge it, then provide guidance on how to adjust or what to consider for the other positions. Use INFORMATION to suggest appropriate ranges or adjustments. Do NOT just ask for the next position - provide coaching value first."
+            
             # Special handling: Detect when all positions are provided at once
             all_positions_handling = ""
             if re.search(r"\b(low|mid|high|highest)\b", user_msg_lower):
@@ -2910,28 +2976,62 @@ def master_template_sse(payload: Dict = Body(...)):
                 position_matches = re.findall(r"\b(low|mid|high|highest)\b", user_msg_lower)
                 unique_positions = set(position_matches)
                 if len(unique_positions) >= 3:  # All three positions mentioned (low, mid/high, highest)
-                    all_positions_handling = "\n\nIMPORTANT: User provided all positions at once. Do NOT repeat or echo back the positions. Instead, use INFORMATION to scrutinize and challenge directly: Is ambition appropriate? Is the spread sufficient? Could they be more ambitious? Suggest specific improvements using INFORMATION. Provide coaching value, then confirm the variable is complete and ask for the next variable."
+                    all_positions_handling = "\n\nIMPORTANT: User provided all positions at once. Do NOT repeat or echo back the positions. Instead, use INFORMATION to scrutinize and challenge directly: Is ambition appropriate? Is the spread sufficient? Could they be more ambitious? For payment terms: Challenge if they could try shorter terms (e.g., 'Could you be more ambitious with your high point? Why not try 14 days? Especially if it is a new customer.'). Also ask about the other party's perspective: 'Where do you feel the other party will be looking to lock down payment terms? Think from the other party's perspective their low, mid and high (worst for you, best for them) position?' Provide coaching value, then confirm the variable is complete and ask for the next variable."
             
             # Special handling for business/coaching questions (not template filling)
             business_question_handling = ""
-            if any(phrase in user_msg_lower for phrase in ["what about", "how can i prepare", "should i", "can i", "is it", "will they"]):
-                business_question_handling = "\n\nIMPORTANT: User is asking a business/coaching question. Answer it fully using INFORMATION first. Provide coaching, suggestions, and guidance. Only after answering should you return to template filling. Do NOT redirect to variable selection."
+            if any(phrase in user_msg_lower for phrase in ["what about", "how can i prepare", "should i", "can i", "is it", "will they", "pay up front", "part pay", "upfront payment"]):
+                business_question_handling = "\n\nIMPORTANT: User is asking a business/coaching question. Acknowledge their thinking first, then answer it fully using INFORMATION. Provide coaching, suggestions, and guidance using INFORMATION dynamically. Do NOT redirect to template filling or variable selection unless the user explicitly asks to add variables or continue filling the template. Answer their question completely and let them decide the next step."
             
             # Special handling for tricky behaviors question
             tricky_behaviors_handling = ""
-            if any(phrase in user_msg_lower for phrase in ["tricky", "difficult", "prepare for", "behaviours", "behaviors", "questions"]):
-                tricky_behaviors_handling = "\n\nIMPORTANT: User is asking about preparing for tricky behaviors/questions. Use INFORMATION to offer shortcuts/options conversationally. Present options from INFORMATION dynamically. Do NOT just ask what scenarios they foresee - provide helpful options from INFORMATION first."
+            if any(phrase in user_msg_lower for phrase in ["tricky", "difficult", "prepare for", "behaviours", "behaviors", "questions", "individual is tricky"]):
+                tricky_behaviors_handling = "\n\nIMPORTANT: User is asking about preparing for tricky behaviors/questions. Use INFORMATION to provide helpful shortcuts/options dynamically. Present options conversationally (e.g., mindset work, relationship context, models), then allow user to respond. Do NOT just ask what scenarios they foresee - provide helpful options from INFORMATION first."
             
             # Special handling for initial help acceptance
             initial_help_handling = ""
             if not active_section_id_sse or active_section_id_sse.strip() == "":
                 if "yes" in user_msg_lower or user_message.strip().lower() in ["yes", "y", "ok", "okay", "sure"]:
                     initial_help_handling = "\n\nIMPORTANT: User just accepted help and no active_section_id is set. Guide them to start with their first variable in MY LIST. Say 'Let's start with your first variable. What variable would you like to add to MY LIST?' Do NOT jump to other sections."
+            
+            # Special handling for completion signals - user wants to move to strategy/coaching
+            completion_handling = ""
+            completion_signals = [
+                "i've given you all", "i've given all", "no more variables", "there are no more variables",
+                "help me with negotiations", "help me with the negotiations", "what to do now", "give me a result",
+                "stop asking for more variables", "stop asking", "i don't want to add more",
+                "i've already written", "i already wrote", "i already chose", "i already added",
+                "let's focus on their list", "focus on their list", "their list", "their side"
+            ]
+            if any(signal in user_msg_lower for signal in completion_signals):
+                completion_handling = "\n\nCRITICAL: User has indicated they've completed variables or want to move to strategy/coaching. Do NOT ask for more variables. Instead, provide negotiation strategy, coaching, scripts, or guidance based on what they've already provided. Use INFORMATION to help with negotiation tactics, opening statements, trade scripts, or next steps. Only return to template filling if the user explicitly asks to add more variables."
+            
+            # Special handling for strategy/coaching requests
+            strategy_handling = ""
+            strategy_signals = [
+                "what to do now", "help me", "tell me what to do", "give me strategy", "give me a strategy",
+                "help me with negotiations", "what should i say", "how do i negotiate", "counter their offer"
+            ]
+            if any(signal in user_msg_lower for signal in strategy_signals):
+                strategy_handling = "\n\nIMPORTANT: User is asking for strategy/coaching help. Provide comprehensive negotiation guidance, scripts, tactics, or next steps using INFORMATION. When user mentions specific positions or conflicts, look at ALL their variables if available, challenge prioritization dynamically, and suggest tactical approaches using INFORMATION. Do NOT redirect to variable collection. Answer their question fully."
+            
+            # Special handling for conflict detection (e.g., "30 days - they will want 120 days")
+            conflict_handling = ""
+            # Detect patterns like "X - they will want Y" or "X vs Y" or "they want X"
+            if re.search(r"\d+\s*(days?|%|dollars?)\s*[-–—]\s*they", user_msg_lower) or re.search(r"they\s+(will\s+)?want", user_msg_lower) or " vs " in user_msg_lower or re.search(r"\d+\s*(days?|%|dollars?)\s*[-–—]\s*they\s+will\s+want", user_msg_lower):
+                conflict_handling = "\n\nCRITICAL: User is describing a conflict or position mismatch (e.g., their position vs what the other party wants). This is a STRATEGY question, not a template filling question. Provide comprehensive negotiation strategy: Look at ALL their variables if available, challenge prioritization, suggest holding with their position but offering concession on a less important variable. Use INFORMATION to provide tactical guidance and scripts. Do NOT treat this as adding a new variable position. Do NOT ask for High/Highest positions or redirect to template filling. Provide the strategy answer completely and let them decide next steps."
+            
+            # Special handling for frustration/concern (show empathy first) - dynamic detection
+            empathy_handling = ""
+            # Detect frustration/concern through context, not just keywords
+            frustration_indicators = ["frustrat", "concern", "worry", "difficult", "challeng", "problem", "issue", "trouble", "ensure", "fair", "wait", "clock"]
+            if any(indicator in user_msg_lower for indicator in frustration_indicators) or any(word in user_msg_lower for word in ["make me", "will make", "want to ensure", "need to ensure"]):
+                empathy_handling = "\n\nCRITICAL: User is expressing frustration, concern, or difficulty. Show empathy first by acknowledging their feeling (e.g., 'That can be frustrating' or 'I understand your concern'), then provide guidance using INFORMATION on how to deal with the specific situation they mentioned. Do NOT redirect to adding variables or template filling. Answer their question directly and provide actionable guidance. Only return to template filling if the user explicitly asks to add variables."
 
             # Build user message with conversation context like /chat
             if conversation_context:
                 user_message_base = (
-                    f"USER_NAME: {name_line}\n"
+                f"USER_NAME: {name_line}\n"
                     f"ACTIVE_SECTION_ID: {active_section_id_sse}\n"
                     f"FOCUS_FIELD: {focus_field_sse}\n"
                     f"{deal_line}"
@@ -2943,8 +3043,8 @@ def master_template_sse(payload: Dict = Body(...)):
                     f"USER_NAME: {name_line}\n"
                     f"ACTIVE_SECTION_ID: {active_section_id_sse}\n"
                     f"FOCUS_FIELD: {focus_field_sse}\n"
-                    f"{deal_line}"
-                    f"USER_MESSAGE: {user_message}\n\n"
+                f"{deal_line}"
+                f"USER_MESSAGE: {user_message}\n\n"
                 )
 
             # Define clarify_note (empty for now, can be used for future clarification logic)
@@ -2954,7 +3054,7 @@ def master_template_sse(payload: Dict = Body(...)):
                 f"{user_message_base}"
                 f"STATE_MEMORY:\n{state_mem}\n\n"
                 f"INFORMATION:\n{info}\n\n"
-                f"TASK: Give Diadem-only, template-ready guidance for the MASTER template.{initial_help_handling}{definition_handling}{variable_name_handling}{all_positions_handling}{business_question_handling}{tricky_behaviors_handling}\n"
+                f"TASK: Give Diadem-only, template-ready guidance for the MASTER template.{initial_help_handling}{definition_handling}{variable_name_handling}{payment_terms_context}{single_position_handling}{all_positions_handling}{business_question_handling}{tricky_behaviors_handling}{completion_handling}{strategy_handling}{conflict_handling}{empathy_handling}\n"
                 f"If FOCUS_FIELD is set: tell the user exactly what to type there and give 1–2 paste-ready lines.\n"
                 f"If user asks what variables: Use INFORMATION to suggest relevant variables conversationally, then ask which one they'd like to add. Do NOT show Low/High/Highest positions.\n"
                 f"Do NOT refuse. If INFORMATION is thin, still give best-effort Diadem guidance.{clarify_note}"
@@ -2993,8 +3093,8 @@ def master_template_sse(payload: Dict = Body(...)):
                         "- Then I'll give you exact template wording."
                     )
             
-            # Truncate to 150 words per Journey doc
-            full_text = _truncate_words(full_text, 150)
+            # Truncate to 180 words per Journey doc
+            full_text = _truncate_words(full_text, 180)
             
             # Add empathy/opener like /chat (but for SSE, we need to prepend to first chunk or handle differently)
             # Since we've already streamed, we'll apply opener logic to the saved text for next turn
