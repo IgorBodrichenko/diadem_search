@@ -520,51 +520,6 @@ def _rewrite_bad_opening(full_text: str, opener: str) -> str:
 # =========================
 # CHAT CONVERSATION HISTORY
 # =========================
-def _get_chat_history(session_id: str, max_turns: int = 4) -> List[Dict[str, str]]:
-    """Get recent conversation history from session for /chat endpoint."""
-    entry = _db_get(session_id) or {}
-    history = entry.get("chat_history", [])
-    if not isinstance(history, list):
-        history = []
-    # Return last N turns (each turn has user query + assistant answer)
-    return history[-max_turns:] if history else []
-
-def _save_chat_history(session_id: str, query: str, answer: str) -> None:
-    """Save query and answer to conversation history for /chat endpoint."""
-    entry = _db_get(session_id) or {}
-    history = entry.get("chat_history", [])
-    if not isinstance(history, list):
-        history = []
-    
-    # Add new turn
-    history.append({
-        "user": query,
-        "assistant": answer
-    })
-    
-    # Keep only last 10 turns to avoid growing too large
-    if len(history) > 10:
-        history = history[-10:]
-    
-    entry["chat_history"] = history
-    _db_set(session_id, entry)
-
-def _build_conversation_context(history: List[Dict[str, str]]) -> str:
-    """Build conversation context string from history."""
-    if not history:
-        return ""
-    
-    parts = []
-    for turn in history:
-        user_msg = turn.get("user", "").strip()
-        assistant_msg = turn.get("assistant", "").strip()
-        if user_msg:
-            parts.append(f"User: {user_msg}")
-        if assistant_msg:
-            parts.append(f"Assistant: {assistant_msg}")
-    
-    return "\n".join(parts)
-
 def _expand_query_with_context(query: str, history: List[Dict[str, str]]) -> str:
     """Expand short queries using conversation context for better retrieval."""
     query_lower = query.lower().strip()
@@ -981,8 +936,15 @@ def is_context_relevant(query: str, matches: List[Dict]) -> bool:
     tt = _tokenize(text)
     overlap = sum(1.0 for t in tt if t in qt)
 
-    ctx = build_context(matches)
-    ctx_len = len(ctx.strip())
+    # Calculate approximate context length without building full context (more efficient)
+    # Estimate: sum of text lengths from matches (with separator overhead)
+    ctx_len = 0
+    for m in matches:
+        md = m.get("metadata") or {}
+        txt = (md.get("text") or "").strip()
+        if txt:
+            ctx_len += len(txt)
+            ctx_len += 5  # approximate separator overhead ("\n---\n")
     
     # High semantic match: trust Pinecone's judgment even if context is short (handles titles/short chunks)
     if semantic_score >= 0.4:
@@ -1152,7 +1114,7 @@ def _make_final_user_message(mode: str, state: Dict[str, Any], info: str, user_n
 
 VARIABLES_POLICY = (
     "\nTemplate Variables rules:\n"
-    "- A Variable is a user-defined negotiation lever (e.g., price, term, volume, timing, scope, risk, concessions).\n"
+    "- A Variable is a user-defined negotiation lever that can be traded or negotiated.\n"
     "- Variables exist only inside a specific template section; they are contextual, not global.\n"
     "- The user creates and edits Variables at all times.\n"
     "- You may suggest example Variables to consider.\n"
@@ -1212,7 +1174,7 @@ SYSTEM_PROMPT_QA = (
 
     "Position Definitions (use ONLY when user mentions Low/High/Highest):\n"
     "MY LIST: Low = least favorable but acceptable, High = most favorable, Highest = most ambitious credible position.\n"
-    "Favorable depends on variable: Payment terms (shorter = High, longer = Low), Price (higher = High, lower = Low).\n"
+    "Favorable depends on variable type: For payment terms (shorter = High, longer = Low), for price (higher = High, lower = Low).\n"
     "When validating: Challenge ambition, check spread, ask about other party's perspective.\n\n"
 
     "Response style:\n"
@@ -1688,95 +1650,31 @@ def chat(payload: Dict = Body(...)):
         return JSONResponse({"answer": "", "session_id": session_id})
 
     if _is_smalltalk(query):
-        answer = _smalltalk_reply(user_name)
-        _save_chat_history(session_id, query, answer)
-        return {"answer": answer, "session_id": session_id}
+        return {"answer": _smalltalk_reply(user_name), "session_id": session_id}
 
-    # Get conversation history
-    history = _get_chat_history(session_id)
-    
-    # Expand query if it's short and we have context
-    expanded_query = _expand_query_with_context(query, history)
-    
-    # Use expanded query for retrieval
-    matches = get_matches(expanded_query, top_k, request_id=request_id)
+    matches = get_matches(query, top_k, request_id=request_id)
     context = build_context(matches, request_id=request_id) if matches else ""
 
-    # Fetch template state if template_id is provided (helps bot understand current template state)
-    template_id = (payload.get("template_id") or payload.get("templateId") or payload.get("template") or "").strip()
-    template_state = ""
-    if template_id:
-        template_state = _fetch_template_state_text(template_id, request_id=request_id)
-        if template_state:
-            context = f"{context}\n\n{template_state}" if context else template_state
-
-    # Build conversation context string
-    conversation_context = _build_conversation_context(history)
-    
-    # Build user message with conversation history
-    if conversation_context:
-        user_message_base = (
-            f"USER_NAME:\n{user_name}\n\n"
-            f"PREVIOUS_CONVERSATION:\n{conversation_context}\n\n"
-            f"CURRENT_USER_MESSAGE:\n{query}\n\n"
-        )
-    else:
-        user_message_base = (
-            f"USER_NAME:\n{user_name}\n\n"
-            f"USER_MESSAGE:\n{query}\n\n"
-        )
-
-    if not matches and not template_state:
-        user = user_message_base + f"INFORMATION:\n"
-        system_prompt = (
-            SYSTEM_PROMPT_EXPLAIN
-            if is_explanatory_question(query)
-            else SYSTEM_PROMPT_QA
-        )
-
-        resp = openai.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.2,
-        )
-        answer = strip_markdown_chars((resp.choices[0].message.content or "").strip())
-        # IMPORTANT: if we are refusing, do not add openers.
-        if answer:
-            opener = _pick_opener(session_id, user_name, "qa_last_opener")
-            answer = _rewrite_bad_opening(answer, opener)
-        
-        # Save to history
-        _save_chat_history(session_id, query, answer)
-        return {"answer": answer, "session_id": session_id}
-
-    user = user_message_base + f"INFORMATION:\n{context}"
+    user = (
+        f"USER_NAME:\n{user_name}\n\n"
+        f"QUESTION:\n{query}\n\n"
+        f"INFORMATION:\n{context}"
+    )
 
     resp = openai.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT_QA,
-            },
-            {
-                "role": "user",
-                "content": user,
-            },
+            {"role": "system", "content": SYSTEM_PROMPT_CHAT},
+            {"role": "user", "content": user},
         ],
         temperature=0.2,
     )
 
     answer = strip_markdown_chars((resp.choices[0].message.content or "").strip())
-    if answer.strip() != "I can't find this in the provided documents.":
+    if answer:
         opener = _pick_opener(session_id, user_name, "qa_last_opener")
         answer = _rewrite_bad_opening(answer, opener)
 
-    # Save to history
-    _save_chat_history(session_id, query, answer)
-    
     return {"answer": answer, "session_id": session_id}
 
 
@@ -1790,91 +1688,39 @@ def chat_sse(payload: Dict = Body(...)):
     top_k = int(payload.get("top_k") or TOP_K)
     user_name = _extract_user_name(payload)
 
-    # Get conversation history
-    history = _get_chat_history(session_id)
-    
-    # Expand query if it's short and we have context
-    expanded_query = _expand_query_with_context(query, history)
-    
-    # Fetch template state if template_id is provided
-    template_id = (payload.get("template_id") or payload.get("templateId") or payload.get("template") or "").strip()
-    template_state = ""
-    if template_id:
-        template_state = _fetch_template_state_text(template_id, request_id=request_id)
-    
-    # Build conversation context string
-    conversation_context = _build_conversation_context(history)
-
     def gen():
         start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
         yield f"event: start\ndata: {start_payload}\n\n"
 
-        # Smalltalk: single chunk
+        # Smalltalk / empty
         if not query:
             chunks = [""]
-            answer = ""
         elif _is_smalltalk(query):
-            answer = _smalltalk_reply(user_name)
-            chunks = [answer]
-            _save_chat_history(session_id, query, answer)
-            # Emit chunks for smalltalk
-            for part in chunks:
-                part = strip_markdown_chars(part)
-                data = json.dumps({"text": part}, ensure_ascii=False)
-                yield f"event: chunk\ndata: {data}\n\n"
+            chunks = [_smalltalk_reply(user_name)]
         else:
-            # Use expanded query for retrieval
-            matches = get_matches(expanded_query, top_k, request_id=request_id)
+            matches = get_matches(query, top_k, request_id=request_id)
             context = build_context(matches, request_id=request_id) if matches else ""
-            
-            # Add template state to context if available
-            if template_state:
-                context = f"{context}\n\n{template_state}" if context else template_state
 
-            # Build user message with conversation history
-            if conversation_context:
-                user_message_base = (
-                    f"USER_NAME:\n{user_name}\n\n"
-                    f"PREVIOUS_CONVERSATION:\n{conversation_context}\n\n"
-                    f"CURRENT_USER_MESSAGE:\n{query}\n\n"
-                )
-            else:
-                user_message_base = (
-                    f"USER_NAME:\n{user_name}\n\n"
-                    f"USER_MESSAGE:\n{query}\n\n"
-                )
+            user = (
+                f"USER_NAME:\n{user_name}\n\n"
+                f"QUESTION:\n{query}\n\n"
+                f"INFORMATION:\n{context}"
+            )
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT_CHAT},
+                {"role": "user", "content": user},
+            ]
 
-            if not matches and not template_state:
-                user = user_message_base + f"INFORMATION:\n"
-                messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT_CHAT},
-                    {"role": "user", "content": user},
-                ]
-            else:
-                user = user_message_base + f"INFORMATION:\n{context}"
-                messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT_QA},
-                    {"role": "user", "content": user},
-                ]
+            chunks = _iter_text_as_sse_chunks(
+                _openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2),
+                min_chars=28,
+            )
 
-            # Stream from OpenAI and collect full answer
-            answer_parts = []
-            text_iter = _openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2)
-            chunks = _iter_text_as_sse_chunks(text_iter, min_chars=28)
-            
-            # Collect chunks and yield them
-            for chunk in chunks:
-                answer_parts.append(chunk)
-                part = strip_markdown_chars(chunk)
-                data = json.dumps({"text": part}, ensure_ascii=False)
-                yield f"event: chunk\ndata: {data}\n\n"
-            
-            answer = "".join(answer_parts).strip() if answer_parts else ""
-            
-            # Save to history after streaming
-            if query and answer:
-                answer_clean = strip_markdown_chars(answer)
-                _save_chat_history(session_id, query, answer_clean)
+        # Emit chunks
+        for part in chunks:
+            part = strip_markdown_chars(part)
+            data = json.dumps({"text": part}, ensure_ascii=False)
+            yield f"event: chunk\ndata: {data}\n\n"
 
         done_payload = json.dumps({"done": True}, ensure_ascii=False)
         yield f"event: done\ndata: {done_payload}\n\n"
@@ -1967,37 +1813,81 @@ You help the user fill the MASTER negotiation template using Diadem language.
 Primary source: Master Negotiator Slides. Use INFORMATION. Do not invent.
 
 Core behaviour:
-- You are a live negotiation coach, not a teacher.
+- You are a live negotiation coach, providing dialogue and coaching through conversation.
 - Your job is to help the user WRITE the next field in their template, then move forward.
 - Work on ONE section/field at a time (active_section_id / focus_field).
-- Ask only ONE focused question per turn (unless the user asked a direct definition — then answer + ask one question).
 - Remember what the user already said in this session and build on it (do not re-ask answered questions).
-- If the user asks a business question related to negotiation, answer it using INFORMATION and their saved answers, then return to the current field.
+- If the user asks a business question related to negotiation (e.g., "what about X?", "how can I prepare for Y?", "should I do Z?"), you MUST answer it fully using INFORMATION first. Provide coaching, suggestions, and guidance. Only after answering should you return to the current field. Do NOT redirect business questions to variable selection.
+- Provide dialogue and coaching, not just questions. After 3 clarification questions, you MUST generate a paste-ready answer even if information is incomplete.
+- When user first accepts help and no active_section_id is set or active_section_id is empty: Guide them to start with their first variable in MY LIST. Say "Let's start with your first variable. What variable would you like to add to MY LIST?" Do NOT jump to other sections like confidence or goals.
 
-Hard rules:
-- Use INFORMATION only. If INFORMATION is insufficient, say so briefly and ask ONE precise question that would let you retrieve/answer.
+CRITICAL RULES (from Journey doc + /chat):
+- Max 3 clarification questions before generating output. After 3 questions, you MUST provide a paste-ready answer.
+- Use ONLY INFORMATION. If INFORMATION has methodology guidance (standards, ranges, best practices, lists, tables, or any structured content), you MUST use it - do NOT ask generic questions instead.
+- When INFORMATION contains lists, bullet points, or structured content that answers the question, you MUST present that content in your response (in a conversational way, not as a list).
+- When user asks about variables for MY LIST: Use INFORMATION to provide helpful variable suggestions conversationally, then ask which one they want to start with. Do NOT just ask "what variable" without providing helpful context from INFORMATION.
+- Do NOT repeat or paraphrase the user's question - answer directly.
+- Do NOT simply echo back what the user just said. Instead, provide coaching, challenge their thinking, suggest improvements, or guide them forward using INFORMATION.
+- Start with empathy or acknowledgment if appropriate, but get straight to the answer.
+- Do NOT give generic negotiation advice outside the methodology.
 - Never output the sentence: "I can only help with questions related to the provided materials."
 - Never dump a full framework list.
 - Never dump all preparation steps at once.
 - Never reset or restart the flow unless the user explicitly asks to restart.
 - Never insert mid-session greetings.
-- Always build directly on the user’s last choice, number, or statement.
+- Always build directly on the user's last choice, number, or statement.
 - If the user selects A/B/C, continue developing that exact path.
-- Never re-list generic preparation steps after a decision has been made.
 - Do not repeat similar bullet lists across turns.
-- Do not ignore the user’s actual question.
+- Do not ignore the user's actual question.
+
+Template-First Writing Contract:
+- AI outputs must map 1:1 to template fields
+- No narrative paragraphs unless the field explicitly requires them
+- Headings, bullets, and short sentences preferred
+- Output must be paste-ready, not advisory
+- Do NOT explain what fields mean unless user explicitly asks. Do NOT use phrases like "you can type" or "you should enter" - be conversational and direct. Provide guidance naturally, not as instructions.
+- NEVER show: Variable Name, Low, High, Highest all together. Only show what's needed for current field.
+- When user asks "what variables" or "what variables should I put": Use ONLY INFORMATION to suggest relevant variables conversationally. Do NOT use generic examples like "Price" or "Delivery Time" - only suggest variables that are mentioned in INFORMATION. Present 2-4 variable suggestions from INFORMATION in a natural, dialogue way (not as a bullet list). Then ask which variable they'd like to add first. Do NOT show Low/High/Highest positions or ranges.
+- When focus_field is "variable_name": ONLY provide the variable name to type, nothing else. Do NOT show positions.
+- When user provides a variable name (FOCUS_FIELD was variable_name and user just gave a name, not a question): Acknowledge the variable name, then ask for their positions (Low, High, Highest) for that variable. Do NOT ask for the next variable until positions are complete.
+- When user provides multiple positions at once: Do NOT repeat or echo back the positions the user just provided. Instead, use INFORMATION to scrutinize and challenge the positions directly. Ask: Is ambition appropriate? Is the spread between Low/High/Highest sufficient? Could they be more ambitious? Suggest specific improvements using INFORMATION. For payment terms: shorter is better (High position), longer is worse (Low position). Provide coaching value, then confirm the variable is complete and ask for the next variable. Do NOT ask for positions that were already provided.
+- When user explicitly asks "what is X" or "explain X": You MUST explain X first using INFORMATION, then ask ONE question.
+- If user asks about Low/High/Highest: Explain each position clearly using INFORMATION (MY LIST: Low = least favorable but acceptable, High = most favorable, Highest = most ambitious credible position), then ask what they want to type.
+
+AI Guardrails:
+- AI must never auto-fill the template without explicit user confirmation
+- AI must never overwrite existing user text
+- AI must only write to the currently active section by default
+- AI must not generate generic negotiation advice outside the template context
+
+AI Confidence & Escalation Logic:
+- If section confidence ≥ threshold → generate content
+- If section confidence < threshold → ask 1–2 clarifying questions (MAX 3 total)
+- After 3 clarification questions → MUST generate best-effort paste-ready output
+- If intent ≠ current template → recommend alternate template
+- AI must always explain why it is redirecting
+
+Minimum Viable AI Interaction:
+- Max 3 clarification questions before generating output
+- Max 3 content variants per response
+- Prefer bullet-ready output over explanation
+- Default response length: ≤150 words
+- When user completes positions for a variable: Do NOT repeat or echo back the positions. Scrutinize the inputs using INFORMATION. Challenge if ambition is appropriate, check if spread between Low/High/Highest is sufficient, suggest specific improvements. Provide coaching value, then move forward.
 
 Variable trading rules:
-- Strict Variable Hierarchy: Do NOT propose changing price until you have proposed at least 2 non-monetary variables (e.g., Support, Payment Terms, Length of Contract).
+- Strict Variable Hierarchy: Do NOT propose changing price until you have proposed at least 2 non-monetary variables.
 - Reverse If/Then: IF = benefit for us (money or their commitment). THEN = our concession.
-- HBP Defense: If the user states a target % increase, start from +3–5% above it as the opening anchor (e.g., target 10% -> open 13–15%) if supported by INFORMATION.
+- HBP Defense: If the user states a target % increase, start from +3–5% above it as the opening anchor if supported by INFORMATION.
+- Payment terms logic: Shorter payment terms are more favorable (High position), longer terms are less favorable (Low position). Do NOT suggest extending payment terms as more ambitious - that's backwards.
 
 Style:
 - Direct, businesslike, and practical.
 - Plain text only. No markdown.
 - Use short bullets only when structured input is necessary.
 - Separate sections with blank lines.
-- End every turn with ONE focused question that advances the template.
+- End every turn with ONE focused question that advances the template (unless you've already asked 3 questions, then provide the answer).
+- Show empathy and coaching through dialogue, not scripted questions.
+- After completing a variable: Provide coaching value, then naturally guide to the next step. Do NOT use generic questions like "what variable would you like to add next" - instead, suggest what makes sense based on INFORMATION and the template structure.
 """
 def _mnt_default_state_text() -> Dict[str, Any]:
     return {
@@ -2016,7 +1906,6 @@ def _mnt_default_state_text() -> Dict[str, Any]:
         "last_question": "",     # last question we asked the user
         "history": [],           # last few turns [{"u": "...", "a": "..."}]
 
-        "clarify_count": 0,
         "updated_at": _now(),
     }
 
@@ -2431,33 +2320,134 @@ def _extract_last_question(text: str) -> str:
     return ""
 
 
+def _mnt_get_history_for_chat(st: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Convert MNT history format to /chat history format for query expansion."""
+    history = _mnt_history(st)[-4:]  # Last 4 turns
+    chat_history = []
+    for h in history:
+        chat_history.append({
+            "user": h.get("u", ""),
+            "assistant": h.get("a", "")
+        })
+    return chat_history
+
+
+def _mnt_build_conversation_context(st: Dict[str, Any]) -> str:
+    """Build conversation context string from MNT history (like /chat format)."""
+    history = _mnt_history(st)[-4:]  # Last 4 turns
+    if not history:
+        return ""
+    
+    parts = []
+    for turn in history:
+        user_msg = turn.get("u", "").strip()
+        assistant_msg = turn.get("a", "").strip()
+        if user_msg:
+            parts.append(f"User: {user_msg}")
+        if assistant_msg:
+            parts.append(f"Assistant: {assistant_msg}")
+    
+    return "\n".join(parts)
+
+
+def _is_new_question(user_message: str) -> bool:
+    """Check if user message is a new question (vs an answer)."""
+    q_words = ["what", "how", "why", "when", "where", "who", "which", "can you", "could you", "should i"]
+    msg_lower = user_message.lower().strip()
+    return any(msg_lower.startswith(qw) for qw in q_words) or msg_lower.endswith("?")
+
+
+def _has_sufficient_info(user_message: str, info: str) -> bool:
+    """Check if retrieved info seems sufficient to answer without asking."""
+    if not info or len(info) < 100:
+        return False
+    # If info is substantial and user message is not a question, we might have enough
+    return len(info) > 200 and not _is_new_question(user_message)
+
+
 def _master_llm_text(
     user_message: str,
     active_section_id: str,
     focus_field: str,
     deal_value: Optional[float],
     user_name: str,
-    clarify_count: int,
     info: str,
     state_memory: str = "",
+    conversation_context: str = "",
 ) -> str:
     # Compact user prompt. INFORMATION is retrieved from Pinecone.
     deal_line = "" if deal_value is None else f"DEAL_VALUE: {deal_value}\n"
     name_line = user_name.strip() if user_name else ""
     mem_line = (state_memory or "").strip()
+    
+    # Build user message with conversation context like /chat
+    if conversation_context:
+        user_message_base = (
+            f"USER_NAME: {name_line}\n"
+            f"ACTIVE_SECTION_ID: {active_section_id}\n"
+            f"FOCUS_FIELD: {focus_field}\n"
+            f"{deal_line}"
+            f"PREVIOUS_CONVERSATION:\n{conversation_context}\n\n"
+            f"CURRENT_USER_MESSAGE: {user_message}\n\n"
+        )
+    else:
+        user_message_base = (
+            f"USER_NAME: {name_line}\n"
+            f"ACTIVE_SECTION_ID: {active_section_id}\n"
+            f"FOCUS_FIELD: {focus_field}\n"
+            f"{deal_line}"
+            f"USER_MESSAGE: {user_message}\n\n"
+        )
+    
+    # Special handling for definition questions
+    definition_handling = ""
+    user_msg_lower = user_message.lower()
+    if any(phrase in user_msg_lower for phrase in ["what is", "explain", "what does", "tell me what"]):
+        definition_handling = "\n\nIMPORTANT: User is asking for a definition/explanation. You MUST explain the concept first using INFORMATION, then ask ONE question about what they want to type."
+    
+    # Special handling for variable name field
+    variable_name_handling = ""
+    if focus_field and "variable" in focus_field.lower() and "name" in focus_field.lower():
+        # Check if user just provided a variable name (not asking a question)
+        is_question = any(q_word in user_msg_lower for q_word in ["what", "which", "how", "why", "when", "where", "?"])
+        if not is_question and len(user_message.strip()) < 50:  # Likely just a variable name
+            variable_name_handling = "\n\nIMPORTANT: User just provided a variable name. Acknowledge it briefly, then ask for their positions (Low, High, Highest) for this variable. Do NOT ask for the next variable yet."
+        else:
+            variable_name_handling = "\n\nIMPORTANT: FOCUS_FIELD is variable_name. ONLY provide the variable name to type. Do NOT show Low/High/Highest positions. Do NOT show ranges or examples with positions."
+    
+    # Special handling: Detect when all positions are provided at once
+    all_positions_handling = ""
+    if re.search(r"\b(low|mid|high|highest)\b", user_msg_lower):
+        # Count how many distinct positions are mentioned
+        position_matches = re.findall(r"\b(low|mid|high|highest)\b", user_msg_lower)
+        unique_positions = set(position_matches)
+        if len(unique_positions) >= 3:  # All three positions mentioned (low, mid/high, highest)
+            all_positions_handling = "\n\nIMPORTANT: User provided all positions at once. Do NOT repeat or echo back the positions. Instead, use INFORMATION to scrutinize and challenge directly: Is ambition appropriate? Is the spread sufficient? Could they be more ambitious? Suggest specific improvements using INFORMATION. Provide coaching value, then confirm the variable is complete and ask for the next variable."
+    
+    # Special handling for business/coaching questions (not template filling)
+    business_question_handling = ""
+    if any(phrase in user_msg_lower for phrase in ["what about", "how can i prepare", "should i", "can i", "is it", "will they"]):
+        business_question_handling = "\n\nIMPORTANT: User is asking a business/coaching question. Answer it fully using INFORMATION first. Provide coaching, suggestions, and guidance. Only after answering should you return to template filling. Do NOT redirect to variable selection."
+    
+    # Special handling for tricky behaviors question
+    tricky_behaviors_handling = ""
+    if any(phrase in user_msg_lower for phrase in ["tricky", "difficult", "prepare for", "behaviours", "behaviors", "questions"]):
+        tricky_behaviors_handling = "\n\nIMPORTANT: User is asking about preparing for tricky behaviors/questions. Use INFORMATION to offer shortcuts/options conversationally. Present options from INFORMATION dynamically. Do NOT just ask what scenarios they foresee - provide helpful options from INFORMATION first."
+    
+    # Special handling for initial help acceptance
+    initial_help_handling = ""
+    if not active_section_id or active_section_id.strip() == "":
+        if "yes" in user_msg_lower or user_message.strip().lower() in ["yes", "y", "ok", "okay", "sure"]:
+            initial_help_handling = "\n\nIMPORTANT: User just accepted help and no active_section_id is set. Guide them to start with their first variable in MY LIST. Say 'Let's start with your first variable. What variable would you like to add to MY LIST?' Do NOT jump to other sections."
 
     prompt_user = (
-        f"USER_NAME: {name_line}\n"
-        f"ACTIVE_SECTION_ID: {active_section_id}\n"
-        f"FOCUS_FIELD: {focus_field}\n"
-        f"{deal_line}"
-        f"USER_MESSAGE: {user_message}\n\n"
+        f"{user_message_base}"
         f"STATE_MEMORY:\n{mem_line}\n\n"
         f"INFORMATION:\n{info}\n\n"
-        "TASK: Give Diadem-only, template-ready guidance for the MASTER template.\n"
-        "If FOCUS_FIELD is set: tell the user exactly what to type there and give 1–2 paste-ready lines.\n"
-        "If user asks what variables: propose 3–6 variables (short) and show how to anchor them in time or price.\n"
-        "Do NOT refuse. If INFORMATION is thin, still give best-effort Diadem guidance.\n"
+        f"TASK: Give Diadem-only, template-ready guidance for the MASTER template.{initial_help_handling}{definition_handling}{variable_name_handling}{all_positions_handling}{business_question_handling}{tricky_behaviors_handling}\n"
+        f"If FOCUS_FIELD is set: tell the user exactly what to type there and give 1–2 paste-ready lines.\n"
+        f"If user asks what variables: Use INFORMATION to suggest relevant variables conversationally, then ask which one they'd like to add. Do NOT show Low/High/Highest positions.\n"
+        f"Do NOT refuse. If INFORMATION is thin, still give best-effort Diadem guidance."
     )
 
     messages = [
@@ -2490,7 +2480,7 @@ def _master_llm_text(
                 "- Then I’ll give you exact template wording."
             )
 
-    return _truncate_words(text, 180)
+    return _truncate_words(text, 150)  # 150 words per Journey doc
 
 
 
@@ -2535,7 +2525,7 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
 
     user_name = _extract_user_name(payload)
 
-    # First touch: always greet (no Yes/No gating)
+    # First touch: always greet with Journey doc text
     if st.get("help_accepted") is None:
         st["help_offered"] = True
         st["help_accepted"] = True  # user is already inside the MASTER template
@@ -2543,7 +2533,7 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
         return {
             "session_id": session_id,
             "mode": MASTER_MODE,
-            "text": "Hello! How can I assist you with the MASTER negotiation template today?",
+            "text": "Do you need help completing your MASTER negotiation template?",
             "done": False,
         }
 
@@ -2553,19 +2543,19 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
         return {
             "session_id": session_id,
             "mode": MASTER_MODE,
-            "text": "Okay. Tell me the section/field when you want help.",
+            "text": "No problem, I'm here if you need me.",
             "done": False,
         }
 
     # Update slot memory from the user's message (percent, money, terms, etc.)
     _mnt_extract_slots_from_user(st, user_message)
 
-    # Deterministic handlers to avoid repeating questions
-    rb = _mnt_rule_based_response(user_message, st)
-    if rb:
-        _mnt_push_history(st, user_message, rb)
-        _mnt_save_state_text(session_id, st)
-        return {"session_id": session_id, "mode": MASTER_MODE, "text": rb, "done": False}
+    # REMOVED: Deterministic handlers that hijack "i don't know" - let LLM handle it through prompt
+    # rb = _mnt_rule_based_response(user_message, st)
+    # if rb:
+    #     _mnt_push_history(st, user_message, rb)
+    #     _mnt_save_state_text(session_id, st)
+    #     return {"session_id": session_id, "mode": MASTER_MODE, "text": rb, "done": False}
 
     # Smalltalk inside the template: greet + refocus
     if _is_smalltalk(user_message):
@@ -2613,10 +2603,14 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
     # (We keep this light because user may want help elsewhere.)
     needs_deal_value_hint = st.get("deal_value") is None and (focus_field.lower() in ("deal_value", "dealvalue", "value") or "deal value" in user_message.lower())
 
-
-    # --- RAG retrieval for MASTER template (always) ---
+    # --- RAG retrieval for MASTER template 
     request_id = str(uuid.uuid4())[:8]
-    rag_query = f"master_template {active_section_id} {focus_field}: {user_message}".strip()
+    
+    # Get conversation history for query expansion and context building
+    history = _mnt_get_history_for_chat(st)  # Convert MNT history to chat format
+    expanded_query = _expand_query_with_context(user_message, history)
+    
+    rag_query = f"master_template {active_section_id} {focus_field}: {expanded_query}".strip()
 
     # 1) Prefer Master Negotiator Slides (primary source for this mode)
     raw = get_matches(rag_query, TOP_K, request_id=request_id)
@@ -2631,25 +2625,31 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
             matches = raw2 or []
 
     info = build_context(matches, request_id=request_id) if matches else ""
-    clarify_count = int(st.get("clarify_count") or 0)
 
     # --- MASTER phase guidance (M/A/S/T/E/R) ---
-    phase, next_phase_q = _mnt_next_phase_question(st, st.get("active_section_id") or "", st.get("focus_field") or "")
-    if phase:
-        st["phase"] = phase
-    # auto-advance the phase question index when the user answered the last asked phase question
-    pending = _safe_str(st.get("pending_phase_question"))
-    if pending and _safe_str(st.get("last_question")) == pending and _mnt_should_advance_phase(st, user_message):
-        # move to next question within the same phase
-        cur = st.get("phase") or phase
-        if cur in _PHASE_QUESTIONS:
-            _mnt_set_phase_idx(st, cur, _mnt_get_phase_idx(st, cur) + 1)
-        # refresh next question after advancing
+    # Skip phase guidance if user just accepted help and no active_section_id is set (guide to variables first)
+    skip_phase_guidance = False
+    if (not active_section_id or active_section_id.strip() == "") and user_message.lower().strip() in ["yes", "y", "ok", "okay", "sure"]:
+        skip_phase_guidance = True
+    
+    phase, next_phase_q = "", ""
+    if not skip_phase_guidance:
         phase, next_phase_q = _mnt_next_phase_question(st, st.get("active_section_id") or "", st.get("focus_field") or "")
-    if next_phase_q:
-        st["pending_phase_question"] = next_phase_q
-    else:
-        st["pending_phase_question"] = ""
+        if phase:
+            st["phase"] = phase
+        # auto-advance the phase question index when the user answered the last asked phase question
+        pending = _safe_str(st.get("pending_phase_question"))
+        if pending and _safe_str(st.get("last_question")) == pending and _mnt_should_advance_phase(st, user_message):
+            # move to next question within the same phase
+            cur = st.get("phase") or phase
+            if cur in _PHASE_QUESTIONS:
+                _mnt_set_phase_idx(st, cur, _mnt_get_phase_idx(st, cur) + 1)
+            # refresh next question after advancing
+            phase, next_phase_q = _mnt_next_phase_question(st, st.get("active_section_id") or "", st.get("focus_field") or "")
+        if next_phase_q:
+            st["pending_phase_question"] = next_phase_q
+        else:
+            st["pending_phase_question"] = ""
 
 
 
@@ -2670,6 +2670,9 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
         template_state_text = ""
 
 
+    # Build conversation context like /chat
+    conversation_context = _mnt_build_conversation_context(st)
+    
     # Build state memory text for the LLM (answers + template snapshot + MASTER phase guidance)
     phase_label = _PHASE_LABEL.get(st.get("phase") or "", "")
     phase_block = ""
@@ -2685,7 +2688,7 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
     if phase_block:
         state_memory_text = (state_memory_text + "\n\n" + phase_block).strip()
 
-    # Generate guidance text (text-only)
+    # Generate guidance text (text-only) with conversation context
     try:
         text = _master_llm_text(
             user_message=user_message,
@@ -2693,9 +2696,9 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
             focus_field=st.get("focus_field") or "",
             deal_value=st.get("deal_value"),
             user_name=user_name,
-            clarify_count=clarify_count,
             state_memory=state_memory_text,
             info=info,
+            conversation_context=conversation_context,
         )
     except Exception as e:
         _jlog("master_template_llm_error", session_id=session_id, err=str(e)[:800])
@@ -2703,15 +2706,23 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
 
     if needs_deal_value_hint and "deal value" not in (text or "").lower():
         # add one short line if not already covered
-        text = (text + "\n\nDeal value: enter the total commercial value as a number (e.g., 120000).").strip()
+        text = (text + "\n\nDeal value: enter the total commercial value as a number.").strip()
 
+    # Add empathy/opener like /chat
+    if text and text.strip() != "I can't find this in the provided documents.":
+        opener = _pick_opener(session_id, user_name, "mnt_last_opener")
+        text = _rewrite_bad_opening(text, opener)
+    
+    # Track last question for conversation context (like /chat)
+    q = _extract_last_question(text)
+    if q:
+        st["last_question"] = q
+    else:
+        st["last_question"] = ""
     
     # Persist conversational memory so the assistant can reference what was already asked/answered.
     if user_message and text:
         _mnt_push_history(st, user_message, text)
-    q = _extract_last_question(text)
-    if q:
-        st["last_question"] = q
 
     _mnt_save_state_text(session_id, st)
     return {"session_id": session_id, "mode": MASTER_MODE, "text": text, "done": False}
@@ -2761,22 +2772,29 @@ def master_template_sse(payload: Dict = Body(...)):
             if st.get("help_accepted") is None:
                 st["help_offered"] = True
                 st["help_accepted"] = True
+                txt = "Do you need help completing your MASTER negotiation template?"
+                data = json.dumps({"text": txt}, ensure_ascii=False)
+                yield f"event: chunk\ndata: {data}\n\n"
+                _mnt_save_state_text(session_id, st)
+                done_payload = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
+                yield f"event: done\ndata: {done_payload}\n\n"
+                return
 
             user_name = _extract_user_name(payload)
 
             # Update slot memory from the user's message
             _mnt_extract_slots_from_user(st, user_message)
 
-            # Deterministic handlers to avoid repeating questions (SSE mode)
-            rb = _mnt_rule_based_response(user_message, st)
-            if rb:
-                data = json.dumps({"text": rb}, ensure_ascii=False)
-                yield f"event: chunk\ndata: {data}\n\n"
-                _mnt_push_history(st, user_message, rb)
-                _mnt_save_state_text(session_id, st)
-                done_payload = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
-                yield f"event: done\ndata: {done_payload}\n\n"
-                return
+            # REMOVED: Deterministic handlers that hijack "i don't know" - let LLM handle it through prompt
+            # rb = _mnt_rule_based_response(user_message, st)
+            # if rb:
+            #     data = json.dumps({"text": rb}, ensure_ascii=False)
+            #     yield f"event: chunk\ndata: {data}\n\n"
+            #     _mnt_push_history(st, user_message, rb)
+            #     _mnt_save_state_text(session_id, st)
+            #     done_payload = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
+            #     yield f"event: done\ndata: {done_payload}\n\n"
+            #     return
 
             if not user_message or _is_smalltalk(user_message):
                 txt = "Which field are you filling right now (deal value, goals, variables, walk-away, concessions)?"
@@ -2787,15 +2805,26 @@ def master_template_sse(payload: Dict = Body(...)):
                 yield f"event: done\ndata: {done_payload}\n\n"
                 return
 
-            # Retrieval (prefer Master Negotiator Slides)
+            # Retrieval (prefer Master Negotiator Slides) with query expansion like /chat
             request_id = str(uuid.uuid4())[:8]
-            rag_query = f"master_template {st.get('active_section_id','')} {st.get('focus_field','')}: {user_message}".strip()
+            
+            # Get conversation history for query expansion and context building
+            history = _mnt_get_history_for_chat(st)  # Convert MNT history to chat format
+            expanded_query = _expand_query_with_context(user_message, history)
+            
+            rag_query = f"master_template {st.get('active_section_id','')} {st.get('focus_field','')}: {expanded_query}".strip()
             raw = get_matches(rag_query, TOP_K, request_id=request_id)
             matches = [m for m in (raw or []) if "master negotiator slides" in str((m.get("metadata") or {}).get("file") or "").lower()
                        or "master negotiator slides" in str((m.get("metadata") or {}).get("source") or "").lower()]
             if len(matches) < 2:
                 matches = raw or []
+                if len(matches) < 2:
+                    raw2 = get_matches(rag_query + " negotiation", TOP_K, request_id=request_id)
+                    matches = raw2 or []
             info = build_context(matches, request_id=request_id) if matches else ""
+            
+            # Build conversation context like /chat
+            conversation_context = _mnt_build_conversation_context(st)
 
             # Build the same prompt as _master_llm_text, but stream
             deal_value = st.get("deal_value")
@@ -2820,19 +2849,27 @@ def master_template_sse(payload: Dict = Body(...)):
 
 
             # --- MASTER phase guidance (M/A/S/T/E/R) ---
-            phase, next_phase_q = _mnt_next_phase_question(st, st.get("active_section_id") or "", st.get("focus_field") or "")
-            if phase:
-                st["phase"] = phase
-            pending = _safe_str(st.get("pending_phase_question"))
-            if pending and _safe_str(st.get("last_question")) == pending and _mnt_should_advance_phase(st, user_message):
-                cur = st.get("phase") or phase
-                if cur in _PHASE_QUESTIONS:
-                    _mnt_set_phase_idx(st, cur, _mnt_get_phase_idx(st, cur) + 1)
-                phase, next_phase_q = _mnt_next_phase_question(st, st.get("active_section_id") or "", st.get("focus_field") or "")
-            if next_phase_q:
-                st["pending_phase_question"] = next_phase_q
-            else:
-                st["pending_phase_question"] = ""
+            # Skip phase guidance if user just accepted help and no active_section_id is set (guide to variables first)
+            skip_phase_guidance = False
+            active_section_id_sse = st.get("active_section_id") or ""
+            if (not active_section_id_sse or active_section_id_sse.strip() == "") and user_message.lower().strip() in ["yes", "y", "ok", "okay", "sure"]:
+                skip_phase_guidance = True
+            
+            phase, next_phase_q = "", ""
+            if not skip_phase_guidance:
+                phase, next_phase_q = _mnt_next_phase_question(st, active_section_id_sse, st.get("focus_field") or "")
+                if phase:
+                    st["phase"] = phase
+                pending = _safe_str(st.get("pending_phase_question"))
+                if pending and _safe_str(st.get("last_question")) == pending and _mnt_should_advance_phase(st, user_message):
+                    cur = st.get("phase") or phase
+                    if cur in _PHASE_QUESTIONS:
+                        _mnt_set_phase_idx(st, cur, _mnt_get_phase_idx(st, cur) + 1)
+                    phase, next_phase_q = _mnt_next_phase_question(st, active_section_id_sse, st.get("focus_field") or "")
+                if next_phase_q:
+                    st["pending_phase_question"] = next_phase_q
+                else:
+                    st["pending_phase_question"] = ""
 
             phase_label = _PHASE_LABEL.get(st.get("phase") or "", "")
             phase_block = ""
@@ -2849,16 +2886,78 @@ def master_template_sse(payload: Dict = Body(...)):
             if phase_block:
                 state_mem = (state_mem + "\n\n" + phase_block).strip()
 
+            # Special handling for definition questions
+            definition_handling = ""
+            user_msg_lower = user_message.lower()
+            if any(phrase in user_msg_lower for phrase in ["what is", "explain", "what does", "tell me what"]):
+                definition_handling = "\n\nIMPORTANT: User is asking for a definition/explanation. You MUST explain the concept first using INFORMATION, then ask ONE question about what they want to type."
+            
+            # Special handling for variable name field
+            variable_name_handling = ""
+            focus_field_sse = st.get("focus_field") or ""
+            if focus_field_sse and "variable" in focus_field_sse.lower() and "name" in focus_field_sse.lower():
+                # Check if user just provided a variable name (not asking a question)
+                is_question = any(q_word in user_msg_lower for q_word in ["what", "which", "how", "why", "when", "where", "?"])
+                if not is_question and len(user_message.strip()) < 50:  # Likely just a variable name
+                    variable_name_handling = "\n\nIMPORTANT: User just provided a variable name. Acknowledge it briefly, then ask for their positions (Low, High, Highest) for this variable. Do NOT ask for the next variable yet."
+                else:
+                    variable_name_handling = "\n\nIMPORTANT: FOCUS_FIELD is variable_name. ONLY provide the variable name to type. Do NOT show Low/High/Highest positions. Do NOT show ranges or examples with positions."
+            
+            # Special handling: Detect when all positions are provided at once
+            all_positions_handling = ""
+            if re.search(r"\b(low|mid|high|highest)\b", user_msg_lower):
+                # Count how many distinct positions are mentioned
+                position_matches = re.findall(r"\b(low|mid|high|highest)\b", user_msg_lower)
+                unique_positions = set(position_matches)
+                if len(unique_positions) >= 3:  # All three positions mentioned (low, mid/high, highest)
+                    all_positions_handling = "\n\nIMPORTANT: User provided all positions at once. Do NOT repeat or echo back the positions. Instead, use INFORMATION to scrutinize and challenge directly: Is ambition appropriate? Is the spread sufficient? Could they be more ambitious? Suggest specific improvements using INFORMATION. Provide coaching value, then confirm the variable is complete and ask for the next variable."
+            
+            # Special handling for business/coaching questions (not template filling)
+            business_question_handling = ""
+            if any(phrase in user_msg_lower for phrase in ["what about", "how can i prepare", "should i", "can i", "is it", "will they"]):
+                business_question_handling = "\n\nIMPORTANT: User is asking a business/coaching question. Answer it fully using INFORMATION first. Provide coaching, suggestions, and guidance. Only after answering should you return to template filling. Do NOT redirect to variable selection."
+            
+            # Special handling for tricky behaviors question
+            tricky_behaviors_handling = ""
+            if any(phrase in user_msg_lower for phrase in ["tricky", "difficult", "prepare for", "behaviours", "behaviors", "questions"]):
+                tricky_behaviors_handling = "\n\nIMPORTANT: User is asking about preparing for tricky behaviors/questions. Use INFORMATION to offer shortcuts/options conversationally. Present options from INFORMATION dynamically. Do NOT just ask what scenarios they foresee - provide helpful options from INFORMATION first."
+            
+            # Special handling for initial help acceptance
+            initial_help_handling = ""
+            if not active_section_id_sse or active_section_id_sse.strip() == "":
+                if "yes" in user_msg_lower or user_message.strip().lower() in ["yes", "y", "ok", "okay", "sure"]:
+                    initial_help_handling = "\n\nIMPORTANT: User just accepted help and no active_section_id is set. Guide them to start with their first variable in MY LIST. Say 'Let's start with your first variable. What variable would you like to add to MY LIST?' Do NOT jump to other sections."
+
+            # Build user message with conversation context like /chat
+            if conversation_context:
+                user_message_base = (
+                    f"USER_NAME: {name_line}\n"
+                    f"ACTIVE_SECTION_ID: {active_section_id_sse}\n"
+                    f"FOCUS_FIELD: {focus_field_sse}\n"
+                    f"{deal_line}"
+                    f"PREVIOUS_CONVERSATION:\n{conversation_context}\n\n"
+                    f"CURRENT_USER_MESSAGE: {user_message}\n\n"
+                )
+            else:
+                user_message_base = (
+                    f"USER_NAME: {name_line}\n"
+                    f"ACTIVE_SECTION_ID: {active_section_id_sse}\n"
+                    f"FOCUS_FIELD: {focus_field_sse}\n"
+                    f"{deal_line}"
+                    f"USER_MESSAGE: {user_message}\n\n"
+                )
+
+            # Define clarify_note (empty for now, can be used for future clarification logic)
+            clarify_note = ""
+            
             prompt_user = (
-                f"USER_NAME: {name_line}\n"
-                f"ACTIVE_SECTION_ID: {st.get('active_section_id','')}\n"
-                f"FOCUS_FIELD: {st.get('focus_field','')}\n"
-                f"{deal_line}"
-                f"USER_MESSAGE: {user_message}\n\n"
+                f"{user_message_base}"
                 f"STATE_MEMORY:\n{state_mem}\n\n"
                 f"INFORMATION:\n{info}\n\n"
-                "TASK: Give Diadem-only, template-ready guidance for the MASTER template.\n"
-                "Do NOT refuse.\n"
+                f"TASK: Give Diadem-only, template-ready guidance for the MASTER template.{initial_help_handling}{definition_handling}{variable_name_handling}{all_positions_handling}{business_question_handling}{tricky_behaviors_handling}\n"
+                f"If FOCUS_FIELD is set: tell the user exactly what to type there and give 1–2 paste-ready lines.\n"
+                f"If user asks what variables: Use INFORMATION to suggest relevant variables conversationally, then ask which one they'd like to add. Do NOT show Low/High/Highest positions.\n"
+                f"Do NOT refuse. If INFORMATION is thin, still give best-effort Diadem guidance.{clarify_note}"
             )
             messages = [
                 {"role": "system", "content": MASTER_SYSTEM_PROMPT_TEXT},
@@ -2874,11 +2973,45 @@ def master_template_sse(payload: Dict = Body(...)):
                 yield f"event: chunk\ndata: {data}\n\n"
 
             full_text = strip_markdown_chars("".join(full_parts)).strip()
+            
+            # Never allow the generic refusal line in this mode
+            if full_text.strip().lower() in ("i can't find this in the provided documents.", "i can't find this in the provided documents."):
+                focus_field = st.get("focus_field", "")
+                if focus_field:
+                    full_text = (
+                        "EARTH\n"
+                        f"- Stay in the '{focus_field}' field.\n"
+                        "- Use short, declarative bullets.\n"
+                        "- Trade: If you... then I... (IF = their commitment, THEN = our concession).\n\n"
+                        "Template line:\n"
+                        "If you commit to [their concrete commitment], then I will [our concession]."
+                    )
+                else:
+                    full_text = (
+                        "WATER\n"
+                        "- Tell me which field you're filling (deal value / variables / goals / walk-away / concessions).\n"
+                        "- Then I'll give you exact template wording."
+                    )
+            
+            # Truncate to 150 words per Journey doc
+            full_text = _truncate_words(full_text, 150)
+            
+            # Add empathy/opener like /chat (but for SSE, we need to prepend to first chunk or handle differently)
+            # Since we've already streamed, we'll apply opener logic to the saved text for next turn
+            if full_text and full_text.strip() != "I can't find this in the provided documents.":
+                opener = _pick_opener(session_id, user_name, "mnt_last_opener")
+                # For SSE, we prepend opener to the text that gets saved
+                full_text = _rewrite_bad_opening(full_text, opener)
+            
             if user_message and full_text:
                 _mnt_push_history(st, user_message, full_text)
+            
+            # Track last question for conversation context (like /chat)
             q = _extract_last_question(full_text)
             if q:
                 st["last_question"] = q
+            else:
+                st["last_question"] = ""
 
             _mnt_save_state_text(session_id, st)
             done_payload = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
