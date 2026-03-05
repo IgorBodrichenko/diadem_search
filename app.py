@@ -88,6 +88,50 @@ PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
 PINECONE_HOST = os.getenv("PINECONE_HOST")
 
+
+
+# =========================
+# DOCUMENT URL MAP (Bubble CDN)
+# =========================
+DOC_URL_MAP: Dict[str, str] = {
+    "Selling.pdf": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772718699250x37833378335347140/Selling.pdf",
+    "Presenting.pdf": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772718691247x364646920850200300/Presenting.pdf",
+    "Negotiation.pdf": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772718684018x235593688581897700/Negotiation.pdf",
+    "Master Negotiator Slides.pdf": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772718674427x236829421146681060/Master%20Negotiator%20Slides.pdf",
+    "Emotional Intelligence.pdf": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772718664960x247567905197888060/Emotional%20Intelligence.pdf",
+    "Coaching.pdf": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772718643763x412377568817892100/Coaching.pdf",
+}
+
+def _build_sources_from_matches(matches: List[Dict], limit: int = 4) -> List[Dict[str, Any]]:
+    sources: List[Dict[str, Any]] = []
+    seen = set()
+    for m in matches or []:
+        md = (m.get("metadata") or {})
+        file_name = (md.get("file_name") or "").strip()
+        page = md.get("page")
+        if not file_name or file_name not in DOC_URL_MAP:
+            continue
+        try:
+            page_i = int(float(page)) if page is not None else None
+        except Exception:
+            page_i = None
+        key = (file_name, page_i)
+        if key in seen:
+            continue
+        seen.add(key)
+        base = DOC_URL_MAP[file_name]
+        url = base
+        if page_i:
+            url = f"{base}#page={page_i}"
+        sources.append({
+            "file": file_name,
+            "page": page_i,
+            "url": url,
+        })
+        if len(sources) >= limit:
+            break
+    return sources
+
 # =========================
 # BUBBLE DATA API (READ-ONLY TEMPLATE STATE)
 # =========================
@@ -1689,6 +1733,8 @@ def chat(payload: Dict = Body(...)):
     matches = get_matches(query, top_k, request_id=request_id)
     context = build_context(matches, request_id=request_id) if matches else ""
 
+    sources = _build_sources_from_matches(matches)
+
     user = (
         f"USER_NAME:\n{user_name}\n\n"
         f"QUESTION:\n{query}\n\n"
@@ -1709,7 +1755,7 @@ def chat(payload: Dict = Body(...)):
         opener = _pick_opener(session_id, user_name, "qa_last_opener")
         answer = _rewrite_bad_opening(answer, opener)
 
-    return {"answer": answer, "session_id": session_id}
+    return {"answer": answer, "session_id": session_id, "sources": sources}
 
 
 @app.post("/chat/sse")
@@ -1724,40 +1770,52 @@ def chat_sse(payload: Dict = Body(...)):
 
     def gen():
         start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
-        yield f"event: start\ndata: {start_payload}\n\n"
-
-        # Smalltalk / empty
+        yield f"event: start\\ndata: {start_payload}\\n\\n"
+# Empty / smalltalk: no OpenAI streaming needed
         if not query:
-            chunks = [""]
-        elif _is_smalltalk(query):
-            chunks = [_smalltalk_reply(user_name)]
-        else:
-            matches = get_matches(query, top_k, request_id=request_id)
-            context = build_context(matches, request_id=request_id) if matches else ""
+            data = json.dumps({"text": ""}, ensure_ascii=False)
+            yield f"event: chunk\\ndata: {data}\\n\\n"
+            done_payload = json.dumps({"done": True}, ensure_ascii=False)
+            yield f"event: done\\ndata: {done_payload}\\n\\n"
+            return
 
-            user = (
-                f"USER_NAME:\n{user_name}\n\n"
-                f"QUESTION:\n{query}\n\n"
-                f"INFORMATION:\n{context}"
-            )
-            messages = [
+        if _is_smalltalk(query):
+            data = json.dumps({"text": _smalltalk_reply(user_name)}, ensure_ascii=False)
+            yield f"event: chunk\\ndata: {data}\\n\\n"
+            done_payload = json.dumps({"done": True}, ensure_ascii=False)
+            yield f"event: done\\ndata: {done_payload}\\n\\n"
+            return
+
+        matches = get_matches(query, top_k, request_id=request_id)
+        sources = _build_sources_from_matches(matches)
+        if sources:
+            src_payload = json.dumps({"sources": sources}, ensure_ascii=False)
+            yield f"event: sources\\ndata: {src_payload}\\n\\n"
+
+        context = build_context(matches, request_id=request_id) if matches else ""
+
+        user = (
+            f"USER_NAME:\n{user_name}\n\n"
+            f"QUESTION:\n{query}\n\n"
+            f"INFORMATION:\n{context}"
+        )
+        messages = [
             {"role": "system", "content": SYSTEM_PROMPT_CHAT},
-                {"role": "user", "content": user},
-            ]
+            {"role": "user", "content": user},
+        ]
 
         chunks = _iter_text_as_sse_chunks(
             _openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2),
             min_chars=28,
         )
 
-        # Emit chunks
         for part in chunks:
             part = strip_markdown_chars(part)
             data = json.dumps({"text": part}, ensure_ascii=False)
-            yield f"event: chunk\ndata: {data}\n\n"
+            yield f"event: chunk\\ndata: {data}\\n\\n"
 
         done_payload = json.dumps({"done": True}, ensure_ascii=False)
-        yield f"event: done\ndata: {done_payload}\n\n"
+        yield f"event: done\\ndata: {done_payload}\\n\\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=_sse_headers())
 
