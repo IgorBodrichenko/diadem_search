@@ -96,7 +96,7 @@ PINECONE_HOST = os.getenv("PINECONE_HOST")
 DOC_URL_MAP: Dict[str, str] = {
     "Selling.pdf": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772718699250x37833378335347140/Selling.pdf",
     "Presenting.pdf": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772718691247x364646920850200300/Presenting.pdf",
-    "Negotiation.pdf": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772718684018x235593688581897700/Negotiation.pdf",
+    "Negotiation.pdf": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772718684018x235593688851897700/Negotiation.pdf",
     "Master Negotiator Slides.pdf": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772718674427x236829421146681060/Master%20Negotiator%20Slides.pdf",
     "Emotional Intelligence.pdf": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772718664960x247567905197888060/Emotional%20Intelligence.pdf",
     "Coaching.pdf": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772718643763x412377568817892100/Coaching.pdf",
