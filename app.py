@@ -54,7 +54,8 @@ CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 TOP_K = int(os.getenv("TOP_K", "10"))
 PINECONE_TOPK_RAW = int(os.getenv("PINECONE_TOPK_RAW", "30"))
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "14000"))
-EMBED_DIM = int(os.getenv("EMBED_DIM", "1536"))
+EMBED_DIM_ENV = os.getenv("EMBED_DIM", "").strip()
+EMBED_DIM = int(EMBED_DIM_ENV) if EMBED_DIM_ENV else 0  # 0 => auto from Pinecone index dimension
 
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
 
@@ -86,7 +87,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
 PINECONE_HOST = os.getenv("PINECONE_HOST")
-PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "").strip()
 
 # =========================
 # BUBBLE DATA API (READ-ONLY TEMPLATE STATE)
@@ -219,22 +219,18 @@ index = pc.Index(
     host=os.getenv("PINECONE_HOST")
 )
 
-
-# =========================
-# PINECONE HELPERS
-# =========================
-def _pinecone_query(vec: List[float], top_k: int):
-    """Query Pinecone with optional namespace."""
-    kwargs = {"vector": vec, "top_k": top_k, "include_metadata": True}
-    if PINECONE_NAMESPACE:
-        kwargs["namespace"] = PINECONE_NAMESPACE
-    return index.query(**kwargs)
-
-def _pinecone_stats_safe() -> Dict[str, Any]:
-    try:
-        return index.describe_index_stats()
-    except Exception as e:
-        return {"error": str(e)[:200]}
+# Auto-align embedding dimensions with the Pinecone index (prevents 400 Bad Request on query)
+try:
+    _stats = index.describe_index_stats()
+    _index_dim = int((_stats or {}).get("dimension") or 0)
+    if _index_dim:
+        if EMBED_DIM in (0, None):
+            EMBED_DIM = _index_dim
+        elif EMBED_DIM != _index_dim:
+            log.warning(f"EMBED_DIM ({EMBED_DIM}) != Pinecone index dimension ({_index_dim}). Overriding to {_index_dim}. Set EMBED_DIM env to silence this.")
+            EMBED_DIM = _index_dim
+except Exception as _e:
+    log.warning(f"Could not read Pinecone index stats to align EMBED_DIM: {_e}")
 
 # =========================
 # OPENAI STREAM HELPERS (SSE)
@@ -646,6 +642,11 @@ def _filter_matches_by_score(matches: List[Dict]) -> List[Dict]:
             score = 0.0
         if score >= MIN_MATCH_SCORE:
             out.append(m)
+
+    # Fallback: if threshold filtered everything out, keep a few best matches
+    if not out and matches:
+        return (matches or [])[: min(5, len(matches))]
+
     return out
 
 def is_explanatory_question(q: str) -> bool:
@@ -1041,15 +1042,18 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
             t0 = time.time()
             vec = embed_query(q)
 
-            res = _pinecone_query(vec, top_k=PINECONE_TOPK_RAW)
+            res = index.query(
+                vector=vec,
+                top_k=PINECONE_TOPK_RAW,
+                include_metadata=True
+            )
+
+            # DEBUG: печатаем metadata (первые 3, чтобы не спамить)
+            for m in (res.get("matches") or [])[:3]:
+                print("PINECONE METADATA:", m.get("metadata"))
 
             ms = int((time.time() - t0) * 1000)
             matches = res.get("matches") or []
-
-            # DEBUG: sample metadata (optional)
-            for mm in matches[:3]:
-                print("PINECONE METADATA:", mm.get("metadata"))
-
             all_results.append(matches)
 
             _slog(
@@ -1058,12 +1062,11 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
                 q=q,
                 ms=ms,
                 matches_count=len(matches),
-                vec_dim=len(vec) if isinstance(vec, list) else None,
-                namespace=PINECONE_NAMESPACE or "",
                 top_matches=[_brief_match(x) for x in matches[:SEARCH_LOG_MAX_MATCHES]],
             )
+
         except Exception as e:
-            _slog("pinecone_query_error", request_id=request_id, q=q, err=str(e)[:300])
+            _jlog("pinecone_query_error", request_id=request_id, q=q, err=str(e), err_repr=repr(e))
             continue
 
     merged = _merge_dedup_matches(all_results)
@@ -1072,16 +1075,6 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
           merged_count=len(merged),
           sample=[_brief_match(x) for x in merged[:SEARCH_LOG_MAX_MATCHES]])
 
-    
-    # If we got zero results, log index stats to diagnose (namespace / empty index / wrong env)
-    if len(merged) == 0:
-        _slog(
-            "pinecone_index_stats",
-            request_id=request_id,
-            index=PINECONE_INDEX_NAME,
-            namespace=PINECONE_NAMESPACE or "",
-            stats=_pinecone_stats_safe(),
-        )
     merged = _filter_matches_by_score(merged)
     _slog("search_filtered",
           request_id=request_id,
