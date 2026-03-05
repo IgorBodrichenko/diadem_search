@@ -930,22 +930,38 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
           request_id=request_id,
           queries=queries)
     all_results: List[List[Dict]] = []
-    for q in queries:
-        try:
-            t0 = time.time()
-            vec = embed_query(q)
-            res = index.query(vector=vec, top_k=PINECONE_TOPK_RAW, include_metadata=True)
-            ms = int((time.time() - t0) * 1000)
-            matches = res.get("matches") or []
-            all_results.append(matches)
-            _slog("pinecone_query",
-                  request_id=request_id,
-                  q=q,
-                  ms=ms,
-                  matches_count=len(matches),
-                  top_matches=[_brief_match(x) for x in matches[:SEARCH_LOG_MAX_MATCHES]])
-        except Exception:
-            continue
+for q in queries:
+    try:
+        t0 = time.time()
+        vec = embed_query(q)
+
+        res = index.query(
+            vector=vec,
+            top_k=PINECONE_TOPK_RAW,
+            include_metadata=True
+        )
+
+        ms = int((time.time() - t0) * 1000)
+        matches = res.get("matches") or []
+
+        # DEBUG: посмотрим metadata из Pinecone
+        for m in matches[:3]:
+            print("PINECONE METADATA:", m.get("metadata"))
+
+        all_results.append(matches)
+
+        _slog(
+            "pinecone_query",
+            request_id=request_id,
+            q=q,
+            ms=ms,
+            matches_count=len(matches),
+            top_matches=[_brief_match(x) for x in matches[:SEARCH_LOG_MAX_MATCHES]]
+        )
+
+    except Exception as e:
+        print("PINECONE ERROR:", str(e))
+        continue
 
     merged = _merge_dedup_matches(all_results)
     _slog("search_merged",
