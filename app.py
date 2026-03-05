@@ -96,11 +96,52 @@ PINECONE_HOST = os.getenv("PINECONE_HOST")
 DOC_URL_MAP: Dict[str, str] = {
     "Selling.pdf": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772718699250x37833378335347140/Selling.pdf",
     "Presenting.pdf": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772718691247x364646920850200300/Presenting.pdf",
-    "Negotiation.pdf": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772718684018x235593688851897700/Negotiation.pdf",
+    "Negotiation.pdf": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772718684018x235593688581897700/Negotiation.pdf",
     "Master Negotiator Slides.pdf": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772718674427x236829421146681060/Master%20Negotiator%20Slides.pdf",
     "Emotional Intelligence.pdf": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772718664960x247567905197888060/Emotional%20Intelligence.pdf",
     "Coaching.pdf": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772718643763x412377568817892100/Coaching.pdf",
 }
+
+
+# =========================
+# SLIDE IMAGE MAP (Bubble CDN screenshots)
+# =========================
+SLIDE_IMAGE_MAP: Dict[str, str] = {
+    # Preparing A Confident Mindset (template screenshot)
+    "confident_mindset": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772727459971x786228047907391100/%D0%A1%D0%BD%D0%B8%D0%BC%D0%BE%D0%BA%20%D1%8D%D0%BA%D1%80%D0%B0%D0%BD%D0%B0%202026-03-05%20181241.png",
+    # Being Aware Of Tactics And Prepared To Respond (difficult behaviours template screenshot)
+    "difficult_behaviours": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1772727490857x865728530489646500/%D0%A1%D0%BD%D0%B8%D0%BC%D0%BE%D0%BA%20%D1%8D%D0%BA%D1%80%D0%B0%D0%BD%D0%B0%202026-03-05%20181650.png",
+}
+
+_TEMPLATE_INTENT_RE = re.compile(
+    r"\b(template|model|framework|worksheet|fill\s+it\s+in|complete\s+it|show\s+me\s+the\s+model|show\s+the\s+model)\b",
+    flags=re.IGNORECASE,
+)
+
+_CONFIDENT_INTENT_RE = re.compile(
+    r"\b(confident\s+mindset|confidence\s+mindset|get\s+into\s+the\s+right\s+confident\s+mindset|right\s+confident\s+mindset|build\s+confidence)\b",
+    flags=re.IGNORECASE,
+)
+
+_DIFFICULT_BEHAVIOUR_RE = re.compile(
+    r"\b(difficult\s+buyer|difficult\s+behaviou?rs?|challenging\s+behaviou?rs?|tricky\s+questions?|handle\s+difficult\s+questions?|deal\s+with\s+difficult\s+questions?|notoriously\s+difficult)\b",
+    flags=re.IGNORECASE,
+)
+
+def _detect_slide_image(query: str) -> Optional[str]:
+    q = (query or "").strip()
+    if not q:
+        return None
+    if _CONFIDENT_INTENT_RE.search(q):
+        return SLIDE_IMAGE_MAP.get("confident_mindset")
+    if _DIFFICULT_BEHAVIOUR_RE.search(q):
+        return SLIDE_IMAGE_MAP.get("difficult_behaviours")
+    # If user asks "show the model/template" but doesn't specify which one,
+    # default to confident mindset template (common request).
+    if _TEMPLATE_INTENT_RE.search(q):
+        return SLIDE_IMAGE_MAP.get("confident_mindset")
+    return None
+
 
 def _build_sources_from_matches(matches: List[Dict], limit: int = 4) -> List[Dict[str, Any]]:
     sources: List[Dict[str, Any]] = []
@@ -1725,10 +1766,10 @@ def chat(payload: Dict = Body(...)):
     _cleanup_sessions()
 
     if not query:
-        return JSONResponse({"answer": "", "session_id": session_id})
+        return JSONResponse({"answer": "", "session_id": session_id, "sources": [], "slide_image": None})
 
     if _is_smalltalk(query):
-        return {"answer": _smalltalk_reply(user_name), "session_id": session_id}
+        return {"answer": _smalltalk_reply(user_name), "session_id": session_id, "sources": [], "slide_image": None}
 
     matches = get_matches(query, top_k, request_id=request_id)
     context = build_context(matches, request_id=request_id) if matches else ""
@@ -1755,9 +1796,8 @@ def chat(payload: Dict = Body(...)):
         opener = _pick_opener(session_id, user_name, "qa_last_opener")
         answer = _rewrite_bad_opening(answer, opener)
 
-    return {"answer": answer, "session_id": session_id, "sources": sources}
-
-
+    slide_image = _detect_slide_image(query)
+    return {"answer": answer, "session_id": session_id, "sources": sources, "slide_image": slide_image}
 @app.post("/chat/sse")
 def chat_sse(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
@@ -1771,6 +1811,10 @@ def chat_sse(payload: Dict = Body(...)):
     def gen():
         start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
         yield f"event: start\\ndata: {start_payload}\\n\\n"
+        slide_image = _detect_slide_image(query)
+        if slide_image:
+            yield f"event: slide\\ndata: {json.dumps({'slide_image': slide_image}, ensure_ascii=False)}\\n\\n"
+
 # Empty / smalltalk: no OpenAI streaming needed
         if not query:
             data = json.dumps({"text": ""}, ensure_ascii=False)
