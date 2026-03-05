@@ -128,19 +128,73 @@ _DIFFICULT_BEHAVIOUR_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
-def _detect_slide_image(query: str) -> Optional[str]:
+def _detect_slide_key(query: str) -> Optional[str]:
     q = (query or "").strip()
     if not q:
         return None
     if _CONFIDENT_INTENT_RE.search(q):
-        return SLIDE_IMAGE_MAP.get("confident_mindset")
+        return "confident_mindset"
     if _DIFFICULT_BEHAVIOUR_RE.search(q):
-        return SLIDE_IMAGE_MAP.get("difficult_behaviours")
-    # If user asks "show the model/template" but doesn't specify which one,
-    # default to confident mindset template (common request).
+        return "difficult_behaviours"
     if _TEMPLATE_INTENT_RE.search(q):
-        return SLIDE_IMAGE_MAP.get("confident_mindset")
+        # Default template if user asks "show the model/template" without specifying
+        return "confident_mindset"
     return None
+
+
+def _detect_slide_image(query: str) -> Optional[str]:
+    key = _detect_slide_key(query)
+    return SLIDE_IMAGE_MAP.get(key) if key else None
+
+def _apply_template_mode(user_msg: str, *, slide_key: Optional[str], query: str) -> str:
+    """Append strict formatting instructions when user is asking for a template/model or matches a known template slide."""
+    q = (query or "").strip()
+
+    # Decide if we must force template output
+    force = False
+    if slide_key in ("confident_mindset", "difficult_behaviours"):
+        force = True
+    elif _TEMPLATE_INTENT_RE.search(q):
+        force = True
+
+    if not force:
+        return user_msg
+
+    if slide_key == "difficult_behaviours":
+        # Template: Being Aware Of Tactics And Prepared To Respond
+        rules = (
+            "\n\nTEMPLATE MODE (must follow exactly):\n"
+            "- Use the 'Prepare for difficult behaviours' template shown on the slide.\n"
+            "- Do NOT ask which model/template the user means.\n"
+            "- Output MUST be structured with these headings exactly (in this order):\n"
+            "  1) ANTICIPATE THEIR TACTICS\n"
+            "  2) YOUR RESPONSE BULLET\n"
+            "  3) MOVE IT ON (AIR)\n"
+            "- Under each heading: give 3–6 short bullet prompts the user should write into the box.\n"
+            "- Under each heading also include ONE short example line (example only).\n"
+            "- Keep it paste-ready. No generic advice list.\n"
+            "- End with ONE focused question asking for the first entry under 'ANTICIPATE THEIR TACTICS'.\n"
+        )
+        return user_msg + rules
+
+    # Default / confident mindset template
+    rules = (
+        "\n\nTEMPLATE MODE (must follow exactly):\n"
+        "- Use the 'Preparing A Confident Mindset' template shown on the slide.\n"
+        "- Do NOT ask which model/template the user means.\n"
+        "- Output MUST be structured with these headings exactly (in this order):\n"
+        "  1) MY COMPANY\n"
+        "  2) THIS SITUATION\n"
+        "  3) THIS RELATIONSHIP\n"
+        "  4) MYSELF\n"
+        "- Under each heading: give 2–4 bullet prompts the user should write into the box.\n"
+        "- Under each heading also include ONE short example line (example only).\n"
+        "- Keep it paste-ready. No generic mindset tips list.\n"
+        "- End with ONE focused question asking for their inputs for 'MY COMPANY'.\n"
+    )
+    return user_msg + rules
+
+
 
 
 def _build_sources_from_matches(matches: List[Dict], limit: int = 4) -> List[Dict[str, Any]]:
@@ -1776,11 +1830,16 @@ def chat(payload: Dict = Body(...)):
 
     sources = _build_sources_from_matches(matches)
 
+    
+    slide_key = _detect_slide_key(query)
+    slide_image = SLIDE_IMAGE_MAP.get(slide_key) if slide_key else None
+
     user = (
-        f"USER_NAME:\n{user_name}\n\n"
-        f"QUESTION:\n{query}\n\n"
-        f"INFORMATION:\n{context}"
-    )
+    f"USER_NAME:\n{user_name}\n\n"
+    f"QUESTION:\n{query}\n\n"
+    f"INFORMATION:\n{context}"
+)
+    user = _apply_template_mode(user, slide_key=slide_key, query=query)
 
     resp = openai.chat.completions.create(
         model=CHAT_MODEL,
@@ -1795,8 +1854,6 @@ def chat(payload: Dict = Body(...)):
     if answer:
         opener = _pick_opener(session_id, user_name, "qa_last_opener")
         answer = _rewrite_bad_opening(answer, opener)
-
-    slide_image = _detect_slide_image(query)
     return {"answer": answer, "session_id": session_id, "sources": sources, "slide_image": slide_image}
 @app.post("/chat/sse")
 def chat_sse(payload: Dict = Body(...)):
@@ -1811,7 +1868,8 @@ def chat_sse(payload: Dict = Body(...)):
     def gen():
         start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
         yield f"event: start\\ndata: {start_payload}\\n\\n"
-        slide_image = _detect_slide_image(query)
+        slide_key = _detect_slide_key(query)
+        slide_image = SLIDE_IMAGE_MAP.get(slide_key) if slide_key else None
         if slide_image:
             yield f"event: slide\\ndata: {json.dumps({'slide_image': slide_image}, ensure_ascii=False)}\\n\\n"
 
@@ -1838,11 +1896,15 @@ def chat_sse(payload: Dict = Body(...)):
 
         context = build_context(matches, request_id=request_id) if matches else ""
 
+        
+        slide_key = _detect_slide_key(query)
+
         user = (
-            f"USER_NAME:\n{user_name}\n\n"
-            f"QUESTION:\n{query}\n\n"
-            f"INFORMATION:\n{context}"
-        )
+    f"USER_NAME:\n{user_name}\n\n"
+    f"QUESTION:\n{query}\n\n"
+    f"INFORMATION:\n{context}"
+)
+        user = _apply_template_mode(user, slide_key=slide_key, query=query)
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT_CHAT},
             {"role": "user", "content": user},
