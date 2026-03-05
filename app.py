@@ -1023,6 +1023,8 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
             t0 = time.time()
             vec = embed_query(q)
             res = index.query(vector=vec, top_k=PINECONE_TOPK_RAW, include_metadata=True)
+            for m in res.get("matches", []):
+    print("PINECONE METADATA:", m.get("metadata"))
             ms = int((time.time() - t0) * 1000)
             matches = res.get("matches") or []
             all_results.append(matches)
