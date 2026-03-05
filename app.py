@@ -1962,6 +1962,73 @@ def _mnt_extract_focus(payload: Dict[str, Any]) -> Tuple[str, str]:
     return active_section_id, focus_field
 
 
+def _mnt_extract_prefill_block(payload: Dict[str, Any]) -> str:
+    """Extract prefilled template fields sent from Bubble.
+
+    Accepts either:
+      - a single string (already formatted), or
+      - a dict of {field_key: value}, or
+      - a list of dicts like [{"key": "...", "value": "..."}, ...]
+    """
+    # Common keys Bubble might send
+    raw = (
+        payload.get("prefill_text")
+        or payload.get("prefill")
+        or payload.get("filled_fields_text")
+        or payload.get("template_fields_text")
+        or payload.get("fields_text")
+        or payload.get("template_snapshot")
+    )
+
+    # Also accept structured payloads
+    raw_struct = payload.get("prefill_fields") or payload.get("filled_fields") or payload.get("fields")
+
+    def _cap(s: str, n: int = 6000) -> str:
+        s = (s or "").strip()
+        if len(s) > n:
+            return (s[:n] + "…").strip()
+        return s
+
+    if isinstance(raw, str) and raw.strip():
+        return _cap("PREFILLED FIELDS (from Bubble UI):\n" + raw.strip())
+
+    if raw is None and raw_struct is None:
+        return ""
+
+    data = raw_struct if raw_struct is not None else raw
+
+    lines: List[str] = []
+    if isinstance(data, dict):
+        for k, v in data.items():
+            k = _safe_str(k)
+            if not k:
+                continue
+            val = _safe_str(v)
+            if not val:
+                continue
+            lines.append(f"- {k}: {val}")
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                k = _safe_str(item.get("key") or item.get("field") or item.get("name"))
+                val = _safe_str(item.get("value") or item.get("text"))
+                if k and val:
+                    lines.append(f"- {k}: {val}")
+            elif isinstance(item, str) and item.strip():
+                lines.append(f"- {item.strip()}")
+    else:
+        s = _safe_str(data)
+        if s:
+            lines.append(s)
+
+    if not lines:
+        return ""
+
+    out = "PREFILLED FIELDS (from Bubble UI):\n" + "\n".join(lines)
+    return _cap(out)
+
+
+
 # =========================
 # MASTER PHASE (M/A/S/T/E/R) GUIDE
 # =========================
@@ -2738,6 +2805,9 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
     state_memory_text = _mnt_build_state_memory_text(st)
     if template_state_text:
         state_memory_text = (state_memory_text + "\n\n" + template_state_text).strip()
+    prefill_block = _mnt_extract_prefill_block(payload)
+    if prefill_block:
+        state_memory_text = (state_memory_text + "\n\n" + prefill_block).strip()
     if phase_block:
         state_memory_text = (state_memory_text + "\n\n" + phase_block).strip()
 
@@ -2936,6 +3006,9 @@ def master_template_sse(payload: Dict = Body(...)):
             state_mem = _mnt_build_state_memory_text(st)
             if template_state_text:
                 state_mem = (state_mem + "\n\n" + template_state_text).strip()
+            prefill_block = _mnt_extract_prefill_block(payload)
+            if prefill_block:
+                state_mem = (state_mem + "\n\n" + prefill_block).strip()
             if phase_block:
                 state_mem = (state_mem + "\n\n" + phase_block).strip()
 
