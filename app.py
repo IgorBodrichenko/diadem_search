@@ -995,14 +995,16 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
     if request_id is None:
         request_id = str(uuid.uuid4())[:8]
 
-    _slog("search_start",
-          request_id=request_id,
-          query=q_clean,
-          top_k_final=top_k_final,
-          pinecone_topk_raw=PINECONE_TOPK_RAW,
-          multi_query_k=MULTI_QUERY_K,
-          min_match_score=MIN_MATCH_SCORE,
-          priority_boost=PRIORITY_BOOST)
+    _slog(
+        "search_start",
+        request_id=request_id,
+        query=q_clean,
+        top_k_final=top_k_final,
+        pinecone_topk_raw=PINECONE_TOPK_RAW,
+        multi_query_k=MULTI_QUERY_K,
+        min_match_score=MIN_MATCH_SCORE,
+        priority_boost=PRIORITY_BOOST,
+    )
 
     hint = _hint_for_question(q_clean)
     q_hint = f"{q_clean}\n{hint}".strip() if hint else ""
@@ -1014,87 +1016,92 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
     if len(queries) < MULTI_QUERY_K and q_kw:
         queries.append(q_kw)
 
-    _slog("search_queries",
-          request_id=request_id,
-          queries=queries)
+    _slog("search_queries", request_id=request_id, queries=queries)
+
     all_results: List[List[Dict]] = []
     for q in queries:
-    try:
-        t0 = time.time()
-        vec = embed_query(q)
+        try:
+            t0 = time.time()
+            vec = embed_query(q)
 
-        res = index.query(
-            vector=vec,
-            top_k=PINECONE_TOPK_RAW,
-            include_metadata=True
-        )
+            res = index.query(
+                vector=vec,
+                top_k=PINECONE_TOPK_RAW,
+                include_metadata=True,
+            )
 
-        # DEBUG: смотрим metadata
-        for m in (res.get("matches") or [])[:3]:
-            print("PINECONE METADATA:", m.get("metadata"))
+            # Optional debug: log a few metadatas
+            if DEBUG:
+                for m in (res.get("matches") or [])[:3]:
+                    md = m.get("metadata") or {}
+                    _slog("pinecone_match_meta", request_id=request_id, q=q, id=m.get("id"), meta_keys=list(md.keys()))
 
-        ms = int((time.time() - t0) * 1000)
-        matches = res.get("matches") or []
+            ms = int((time.time() - t0) * 1000)
+            matches = res.get("matches") or []
+            all_results.append(matches)
 
-        all_results.append(matches)
-
-        _slog(
-            "pinecone_query",
-            request_id=request_id,
-            q=q,
-            ms=ms,
-            matches_count=len(matches),
-            top_matches=[_brief_match(x) for x in matches[:SEARCH_LOG_MAX_MATCHES]],
-        )
-
-    except Exception:
-        continue
+            _slog(
+                "pinecone_query",
+                request_id=request_id,
+                q=q,
+                ms=ms,
+                matches_count=len(matches),
+                top_matches=[_brief_match(x) for x in matches[:SEARCH_LOG_MAX_MATCHES]],
+            )
+        except Exception:
+            continue
 
     merged = _merge_dedup_matches(all_results)
-    _slog("search_merged",
-          request_id=request_id,
-          merged_count=len(merged),
-          sample=[_brief_match(x) for x in merged[:SEARCH_LOG_MAX_MATCHES]])
+    _slog(
+        "search_merged",
+        request_id=request_id,
+        merged_count=len(merged),
+        sample=[_brief_match(x) for x in merged[:SEARCH_LOG_MAX_MATCHES]],
+    )
 
     merged = _filter_matches_by_score(merged)
-    _slog("search_filtered",
-          request_id=request_id,
-          filtered_count=len(merged),
-          sample=[_brief_match(x) for x in merged[:SEARCH_LOG_MAX_MATCHES]])
+    _slog(
+        "search_filtered",
+        request_id=request_id,
+        filtered_count=len(merged),
+        sample=[_brief_match(x) for x in merged[:SEARCH_LOG_MAX_MATCHES]],
+    )
 
     reranked = _rerank(q_clean, merged, top_k_final)
 
-    if reranked and not any(m.get("metadata", {}).get("type") == "text" for m in reranked):
+    # Ensure at least one "type=text" chunk survives (some pdf pipelines mark non-text chunks)
+    if reranked and not any((m.get("metadata") or {}).get("type") == "text" for m in reranked):
         for m in merged:
-            if m.get("metadata", {}).get("type") == "text":
+            if (m.get("metadata") or {}).get("type") == "text":
                 reranked[-1] = m
                 break
 
-    _slog("search_reranked",
-          request_id=request_id,
-          final_count=len(reranked),
-          final=[_brief_match(x) for x in reranked[:SEARCH_LOG_MAX_MATCHES]])
+    _slog(
+        "search_reranked",
+        request_id=request_id,
+        final_count=len(reranked),
+        final=[_brief_match(x) for x in reranked[:SEARCH_LOG_MAX_MATCHES]],
+    )
 
     # If we have a curated hint for this query, do NOT block on the relevance gate.
-    # where the top chunk can be short and fail overlap/length heuristics.
     hint_gate = _hint_for_question(q_clean)
     if hint_gate and reranked:
-        _slog("search_context_relevance",
-              request_id=request_id,
-              relevant=True,
-              kept=len(reranked),
-              reason="hint_override")
+        _slog(
+            "search_context_relevance",
+            request_id=request_id,
+            relevant=True,
+            kept=len(reranked),
+            reason="hint_override",
+        )
         return reranked
 
     relevant = is_context_relevant(q_clean, reranked)
-    _slog("search_context_relevance",
-          request_id=request_id,
-          relevant=relevant,
-          kept=len(reranked))
+    _slog("search_context_relevance", request_id=request_id, relevant=relevant, kept=len(reranked))
     if not relevant:
         return []
 
     return reranked
+
 
 def _reflect_line() -> str:
     return random.choice(["Got it.", "Okay.", "Thanks — noted.", "Understood.", "That helps."])
@@ -1234,6 +1241,7 @@ SYSTEM_PROMPT_CHAT = (
     "- Do NOT explain that you are using Pinecone or retrieved materials.\n"
     "- Keep answers clear, professional, and structured.\n"
     "- Avoid unnecessary verbosity.\n"
+"- If INFORMATION contains a model/template/framework, offer it explicitly and describe how to use it.\n"
     "- Ask at most ONE clarifying question if the request is unclear.\n"
     "- If USER_NAME is provided, greet only once at the beginning of the conversation.\n"
     "\n"
@@ -1640,6 +1648,41 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
     return _with_debug({"text": text, "session_id": session_id, "done": False}, mode=mode, next_key=(nxt.get("key") if nxt else ""))
 
 
+def _looks_like_url(s: str) -> bool:
+    s = (s or "").strip()
+    if not s:
+        return False
+    return s.startswith("http://") or s.startswith("https://") or s.startswith("//")
+
+
+def _extract_image_urls_from_matches(matches: List[Dict], limit: int = 4) -> List[str]:
+    """Pull slide/page image URLs from Pinecone metadata if present.
+
+    We keep this generic because different ingestion pipelines use different keys.
+    """
+    urls: List[str] = []
+    seen = set()
+
+    keys = [
+        "image_url", "img_url", "image", "img",
+        "page_image_url", "slide_image_url",
+        "public_url", "cdn_url", "url",
+    ]
+
+    for m in (matches or []):
+        md = (m.get("metadata") or {})
+        for k in keys:
+            v = md.get(k)
+            if isinstance(v, str) and _looks_like_url(v):
+                u = v.strip()
+                if u not in seen:
+                    seen.add(u)
+                    urls.append(u)
+                    if len(urls) >= limit:
+                        return urls
+
+    return urls
+
 # =========================
 # ROUTES
 # =========================
@@ -1662,13 +1705,14 @@ def chat(payload: Dict = Body(...)):
     _cleanup_sessions()
 
     if not query:
-        return JSONResponse({"answer": "", "session_id": session_id})
+        return JSONResponse({"answer": "", "session_id": session_id, "images": []})
 
     if _is_smalltalk(query):
-        return {"answer": _smalltalk_reply(user_name), "session_id": session_id}
+        return {"answer": _smalltalk_reply(user_name), "session_id": session_id, "images": []}
 
     matches = get_matches(query, top_k, request_id=request_id)
     context = build_context(matches, request_id=request_id) if matches else ""
+    images = _extract_image_urls_from_matches(matches)
 
     user = (
         f"USER_NAME:\n{user_name}\n\n"
@@ -1690,7 +1734,7 @@ def chat(payload: Dict = Body(...)):
         opener = _pick_opener(session_id, user_name, "qa_last_opener")
         answer = _rewrite_bad_opening(answer, opener)
 
-    return {"answer": answer, "session_id": session_id}
+    return {"answer": answer, "session_id": session_id, "images": images}
 
 
 @app.post("/chat/sse")
@@ -1707,31 +1751,46 @@ def chat_sse(payload: Dict = Body(...)):
         start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
         yield f"event: start\ndata: {start_payload}\n\n"
 
-        # Smalltalk / empty
+        # Empty
         if not query:
-            chunks = [""]
-        elif _is_smalltalk(query):
-            chunks = [_smalltalk_reply(user_name)]
-        else:
-            matches = get_matches(query, top_k, request_id=request_id)
-            context = build_context(matches, request_id=request_id) if matches else ""
+            data = json.dumps({"text": ""}, ensure_ascii=False)
+            yield f"event: chunk\ndata: {data}\n\n"
+            done_payload = json.dumps({"done": True}, ensure_ascii=False)
+            yield f"event: done\ndata: {done_payload}\n\n"
+            return
 
-            user = (
-                f"USER_NAME:\n{user_name}\n\n"
-                f"QUESTION:\n{query}\n\n"
-                f"INFORMATION:\n{context}"
-            )
-            messages = [
+        # Smalltalk
+        if _is_smalltalk(query):
+            data = json.dumps({"text": _smalltalk_reply(user_name)}, ensure_ascii=False)
+            yield f"event: chunk\ndata: {data}\n\n"
+            done_payload = json.dumps({"done": True}, ensure_ascii=False)
+            yield f"event: done\ndata: {done_payload}\n\n"
+            return
+
+        # RAG + stream
+        matches = get_matches(query, top_k, request_id=request_id)
+        context = build_context(matches, request_id=request_id) if matches else ""
+        images = _extract_image_urls_from_matches(matches)
+
+        if images:
+            assets_payload = json.dumps({"images": images}, ensure_ascii=False)
+            yield f"event: assets\ndata: {assets_payload}\n\n"
+
+        user = (
+            f"USER_NAME:\n{user_name}\n\n"
+            f"QUESTION:\n{query}\n\n"
+            f"INFORMATION:\n{context}"
+        )
+        messages = [
             {"role": "system", "content": SYSTEM_PROMPT_CHAT},
-                {"role": "user", "content": user},
-            ]
+            {"role": "user", "content": user},
+        ]
 
         chunks = _iter_text_as_sse_chunks(
             _openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2),
             min_chars=28,
         )
 
-        # Emit chunks
         for part in chunks:
             part = strip_markdown_chars(part)
             data = json.dumps({"text": part}, ensure_ascii=False)
@@ -1741,6 +1800,7 @@ def chat_sse(payload: Dict = Body(...)):
         yield f"event: done\ndata: {done_payload}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=_sse_headers())
+
 
 
 
