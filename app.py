@@ -2845,28 +2845,17 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
 
     user_name = _extract_user_name(payload)
 
-    # First touch: show greeting only if it's a greeting message, otherwise skip and process directly
+    # First touch: always greet with Journey doc text
     if st.get("help_accepted") is None:
-        # Check if user message is empty or is a greeting/smalltalk
-        is_greeting = not user_message or _is_smalltalk(user_message)
-
-        if is_greeting:
-            # Show greeting message
-            st["help_offered"] = True
-            st["help_accepted"] = True  # user is already inside the MASTER template
-            _mnt_save_state_text(session_id, st)
-            return {
-                "session_id": session_id,
-                "mode": MASTER_MODE,
-                "text": "Do you need help completing your MASTER negotiation template?",
-                "done": False,
-            }
-        else:
-            # User has a specific question - skip greeting and process directly
-            st["help_offered"] = True
-            st["help_accepted"] = True
-            _mnt_save_state_text(session_id, st)
-            # Continue to LLM processing below (don't return here)
+        st["help_offered"] = True
+        st["help_accepted"] = True  # user is already inside the MASTER template
+        _mnt_save_state_text(session_id, st)
+        return {
+            "session_id": session_id,
+            "mode": MASTER_MODE,
+            "text": "Do you need help completing your MASTER negotiation template?",
+            "done": False,
+        }
 
     # User explicitly disabled help
     if st.get("help_accepted") is False:
@@ -3102,28 +3091,17 @@ def master_template_sse(payload: Dict = Body(...)):
             if dv is not None:
                 st["deal_value"] = dv
 
-            # First touch: show greeting only if it's a greeting message, otherwise skip and process directly
+            # First call greeting (if Bubble sends 'hi' as first message)
             if st.get("help_accepted") is None:
-                # Check if user message is empty or is a greeting/smalltalk
-                is_greeting = not user_message or _is_smalltalk(user_message)
-
-                if is_greeting:
-                    # Show greeting message
-                    st["help_offered"] = True
-                    st["help_accepted"] = True
-                    txt = "Do you need help completing your MASTER negotiation template?"
-                    data = json.dumps({"text": txt}, ensure_ascii=False)
-                    yield f"event: chunk\ndata: {data}\n\n"
-                    _mnt_save_state_text(session_id, st)
-                    done_payload = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
-                    yield f"event: done\ndata: {done_payload}\n\n"
-                    return
-                else:
-                    # User has a specific question - skip greeting and process directly
-                    st["help_offered"] = True
-                    st["help_accepted"] = True
-                    _mnt_save_state_text(session_id, st)
-                    # Continue to LLM processing below (don't return here)
+                st["help_offered"] = True
+                st["help_accepted"] = True
+                txt = "Do you need help completing your MASTER negotiation template?"
+                data = json.dumps({"text": txt}, ensure_ascii=False)
+                yield f"event: chunk\ndata: {data}\n\n"
+                _mnt_save_state_text(session_id, st)
+                done_payload = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
+                yield f"event: done\ndata: {done_payload}\n\n"
+                return
 
             user_name = _extract_user_name(payload)
 
