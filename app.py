@@ -163,34 +163,36 @@ def _apply_template_mode(user_msg: str, *, slide_key: Optional[str], query: str)
     if slide_key == "difficult_behaviours":
         # Template: Being Aware Of Tactics And Prepared To Respond
         rules = (
-            "\n\nTEMPLATE MODE (must follow exactly):\n"
-            "- Use the 'Prepare for difficult behaviours' template shown on the slide.\n"
-            "- Do NOT ask which model/template the user means.\n"
-            "- Output MUST be structured with these headings exactly (in this order):\n"
-            "  1) ANTICIPATE THEIR TACTICS\n"
-            "  2) YOUR RESPONSE BULLET\n"
-            "  3) MOVE IT ON (AIR)\n"
-            "- Under each heading: give 3–6 short bullet prompts the user should write into the box.\n"
-            "- Under each heading also include ONE short example line (example only).\n"
-            "- Keep it paste-ready. No generic advice list.\n"
-            "- End with ONE focused question asking for the first entry under 'ANTICIPATE THEIR TACTICS'.\n"
-        )
+       "\n\nTEMPLATE MODE (must follow exactly):\n"
+       "- Start with 1–2 short empathetic sentences acknowledging the user's situation.\n"
+       "- Briefly explain that the following template helps prepare for difficult behaviours.\n"
+       "- Then show the template.\n"
+       "- Do NOT ask which model/template the user means.\n"
+       "- Output MUST be structured with these headings exactly (in this order):\n"
+       "  1) ANTICIPATE THEIR TACTICS\n"
+       "  2) YOUR RESPONSE BULLET\n"
+       "  3) MOVE IT ON (AIR)\n"
+       "- Under each heading give 3–6 short bullet prompts.\n"
+       "- Under each heading include ONE short example line.\n"
+       "- End with ONE focused question asking for the first tactic.\n"
+    )
         return user_msg + rules
 
     # Default / confident mindset template
     rules = (
-        "\n\nTEMPLATE MODE (must follow exactly):\n"
-        "- Use the 'Preparing A Confident Mindset' template shown on the slide.\n"
-        "- Do NOT ask which model/template the user means.\n"
-        "- Output MUST be structured with these headings exactly (in this order):\n"
-        "  1) MY COMPANY\n"
-        "  2) THIS SITUATION\n"
-        "  3) THIS RELATIONSHIP\n"
-        "  4) MYSELF\n"
-        "- Under each heading: give 2–4 bullet prompts the user should write into the box.\n"
-        "- Under each heading also include ONE short example line (example only).\n"
-        "- Keep it paste-ready. No generic mindset tips list.\n"
-        "- End with ONE focused question asking for their inputs for 'MY COMPANY'.\n"
+       "\n\nTEMPLATE MODE (must follow exactly):\n"
+       "- Start with 1–2 short empathetic sentences.\n"
+       "- Briefly explain that the template helps build the right confident mindset.\n"
+       "- Then show the template.\n"
+       "- Do NOT ask which model/template the user means.\n"
+       "- Output MUST be structured with these headings exactly:\n"
+       "  1) MY COMPANY\n"
+       "  2) THIS SITUATION\n"
+       "  3) THIS RELATIONSHIP\n"
+       "  4) MYSELF\n"
+       "- Under each heading give 2–4 prompts.\n"
+       "- Include ONE short example line under each heading.\n"
+       "- End with ONE focused question asking for MY COMPANY.\n"
     )
     return user_msg + rules
 
