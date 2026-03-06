@@ -1965,12 +1965,12 @@ def _mnt_extract_focus(payload: Dict[str, Any]) -> Tuple[str, str]:
 def _mnt_extract_prefill_block(payload: Dict[str, Any]) -> str:
     """Extract prefilled template fields sent from Bubble.
 
-    Accepts either:
-      - a single string (already formatted), or
-      - a dict of {field_key: value}, or
-      - a list of dicts like [{"key": "...", "value": "..."}, ...]
+    Supports:
+      - prefill_text / prefill as a raw string
+      - dict payloads like {field_key: value}
+      - list payloads like [{"key": "...", "value": "..."}, ...]
+      - compact Bubble strings such as "my_items///contract length///payment terms"
     """
-    # Common keys Bubble might send
     raw = (
         payload.get("prefill_text")
         or payload.get("prefill")
@@ -1979,8 +1979,6 @@ def _mnt_extract_prefill_block(payload: Dict[str, Any]) -> str:
         or payload.get("fields_text")
         or payload.get("template_snapshot")
     )
-
-    # Also accept structured payloads
     raw_struct = payload.get("prefill_fields") or payload.get("filled_fields") or payload.get("fields")
 
     def _cap(s: str, n: int = 6000) -> str:
@@ -1989,7 +1987,62 @@ def _mnt_extract_prefill_block(payload: Dict[str, Any]) -> str:
             return (s[:n] + "…").strip()
         return s
 
+    def _clean_token(s: Any) -> str:
+        s = _safe_str(s)
+        s = re.sub(r"\s+", " ", s).strip(" -•:\t")
+        return s
+
+    def _looks_like_placeholder(s: str) -> bool:
+        ss = (s or "").strip().lower()
+        return ss in {
+            "my_items", "their_items", "items", "variables", "variable items",
+            "low", "mid", "high", "highest", "my list", "their list",
+            "my win zone", "their win zone", "my win zone variables", "their win zone variables"
+        }
+
+    def _from_raw_string(s: str) -> List[str]:
+        s = _safe_str(s)
+        if not s:
+            return []
+        normalized = s.replace("\r", "\n")
+        parts = [_clean_token(p) for p in re.split(r"(?:///|\n|;|•)", normalized)]
+        parts = [p for p in parts if p]
+        if not parts:
+            return []
+
+        lines: List[str] = []
+        seen = set()
+        current_group = ""
+        for part in parts:
+            low = part.lower()
+            if low in {"my_items", "my list", "my win zone", "my win zone variables"}:
+                current_group = "My variables"
+                continue
+            if low in {"their_items", "their list", "their win zone", "their win zone variables"}:
+                current_group = "Their variables"
+                continue
+            if _looks_like_placeholder(part):
+                continue
+            line = f"- {part}"
+            if current_group:
+                line = f"- {current_group}: {part}"
+            if line not in seen:
+                seen.add(line)
+                lines.append(line)
+
+        if lines:
+            return [
+                "These fields/variables are already present in the Bubble UI. Treat them as user-entered facts. Do not replace them with default examples such as price.",
+                *lines,
+            ]
+
+        cleaned = _clean_token(s)
+        return [cleaned] if cleaned else []
+
     if isinstance(raw, str) and raw.strip():
+        lines = _from_raw_string(raw)
+        if lines:
+            return _cap("PREFILLED FIELDS (from Bubble UI):\n" + "\n".join(lines))
         return _cap("PREFILLED FIELDS (from Bubble UI):\n" + raw.strip())
 
     if raw is None and raw_struct is None:
@@ -2000,33 +2053,32 @@ def _mnt_extract_prefill_block(payload: Dict[str, Any]) -> str:
     lines: List[str] = []
     if isinstance(data, dict):
         for k, v in data.items():
-            k = _safe_str(k)
+            k = _clean_token(k)
             if not k:
                 continue
-            val = _safe_str(v)
+            val = _clean_token(v)
             if not val:
                 continue
             lines.append(f"- {k}: {val}")
     elif isinstance(data, list):
         for item in data:
             if isinstance(item, dict):
-                k = _safe_str(item.get("key") or item.get("field") or item.get("name"))
-                val = _safe_str(item.get("value") or item.get("text"))
+                k = _clean_token(item.get("key") or item.get("field") or item.get("name"))
+                val = _clean_token(item.get("value") or item.get("text"))
                 if k and val:
                     lines.append(f"- {k}: {val}")
             elif isinstance(item, str) and item.strip():
-                lines.append(f"- {item.strip()}")
+                lines.extend(_from_raw_string(item))
     else:
         s = _safe_str(data)
         if s:
-            lines.append(s)
+            lines.extend(_from_raw_string(s))
 
     if not lines:
         return ""
 
     out = "PREFILLED FIELDS (from Bubble UI):\n" + "\n".join(lines)
     return _cap(out)
-
 
 # =========================
 # MASTER PHASE (M/A/S/T/E/R) GUIDE
@@ -2896,11 +2948,11 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
             f"- Next coaching question: {st.get('pending_phase_question')}\n"
         )
     state_memory_text = _mnt_build_state_memory_text(st)
-    if template_state_text:
-        state_memory_text = (state_memory_text + "\n\n" + template_state_text).strip()
     prefill_block = _mnt_extract_prefill_block(payload)
     if prefill_block:
         state_memory_text = (state_memory_text + "\n\n" + prefill_block).strip()
+    if template_state_text:
+        state_memory_text = (state_memory_text + "\n\n" + template_state_text).strip()
     if phase_block:
         state_memory_text = (state_memory_text + "\n\n" + phase_block).strip()
 
@@ -3108,11 +3160,11 @@ def master_template_sse(payload: Dict = Body(...)):
                 )
 
             state_mem = _mnt_build_state_memory_text(st)
-            if template_state_text:
-                state_mem = (state_mem + "\n\n" + template_state_text).strip()
             prefill_block = _mnt_extract_prefill_block(payload)
             if prefill_block:
                 state_mem = (state_mem + "\n\n" + prefill_block).strip()
+            if template_state_text:
+                state_mem = (state_mem + "\n\n" + template_state_text).strip()
             if phase_block:
                 state_mem = (state_mem + "\n\n" + phase_block).strip()
 
