@@ -739,7 +739,7 @@ def _tactics_subintent(text: str) -> str:
 def _tactics_instruction(text: str) -> str:
     subtype = _tactics_subintent(text)
     base = (
-        "\n\nIMPORTANT TACTICS OVERRIDE: The user is asking about tactics, power play, tricky behaviour, losing control, or tactical buyer behaviour. Use INFORMATION from Master Negotiator Slides first and answer this as a live negotiation coach. For this answer, do NOT default to variable-mapping, low/mid/high coaching, input flipping, MY LIST/THEIR LIST collection, mutual-interests language, generic template progression, or teaching-manual phrasing. First solve the tactics question directly. Treat tactics/factics as gameplay designed to put them on the back foot rather than as real positions. Restore a balanced playing field and confidence before you connect back to any template work. Use natural business language, not a framework dump. Do NOT default to offering COAL/GRAPHITE/DIAMOND slides. Do NOT just ask what scenarios they foresee. Avoid bullet-heavy answers unless the user explicitly asks for a list or the question is specifically about recognising signs. Prefer 1-3 compact paragraphs with direct coaching language. Avoid phrases like 'mutual interests', 'what works best for both of us', or other soft generic negotiation language unless INFORMATION clearly supports it. End with a firm coaching statement unless the user explicitly asked for field-filling help."
+        "\n\nIMPORTANT TACTICS OVERRIDE: The user is asking about tactics, power play, tricky behaviour, losing control, or tactical buyer behaviour. Use INFORMATION from Master Negotiator Slides first and answer this as a live negotiation coach. For this answer, do NOT default to variable-mapping, low/mid/high coaching, input flipping, MY LIST/THEIR LIST collection, mutual-interests language, generic template progression, or teaching-manual phrasing. First solve the tactics question directly. Treat tactics/factics as gameplay designed to put them on the back foot rather than as real positions. Restore a balanced playing field and confidence before you connect back to any template work. Use natural business language, not a framework dump. Do NOT default to offering COAL/GRAPHITE/DIAMOND slides. Do NOT just ask what scenarios they foresee. Avoid bullet-heavy answers unless the user explicitly asks for a list or the question is specifically about recognising signs. Prefer 1-3 compact paragraphs with direct coaching language. Avoid phrases like 'mutual interests', 'what works best for both of us', or other soft generic negotiation language unless INFORMATION clearly supports it. End with a firm coaching statement unless the user explicitly asked for field-filling help Do NOT invent your own breakdown of the Five Elements tool. Refer to Five Elements directly unless INFORMATION clearly provides the exact wording. Do NOT use the word 'context' in the answer. Avoid soft reflective wrap-ups like 'consider how you can apply this' or 'think about what resonates'. End with a firm coaching statement unless the user explicitly asked for field-filling help."
     )
 
     if subtype == "power_play":
@@ -749,7 +749,7 @@ def _tactics_instruction(text: str) -> str:
 
     if subtype == "lose_control":
         return base + (
-            " Specifically for this question: focus on what to do when they lose control in the meeting. Say that this is why tactics preparation matters. Prioritise Confident Mindset (page 14), balanced playing field, Five Elements (pages 28-33), and tactics preparation tool (page 34). Coach them to prepare for the likely move in advance and to bring themselves back to composed commercial control. Do not format this as a training list unless needed. Keep it sounding like a calm coach speaking before a live meeting."
+            " Specifically for this question: focus on what to do when they lose control in the meeting. Say that this is why tactics preparation matters. Prioritise Confident Mindset (page 14), balanced playing field, Five Elements (pages 28-33), and tactics preparation tool (page 34). Coach them to prepare for the likely move in advance and bring themselves back to composed commercial control. Do not format this as a training list unless needed. Do not drift into therapeutic language, breathing exercises, or reflective wrap-up lines. Keep it sounding like a calm commercial coach speaking before a live meeting."
         )
 
     if subtype == "detect_tactical":
@@ -759,7 +759,7 @@ def _tactics_instruction(text: str) -> str:
 
     if subtype == "prepare_tricky_questions":
         return base + (
-            " Specifically for this question: focus on preparation rather than diagnosis. Explain that tricky questions are curveballs designed to put them on the back foot. Prioritise tactics preparation tool (page 34), Five Elements (pages 28-33), and confident mindset. Tell them to anticipate the likely curveballs, prepare their responses in advance, and decide how they will steer the conversation back onto the real negotiation. Keep the answer practical and sharp rather than broad or theoretical."
+            " Specifically for this question: focus on preparation rather than diagnosis. Explain that tricky questions are curveballs designed to put them on the back foot. Prioritise tactics preparation tool (page 34), Five Elements (pages 28-33), and confident mindset. Tell them to anticipate the likely curveballs, prepare their responses in advance, and decide how they will steer the conversation back onto the real negotiation. Do not define Five Elements in your own words. Keep the answer practical, sharp, and non-theoretical."
         )
 
     return base + (
@@ -2061,6 +2061,9 @@ Tactics and difficult behaviour guidance:
 - Avoid phrases like 'mutual interests', 'what works for both sides', or similarly soft generic language unless INFORMATION clearly uses that idea. Stay in direct Diadem-style language.
 - For power play, losing control, and tricky-questions answers, prefer compact coaching paragraphs over bullet-heavy training-manual formatting. Use bullets only when the user is explicitly asking for signs, examples, or a checklist.
 - Use language like commercial control, balanced playing field, confidence, and preparation. Avoid sounding academic, therapeutic, or generic.
+- Do NOT invent or paraphrase the internal components of the Five Elements tool unless INFORMATION explicitly provides them. Refer to the tool directly rather than making up your own definition.
+- Do NOT use the word 'context' in the user-facing answer.
+- Avoid soft wrap-up lines such as 'Consider how you can apply this', 'Think about what resonates most', or similar reflective coaching endings. End with a firm practical statement unless a field-specific forward question is clearly required.
 
 Style:
 - Direct, businesslike, and practical.
@@ -2806,7 +2809,7 @@ def _master_llm_text(
 
     non_tactics_guard = ""
     if not _is_tactics_query(user_message):
-        non_tactics_guard = "\n\nIMPORTANT: The CURRENT user message is NOT a tactics question. Do NOT frame this answer around tactics, power play, tricky behaviour, difficult buyer behaviour, losing control, Coal, Soft Coal, good-cop behaviour, flattery, curveballs, balanced playing field, or Five Elements unless the user explicitly asked for that. Ignore any spillover from earlier turns. Answer the CURRENT question directly in normal MASTER template mode. If the user is asking what variables to prepare, what to type in a field, or how to complete the template, stay focused on that task only."
+        non_tactics_guard = "\n\nIMPORTANT: The CURRENT user message is NOT a tactics question. Do NOT frame this answer around tactics, power play, tricky behaviour, difficult buyer behaviour, losing control, Coal, Soft Coal, good-cop behaviour, flattery, curveballs, balanced playing field, or Five Elements unless the user explicitly asked for that. Ignore any spillover from earlier turns. Answer the CURRENT question directly in normal MASTER template mode. If the user is asking what variables to prepare, what to type in a field, or how to complete the template, stay focused on that task only. Do NOT add tactics examples, ABC, Five Elements, or power-play framing by habit. Keep the answer tightly scoped to the current template task."
     
     # Special handling for table entries recognition
     table_entries_handling = ""
@@ -3454,7 +3457,7 @@ def master_template_sse(payload: Dict = Body(...)):
 
             non_tactics_guard = ""
             if not _is_tactics_query(user_message):
-                non_tactics_guard = "\n\nIMPORTANT: The CURRENT user message is NOT a tactics question. Do NOT frame this answer around tactics, power play, tricky behaviour, difficult buyer behaviour, losing control, Coal, Soft Coal, good-cop behaviour, flattery, curveballs, balanced playing field, or Five Elements unless the user explicitly asked for that. Ignore any spillover from earlier turns. Answer the CURRENT question directly in normal MASTER template mode. If the user is asking what variables to prepare, what to type in a field, or how to complete the template, stay focused on that task only."
+                non_tactics_guard = "\n\nIMPORTANT: The CURRENT user message is NOT a tactics question. Do NOT frame this answer around tactics, power play, tricky behaviour, difficult buyer behaviour, losing control, Coal, Soft Coal, good-cop behaviour, flattery, curveballs, balanced playing field, or Five Elements unless the user explicitly asked for that. Ignore any spillover from earlier turns. Answer the CURRENT question directly in normal MASTER template mode. If the user is asking what variables to prepare, what to type in a field, or how to complete the template, stay focused on that task only. Do NOT add tactics examples, ABC, Five Elements, or power-play framing by habit. Keep the answer tightly scoped to the current template task."
             
             # Special handling for table entries recognition
             table_entries_handling = ""
