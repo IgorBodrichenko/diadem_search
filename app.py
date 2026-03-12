@@ -633,6 +633,46 @@ def _hint_for_question(question: str) -> str:
                 return item["hint"]
     return ""
 
+TACTICS_QUERY_PHRASES = [
+    "buyer uses tactics",
+    "using tactics",
+    "uses tactics",
+    "power play",
+    "play games with me",
+    "back foot",
+    "take power and control",
+    "tactical behaviour",
+    "tactical behavior",
+    "tricky buyer",
+    "difficult buyer",
+    "difficult behaviour",
+    "difficult behavior",
+    "tricky behaviour",
+    "tricky behavior",
+    "lose control in the meeting",
+    "losing control in the meeting",
+    "lose control",
+    "buyer says things and i lose control",
+    "regain control in negotiation",
+    "stop my buyer using tactics",
+    "deal with tactics",
+    "deal with buyer tactics",
+    "how do i know if my buyer is being tactical",
+    "being tactical in a negotiation",
+    "good relationship with my buyer",
+    "soft coal",
+    "good cop",
+    "flattery",
+    "individual is tricky",
+    "prepare for tricky questions",
+    "deal with difficult questions",
+    "handle difficult questions",
+]
+
+def _is_tactics_query(text: str) -> bool:
+    q = _norm_q(text)
+    return any(p in q for p in TACTICS_QUERY_PHRASES)
+
 
 # =========================
 # RAG HELPERS
@@ -1913,11 +1953,13 @@ Variable trading rules:
 - Payment terms logic: Shorter payment terms are more favorable (High position), longer terms are less favorable (Low position). Do NOT suggest extending payment terms as more ambitious - that's backwards.
 
 Tactics and difficult behaviour guidance:
-- If the user asks about tactics, power play, difficult behaviour, tricky buyers, losing control, or how to tell whether behaviour is tactical, answer using INFORMATION from Master Negotiator Slides first. Do NOT give generic reassurance.
+- If the user asks about tactics, power play, difficult behaviour, tricky buyers, losing control, tricky questions, or how to tell whether behaviour is tactical, answer using INFORMATION from Master Negotiator Slides first. Do NOT give generic reassurance.
+- Tactics-intent OVERRIDE: for these questions, do NOT start with variable mapping, low/mid/high coaching, input flipping, MY LIST/THEIR LIST collection, or template field completion. First answer as a live negotiation coach on tactics. Only connect back to the template after the tactics answer is complete.
 - Treat tactics and factics as gameplay, not as real positions. Say this idea in natural business language when relevant.
-- For tactics questions, anchor answers to the right tools when supported by INFORMATION: ABC model (page 6), Confident Mindset tool (page 14), DISC personality styles (page 15), tactic definition and common tactics/factics (pages 24-25), Five Elements tool (pages 28-33), tactics preparation tool (page 34), Negotiation Styles / Coal / Soft Coal (pages 37-45).
+- For tactics questions, anchor answers to the right tools when supported by INFORMATION: ABC model (page 6: awareness, balanced playing field, confidence), Confident Mindset tool (page 14), DISC personality styles (page 15), tactic definition and common tactics/factics (pages 24-25), Five Elements tool (pages 28-33), tactics preparation tool (page 34), Negotiation Styles / Coal / Soft Coal (pages 37-45).
 - If the user says they are relationship-led or dislike conflict, acknowledge that this can make gameplay feel harder, then coach them back to a balanced playing field and confident control.
 - If the user asks how to stop tactics and return to the real conversation, coach them to use the Five Elements tool and confident commercial control. Do not suggest saying nothing or responding with pure logic.
+- If the user asks about losing control in the meeting, coach them back to confidence, balanced playing field, and the Five Elements tool before discussing any variables or positions.
 - If the user asks how to know whether the buyer is being tactical, assess for one-sided asks, too few variables, unreasonable timelines, pressure, flattery, good-cop behaviour, or Soft Coal signs when supported by INFORMATION.
 - If the user asks about a tricky buyer, provide coaching and a practical next move first. Do NOT default to offering slides or listing COAL/GRAPHITE/DIAMOND unless INFORMATION clearly supports that exact path.
 
@@ -2660,8 +2702,8 @@ def _master_llm_text(
     
     # Special handling for tricky behaviors question
     tricky_behaviors_handling = ""
-    if any(phrase in user_msg_lower for phrase in ["tricky", "difficult", "prepare for", "behaviours", "behaviors", "questions", "individual is tricky"]):
-        tricky_behaviors_handling = "\n\nIMPORTANT: User is asking about tactics, power play, tricky behaviour, or losing control in a negotiation. Use INFORMATION from Master Negotiator Slides first. Respond like a live negotiation coach, not a framework index. In your answer: 1) acknowledge the concern briefly, 2) explain that tactics/factics are gameplay designed to put them on the back foot, 3) bring them back to a balanced playing field and confidence, 4) guide them to the most relevant tool supported by INFORMATION such as ABC model (page 6), Confident Mindset (page 14), DISC (page 15), Five Elements (pages 28-33), tactics preparation tool (page 34), or Negotiation Styles / Coal / Soft Coal (pages 37-45). Do NOT default to offering COAL/GRAPHITE/DIAMOND slides. Do NOT just ask what scenarios they foresee. Give practical coaching and a clear next move first."
+    if _is_tactics_query(user_message):
+        tricky_behaviors_handling = "\n\nIMPORTANT TACTICS OVERRIDE: The user is asking about tactics, power play, tricky behaviour, losing control, or tactical buyer behaviour. Use INFORMATION from Master Negotiator Slides first and answer this as a live negotiation coach. For this answer, do NOT default to variable-mapping, low/mid/high coaching, input flipping, MY LIST/THEIR LIST collection, or generic template progression. First solve the tactics question directly. Structure the response in natural language like this: 1) brief empathy/acknowledgement, 2) explain that tactics/factics are gameplay designed to put them on the back foot rather than real positions, 3) restore a balanced playing field and confidence, 4) guide them to the most relevant tool supported by INFORMATION such as ABC model (page 6: awareness, balanced playing field, confidence), Confident Mindset (page 14), DISC (page 15), Five Elements (pages 28-33), tactics preparation tool (page 34), or Negotiation Styles / Coal / Soft Coal (pages 37-45), 5) give one practical next move. If the question is about stopping tactics, returning to the real conversation, or losing control in the meeting, prioritize Five Elements, confidence, and balanced playing field before anything else. Do NOT default to offering COAL/GRAPHITE/DIAMOND slides. Do NOT just ask what scenarios they foresee. End with a statement unless the user explicitly asked for field-filling help."
     
     # Special handling for table entries recognition
     table_entries_handling = ""
