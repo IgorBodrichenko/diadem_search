@@ -674,6 +674,99 @@ def _is_tactics_query(text: str) -> bool:
     return any(p in q for p in TACTICS_QUERY_PHRASES)
 
 
+def _tactics_subintent(text: str) -> str:
+    q = _norm_q(text)
+
+    detect_signals = [
+        "how do i know if my buyer is being tactical",
+        "how do i know if they're being tactical",
+        "being tactical in a negotiation",
+        "good relationship with my buyer",
+        "soft coal",
+        "good cop",
+        "flattery",
+        "one-sided asks",
+        "one sided asks",
+        "unreasonable timelines",
+    ]
+    prepare_signals = [
+        "prepare for tricky questions",
+        "tricky questions",
+        "deal with difficult questions",
+        "handle difficult questions",
+        "individual is tricky",
+        "prepare for tricky",
+    ]
+    lose_control_signals = [
+        "lose control in the meeting",
+        "losing control in the meeting",
+        "lose control",
+        "buyer says things and i lose control",
+        "regain control in negotiation",
+    ]
+    power_play_signals = [
+        "buyer uses tactics",
+        "using tactics",
+        "uses tactics",
+        "power play",
+        "play games with me",
+        "back foot",
+        "take power and control",
+        "stop my buyer using tactics",
+        "deal with tactics",
+        "deal with buyer tactics",
+        "tricky buyer",
+        "difficult buyer",
+        "tactical behaviour",
+        "tactical behavior",
+        "difficult behaviour",
+        "difficult behavior",
+        "tricky behaviour",
+        "tricky behavior",
+    ]
+
+    if any(s in q for s in detect_signals):
+        return "detect_tactical"
+    if any(s in q for s in prepare_signals):
+        return "prepare_tricky_questions"
+    if any(s in q for s in lose_control_signals):
+        return "lose_control"
+    if any(s in q for s in power_play_signals):
+        return "power_play"
+    return "general_tactics"
+
+
+def _tactics_instruction(text: str) -> str:
+    subtype = _tactics_subintent(text)
+    base = (
+        "\n\nIMPORTANT TACTICS OVERRIDE: The user is asking about tactics, power play, tricky behaviour, losing control, or tactical buyer behaviour. Use INFORMATION from Master Negotiator Slides first and answer this as a live negotiation coach. For this answer, do NOT default to variable-mapping, low/mid/high coaching, input flipping, MY LIST/THEIR LIST collection, mutual-interests language, or generic template progression. First solve the tactics question directly. Treat tactics/factics as gameplay designed to put them on the back foot rather than as real positions. Restore a balanced playing field and confidence before you connect back to any template work. Use natural business language, not a framework dump. Do NOT default to offering COAL/GRAPHITE/DIAMOND slides. Do NOT just ask what scenarios they foresee. End with a statement unless the user explicitly asked for field-filling help."
+    )
+
+    if subtype == "power_play":
+        return base + (
+            " Specifically for this question: acknowledge that relationship-led people often find gameplay uncomfortable. Explain that the buyer is trying to take power and control, so the answer is not to treat the move as real. Re-anchor them to ABC model (awareness, balanced playing field, confidence), then guide them to the Five Elements tool as the main response tool. Give one practical next move focused on restoring commercial control in the meeting."
+        )
+
+    if subtype == "lose_control":
+        return base + (
+            " Specifically for this question: focus on what to do when they lose control in the meeting. Say that this is why tactics preparation matters. Prioritise Confident Mindset (page 14), balanced playing field, Five Elements (pages 28-33), and tactics preparation tool (page 34). Coach them to prepare for the likely move in advance and to bring themselves back to composed commercial control."
+        )
+
+    if subtype == "detect_tactical":
+        return base + (
+            " Specifically for this question: do not give the generic tactics answer. Diagnose the signs of tactical behaviour. Tell them to look for one-sided asks, too few variables on the table, unreasonable timelines, pressure, feeling powerless, flattery, good-cop behaviour, and Soft Coal / Coal signs when supported by INFORMATION. Then explain that if those signs are present, they should expect tactics/factics and prepare Five Elements responses while keeping ambition high."
+        )
+
+    if subtype == "prepare_tricky_questions":
+        return base + (
+            " Specifically for this question: focus on preparation rather than diagnosis. Explain that tricky questions are curveballs designed to put them on the back foot. Prioritise tactics preparation tool (page 34), Five Elements (pages 28-33), and confident mindset. Tell them to anticipate likely questions, prepare their responses in advance, and decide how they will steer the conversation back onto the real negotiation."
+        )
+
+    return base + (
+        " Specifically for this question: keep the response practical, confidence-led, and grounded in ABC model, Five Elements, and the most relevant tactics pages from INFORMATION."
+    )
+
+
 # =========================
 # RAG HELPERS
 # =========================
@@ -1960,8 +2053,11 @@ Tactics and difficult behaviour guidance:
 - If the user says they are relationship-led or dislike conflict, acknowledge that this can make gameplay feel harder, then coach them back to a balanced playing field and confident control.
 - If the user asks how to stop tactics and return to the real conversation, coach them to use the Five Elements tool and confident commercial control. Do not suggest saying nothing or responding with pure logic.
 - If the user asks about losing control in the meeting, coach them back to confidence, balanced playing field, and the Five Elements tool before discussing any variables or positions.
-- If the user asks how to know whether the buyer is being tactical, assess for one-sided asks, too few variables, unreasonable timelines, pressure, flattery, good-cop behaviour, or Soft Coal signs when supported by INFORMATION.
+- If the user asks how to know whether the buyer is being tactical, do NOT give the generic tactics answer. Assess for one-sided asks, too few variables, unreasonable timelines, pressure, feeling powerless, flattery, good-cop behaviour, or Soft Coal signs when supported by INFORMATION.
+- If the user asks how to prepare for tricky questions, focus on anticipating curveballs, using the tactics preparation tool, preparing Five Elements responses, and deciding how to steer back to the real negotiation.
+- If the user asks about losing control in the meeting, focus on regaining composed commercial control through confidence, balanced playing field, Five Elements, and tactics preparation.
 - If the user asks about a tricky buyer, provide coaching and a practical next move first. Do NOT default to offering slides or listing COAL/GRAPHITE/DIAMOND unless INFORMATION clearly supports that exact path.
+- Avoid phrases like 'mutual interests' unless INFORMATION clearly uses that idea. Stay in direct Diadem-style language.
 
 Style:
 - Direct, businesslike, and practical.
@@ -2703,7 +2799,7 @@ def _master_llm_text(
     # Special handling for tricky behaviors question
     tricky_behaviors_handling = ""
     if _is_tactics_query(user_message):
-        tricky_behaviors_handling = "\n\nIMPORTANT TACTICS OVERRIDE: The user is asking about tactics, power play, tricky behaviour, losing control, or tactical buyer behaviour. Use INFORMATION from Master Negotiator Slides first and answer this as a live negotiation coach. For this answer, do NOT default to variable-mapping, low/mid/high coaching, input flipping, MY LIST/THEIR LIST collection, or generic template progression. First solve the tactics question directly. Structure the response in natural language like this: 1) brief empathy/acknowledgement, 2) explain that tactics/factics are gameplay designed to put them on the back foot rather than real positions, 3) restore a balanced playing field and confidence, 4) guide them to the most relevant tool supported by INFORMATION such as ABC model (page 6: awareness, balanced playing field, confidence), Confident Mindset (page 14), DISC (page 15), Five Elements (pages 28-33), tactics preparation tool (page 34), or Negotiation Styles / Coal / Soft Coal (pages 37-45), 5) give one practical next move. If the question is about stopping tactics, returning to the real conversation, or losing control in the meeting, prioritize Five Elements, confidence, and balanced playing field before anything else. Do NOT default to offering COAL/GRAPHITE/DIAMOND slides. Do NOT just ask what scenarios they foresee. End with a statement unless the user explicitly asked for field-filling help."
+        tricky_behaviors_handling = _tactics_instruction(user_message)
     
     # Special handling for table entries recognition
     table_entries_handling = ""
@@ -3346,8 +3442,8 @@ def master_template_sse(payload: Dict = Body(...)):
             
             # Special handling for tricky behaviors question
             tricky_behaviors_handling = ""
-            if any(phrase in user_msg_lower for phrase in ["tricky", "difficult", "prepare for", "behaviours", "behaviors", "questions", "individual is tricky"]):
-                tricky_behaviors_handling = "\n\nIMPORTANT: User is asking about tactics, power play, tricky behaviour, or losing control in a negotiation. Use INFORMATION from Master Negotiator Slides first. Respond like a live negotiation coach, not a framework index. In your answer: 1) acknowledge the concern briefly, 2) explain that tactics/factics are gameplay designed to put them on the back foot, 3) bring them back to a balanced playing field and confidence, 4) guide them to the most relevant tool supported by INFORMATION such as ABC model (page 6), Confident Mindset (page 14), DISC (page 15), Five Elements (pages 28-33), tactics preparation tool (page 34), or Negotiation Styles / Coal / Soft Coal (pages 37-45). Do NOT default to offering COAL/GRAPHITE/DIAMOND slides. Do NOT just ask what scenarios they foresee. Give practical coaching and a clear next move first."
+            if _is_tactics_query(user_message):
+                tricky_behaviors_handling = _tactics_instruction(user_message)
             
             # Special handling for table entries recognition
             table_entries_handling = ""
