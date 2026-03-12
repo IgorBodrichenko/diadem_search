@@ -566,11 +566,11 @@ def _norm_q(s: str) -> str:
 SEARCH_HINTS = [
     {
         "match_any": ["balance the power in a negotiation", "balance power in a negotiation", "balance the power"],
-        "hint": "confident mindset pages 9-11",
+        "hint": "balanced playing field confident mindset ABC model pages 6 14",
     },
     {
         "match_any": ["push back without upsetting the relationship", "push back without upsetting", "push back"],
-        "hint": "tactics prepared to respond pages 65-74 slides 7 8 15",
+        "hint": "five elements tool tactics prepared to respond pages 28 33 34",
     },
     {
         "match_any": ["difference between selling and negotiation", "selling vs negotiation", "selling and negotiation"],
@@ -585,16 +585,43 @@ SEARCH_HINTS = [
         ],
         "hint": "slides 28-34 difficult questions",
     },
-{
-    "match_any": [
-        "earth element", "element earth", "earth rules", "7 rules earth", "seven rules earth",
-        "water element", "element water", "water rules", "fire element", "element fire", "fire rules",
-        "silence element", "element silence", "silence rules",
-        "diadem earth", "diadem water", "diadem fire", "diadem silence"
-    ],
-    "hint": "Master Negotiator Slides elements water earth fire silence rules",
-},
-
+    {
+        "match_any": [
+            "earth element", "element earth", "earth rules", "7 rules earth", "seven rules earth",
+            "water element", "element water", "water rules", "fire element", "element fire", "fire rules",
+            "silence element", "element silence", "silence rules",
+            "diadem earth", "diadem water", "diadem fire", "diadem silence"
+        ],
+        "hint": "Master Negotiator Slides elements water earth fire silence rules",
+    },
+    {
+        "match_any": [
+            "tactics", "tactic", "factics", "power play", "play games with me", "back foot",
+            "take power and control", "tactical behaviour", "tactical behavior", "buyer using tactics",
+            "stop my buyer using tactics", "deal with tactics", "deal with buyer tactics"
+        ],
+        "hint": "Master Negotiator Slides tactics gameplay pages 24 25 five elements pages 28 33 tactics preparation page 34 balanced playing field page 6 confident mindset page 14",
+    },
+    {
+        "match_any": [
+            "lose control in the meeting", "losing control in the meeting", "lose control",
+            "buyer says things and i lose control", "regain control in negotiation"
+        ],
+        "hint": "Master Negotiator Slides five elements pages 28 33 tactics preparation page 34 balanced playing field page 6 confident mindset page 14",
+    },
+    {
+        "match_any": [
+            "good relationship with my buyer", "how do i know if they're being tactical",
+            "being tactical in a negotiation", "soft coal", "good cop", "flattery", "coal style"
+        ],
+        "hint": "Master Negotiator Slides negotiation styles coal soft coal pages 37 45 tactics and factics pages 24 25 five elements pages 28 33",
+    },
+    {
+        "match_any": [
+            "disc", "personality style", "personality styles", "d style", "s style", "i style"
+        ],
+        "hint": "Master Negotiator Slides DISC personality styles page 15",
+    },
 ]
 
 
@@ -1885,6 +1912,15 @@ Variable trading rules:
 - HBP Defense: If the user states a target % increase, start from +3–5% above it as the opening anchor if supported by INFORMATION.
 - Payment terms logic: Shorter payment terms are more favorable (High position), longer terms are less favorable (Low position). Do NOT suggest extending payment terms as more ambitious - that's backwards.
 
+Tactics and difficult behaviour guidance:
+- If the user asks about tactics, power play, difficult behaviour, tricky buyers, losing control, or how to tell whether behaviour is tactical, answer using INFORMATION from Master Negotiator Slides first. Do NOT give generic reassurance.
+- Treat tactics and factics as gameplay, not as real positions. Say this idea in natural business language when relevant.
+- For tactics questions, anchor answers to the right tools when supported by INFORMATION: ABC model (page 6), Confident Mindset tool (page 14), DISC personality styles (page 15), tactic definition and common tactics/factics (pages 24-25), Five Elements tool (pages 28-33), tactics preparation tool (page 34), Negotiation Styles / Coal / Soft Coal (pages 37-45).
+- If the user says they are relationship-led or dislike conflict, acknowledge that this can make gameplay feel harder, then coach them back to a balanced playing field and confident control.
+- If the user asks how to stop tactics and return to the real conversation, coach them to use the Five Elements tool and confident commercial control. Do not suggest saying nothing or responding with pure logic.
+- If the user asks how to know whether the buyer is being tactical, assess for one-sided asks, too few variables, unreasonable timelines, pressure, flattery, good-cop behaviour, or Soft Coal signs when supported by INFORMATION.
+- If the user asks about a tricky buyer, provide coaching and a practical next move first. Do NOT default to offering slides or listing COAL/GRAPHITE/DIAMOND unless INFORMATION clearly supports that exact path.
+
 Style:
 - Direct, businesslike, and practical.
 - Plain text only. No markdown.
@@ -1961,6 +1997,124 @@ def _mnt_extract_focus(payload: Dict[str, Any]) -> Tuple[str, str]:
     focus_field = _safe_str(payload.get("focus_field") or payload.get("active_field") or payload.get("field_key"))
     return active_section_id, focus_field
 
+
+def _mnt_extract_prefill_block(payload: Dict[str, Any]) -> str:
+    """Extract prefilled template fields sent from Bubble.
+
+    Supports:
+      - prefill_text / prefill as a raw string
+      - dict payloads like {field_key: value}
+      - list payloads like [{"key": "...", "value": "..."}, ...]
+      - compact Bubble strings such as "my_items///contract length///payment terms"
+    """
+    raw = (
+        payload.get("prefill_text")
+        or payload.get("prefill")
+        or payload.get("filled_fields_text")
+        or payload.get("template_fields_text")
+        or payload.get("fields_text")
+        or payload.get("template_snapshot")
+    )
+    raw_struct = payload.get("prefill_fields") or payload.get("filled_fields") or payload.get("fields")
+
+    def _cap(s: str, n: int = 6000) -> str:
+        s = (s or "").strip()
+        if len(s) > n:
+            return (s[:n] + "…").strip()
+        return s
+
+    def _clean_token(s: Any) -> str:
+        s = _safe_str(s)
+        s = re.sub(r"\s+", " ", s).strip(" -•:\t")
+        return s
+
+    def _looks_like_placeholder(s: str) -> bool:
+        ss = (s or "").strip().lower()
+        return ss in {
+            "my_items", "their_items", "items", "variables", "variable items",
+            "low", "mid", "high", "highest", "my list", "their list",
+            "my win zone", "their win zone", "my win zone variables", "their win zone variables"
+        }
+
+    def _from_raw_string(s: str) -> List[str]:
+        s = _safe_str(s)
+        if not s:
+            return []
+        normalized = s.replace("\r", "\n")
+        parts = [_clean_token(p) for p in re.split(r"(?:///|\n|;|•)", normalized)]
+        parts = [p for p in parts if p]
+        if not parts:
+            return []
+
+        lines: List[str] = []
+        seen = set()
+        current_group = ""
+        for part in parts:
+            low = part.lower()
+            if low in {"my_items", "my list", "my win zone", "my win zone variables"}:
+                current_group = "My variables"
+                continue
+            if low in {"their_items", "their list", "their win zone", "their win zone variables"}:
+                current_group = "Their variables"
+                continue
+            if _looks_like_placeholder(part):
+                continue
+            line = f"- {part}"
+            if current_group:
+                line = f"- {current_group}: {part}"
+            if line not in seen:
+                seen.add(line)
+                lines.append(line)
+
+        if lines:
+            return [
+                "These fields/variables are already present in the Bubble UI. Treat them as user-entered facts. Do not replace them with default examples such as price.",
+                *lines,
+            ]
+
+        cleaned = _clean_token(s)
+        return [cleaned] if cleaned else []
+
+    if isinstance(raw, str) and raw.strip():
+        lines = _from_raw_string(raw)
+        if lines:
+            return _cap("PREFILLED FIELDS (from Bubble UI):\n" + "\n".join(lines))
+        return _cap("PREFILLED FIELDS (from Bubble UI):\n" + raw.strip())
+
+    if raw is None and raw_struct is None:
+        return ""
+
+    data = raw_struct if raw_struct is not None else raw
+
+    lines: List[str] = []
+    if isinstance(data, dict):
+        for k, v in data.items():
+            k = _clean_token(k)
+            if not k:
+                continue
+            val = _clean_token(v)
+            if not val:
+                continue
+            lines.append(f"- {k}: {val}")
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                k = _clean_token(item.get("key") or item.get("field") or item.get("name"))
+                val = _clean_token(item.get("value") or item.get("text"))
+                if k and val:
+                    lines.append(f"- {k}: {val}")
+            elif isinstance(item, str) and item.strip():
+                lines.extend(_from_raw_string(item))
+    else:
+        s = _safe_str(data)
+        if s:
+            lines.extend(_from_raw_string(s))
+
+    if not lines:
+        return ""
+
+    out = "PREFILLED FIELDS (from Bubble UI):\n" + "\n".join(lines)
+    return _cap(out)
 
 # =========================
 # MASTER PHASE (M/A/S/T/E/R) GUIDE
@@ -2507,7 +2661,7 @@ def _master_llm_text(
     # Special handling for tricky behaviors question
     tricky_behaviors_handling = ""
     if any(phrase in user_msg_lower for phrase in ["tricky", "difficult", "prepare for", "behaviours", "behaviors", "questions", "individual is tricky"]):
-        tricky_behaviors_handling = "\n\nIMPORTANT: User is asking about preparing for tricky behaviors/questions. Provide shortcuts/options using INFORMATION: a) Work on developing a confident mindset, b) Tell me more about the relationship (when introducing COAL, GRAPHITE, DIAMOND models, suggest showing the slides to help explain these concepts - use INFORMATION to find relevant slide references), c) Show a model to help approach this confidently (use INFORMATION to find relevant models/techniques). When mentioning COAL, GRAPHITE, or DIAMOND, explicitly suggest: 'Would it help if I show you the slides that explain COAL, GRAPHITE, and DIAMOND?' or 'I can show you the slides that cover this.' Present these options conversationally, then allow user to respond. Do NOT just ask what scenarios they foresee - provide helpful options first."
+        tricky_behaviors_handling = "\n\nIMPORTANT: User is asking about tactics, power play, tricky behaviour, or losing control in a negotiation. Use INFORMATION from Master Negotiator Slides first. Respond like a live negotiation coach, not a framework index. In your answer: 1) acknowledge the concern briefly, 2) explain that tactics/factics are gameplay designed to put them on the back foot, 3) bring them back to a balanced playing field and confidence, 4) guide them to the most relevant tool supported by INFORMATION such as ABC model (page 6), Confident Mindset (page 14), DISC (page 15), Five Elements (pages 28-33), tactics preparation tool (page 34), or Negotiation Styles / Coal / Soft Coal (pages 37-45). Do NOT default to offering COAL/GRAPHITE/DIAMOND slides. Do NOT just ask what scenarios they foresee. Give practical coaching and a clear next move first."
     
     # Special handling for table entries recognition
     table_entries_handling = ""
@@ -2830,6 +2984,9 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
             f"- Next coaching question: {st.get('pending_phase_question')}\n"
         )
     state_memory_text = _mnt_build_state_memory_text(st)
+    prefill_block = _mnt_extract_prefill_block(payload)
+    if prefill_block:
+        state_memory_text = (state_memory_text + "\n\n" + prefill_block).strip()
     if template_state_text:
         state_memory_text = (state_memory_text + "\n\n" + template_state_text).strip()
     if phase_block:
@@ -3039,6 +3196,9 @@ def master_template_sse(payload: Dict = Body(...)):
                 )
 
             state_mem = _mnt_build_state_memory_text(st)
+            prefill_block = _mnt_extract_prefill_block(payload)
+            if prefill_block:
+                state_mem = (state_mem + "\n\n" + prefill_block).strip()
             if template_state_text:
                 state_mem = (state_mem + "\n\n" + template_state_text).strip()
             if phase_block:
@@ -3145,7 +3305,7 @@ def master_template_sse(payload: Dict = Body(...)):
             # Special handling for tricky behaviors question
             tricky_behaviors_handling = ""
             if any(phrase in user_msg_lower for phrase in ["tricky", "difficult", "prepare for", "behaviours", "behaviors", "questions", "individual is tricky"]):
-                tricky_behaviors_handling = "\n\nIMPORTANT: User is asking about preparing for tricky behaviors/questions. Provide shortcuts/options using INFORMATION: a) Work on developing a confident mindset, b) Tell me more about the relationship (when introducing COAL, GRAPHITE, DIAMOND models, suggest showing the slides to help explain these concepts - use INFORMATION to find relevant slide references), c) Show a model to help approach this confidently (use INFORMATION to find relevant models/techniques). When mentioning COAL, GRAPHITE, or DIAMOND, explicitly suggest: 'Would it help if I show you the slides that explain COAL, GRAPHITE, and DIAMOND?' or 'I can show you the slides that cover this.' Present these options conversationally, then allow user to respond. Do NOT just ask what scenarios they foresee - provide helpful options first."
+                tricky_behaviors_handling = "\n\nIMPORTANT: User is asking about tactics, power play, tricky behaviour, or losing control in a negotiation. Use INFORMATION from Master Negotiator Slides first. Respond like a live negotiation coach, not a framework index. In your answer: 1) acknowledge the concern briefly, 2) explain that tactics/factics are gameplay designed to put them on the back foot, 3) bring them back to a balanced playing field and confidence, 4) guide them to the most relevant tool supported by INFORMATION such as ABC model (page 6), Confident Mindset (page 14), DISC (page 15), Five Elements (pages 28-33), tactics preparation tool (page 34), or Negotiation Styles / Coal / Soft Coal (pages 37-45). Do NOT default to offering COAL/GRAPHITE/DIAMOND slides. Do NOT just ask what scenarios they foresee. Give practical coaching and a clear next move first."
             
             # Special handling for table entries recognition
             table_entries_handling = ""
