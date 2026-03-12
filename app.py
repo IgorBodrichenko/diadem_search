@@ -2051,6 +2051,7 @@ Tactics and difficult behaviour guidance:
 - Treat tactics and factics as gameplay, not as real positions. Say this idea in natural business language when relevant.
 - For tactics questions, anchor answers to the right tools when supported by INFORMATION: ABC model (page 6: awareness, balanced playing field, confidence), Confident Mindset tool (page 14), DISC personality styles (page 15), tactic definition and common tactics/factics (pages 24-25), Five Elements tool (pages 28-33), tactics preparation tool (page 34), Negotiation Styles / Coal / Soft Coal (pages 37-45).
 - If the user says they are relationship-led or dislike conflict, acknowledge that this can make gameplay feel harder, then coach them back to a balanced playing field and confident control.
+- Tactics guidance is conditional, not default. Use it only when the CURRENT user message is explicitly about tactics, power play, tricky questions, losing control, tactical behaviour, good-cop / flattery, Soft Coal / Coal, or similar gameplay. For ordinary template questions such as what variables to prepare, what to type, what to put in a field, pricing discussion, payment terms setup, or MASTER field completion, do NOT frame the answer around tactics unless the user explicitly asked about tactics.
 - If the user asks how to stop tactics and return to the real conversation, coach them to use the Five Elements tool and confident commercial control. Do not suggest saying nothing or responding with pure logic.
 - If the user asks about losing control in the meeting, coach them back to confidence, balanced playing field, and the Five Elements tool before discussing any variables or positions.
 - If the user asks how to know whether the buyer is being tactical, do NOT give the generic tactics answer. Assess for one-sided asks, too few variables, unreasonable timelines, pressure, feeling powerless, flattery, good-cop behaviour, or Soft Coal behaviour / indicators when supported by INFORMATION.
@@ -2802,6 +2803,10 @@ def _master_llm_text(
     tricky_behaviors_handling = ""
     if _is_tactics_query(user_message):
         tricky_behaviors_handling = _tactics_instruction(user_message)
+
+    non_tactics_guard = ""
+    if not _is_tactics_query(user_message):
+        non_tactics_guard = "\n\nIMPORTANT: The CURRENT user message is NOT a tactics question. Do NOT frame this answer around tactics, power play, tricky behaviour, difficult buyer behaviour, losing control, Coal, Soft Coal, good-cop behaviour, flattery, curveballs, balanced playing field, or Five Elements unless the user explicitly asked for that. Ignore any spillover from earlier turns. Answer the CURRENT question directly in normal MASTER template mode. If the user is asking what variables to prepare, what to type in a field, or how to complete the template, stay focused on that task only."
     
     # Special handling for table entries recognition
     table_entries_handling = ""
@@ -2873,7 +2878,7 @@ def _master_llm_text(
         f"{user_message_base}"
         f"STATE_MEMORY:\n{mem_line}\n\n"
         f"INFORMATION:\n{info}\n\n"
-        f"TASK: Give Diadem-only, template-ready guidance for the MASTER template.{initial_help_handling}{definition_handling}{variable_name_handling}{payment_terms_context}{single_position_handling}{all_positions_handling}{their_side_handling}{table_entries_handling}{business_question_handling}{tricky_behaviors_handling}{time_management_handling}{completion_handling}{strategy_handling}{conflict_handling}{empathy_handling}\n"
+        f"TASK: Give Diadem-only, template-ready guidance for the MASTER template.{initial_help_handling}{definition_handling}{variable_name_handling}{payment_terms_context}{single_position_handling}{all_positions_handling}{their_side_handling}{table_entries_handling}{business_question_handling}{tricky_behaviors_handling}{non_tactics_guard}{time_management_handling}{completion_handling}{strategy_handling}{conflict_handling}{empathy_handling}\n"
         f"If FOCUS_FIELD is set: tell the user exactly what to type there and give 1–2 paste-ready lines.\n"
         f"If user asks what variables: Use INFORMATION to suggest relevant variables conversationally, then ask which one they'd like to add. Do NOT show Low/High/Highest positions.\n"
         f"Do NOT refuse. If INFORMATION is thin, still give best-effort Diadem guidance.\n"
@@ -3446,6 +3451,10 @@ def master_template_sse(payload: Dict = Body(...)):
             tricky_behaviors_handling = ""
             if _is_tactics_query(user_message):
                 tricky_behaviors_handling = _tactics_instruction(user_message)
+
+            non_tactics_guard = ""
+            if not _is_tactics_query(user_message):
+                non_tactics_guard = "\n\nIMPORTANT: The CURRENT user message is NOT a tactics question. Do NOT frame this answer around tactics, power play, tricky behaviour, difficult buyer behaviour, losing control, Coal, Soft Coal, good-cop behaviour, flattery, curveballs, balanced playing field, or Five Elements unless the user explicitly asked for that. Ignore any spillover from earlier turns. Answer the CURRENT question directly in normal MASTER template mode. If the user is asking what variables to prepare, what to type in a field, or how to complete the template, stay focused on that task only."
             
             # Special handling for table entries recognition
             table_entries_handling = ""
@@ -3539,7 +3548,7 @@ def master_template_sse(payload: Dict = Body(...)):
                 f"{user_message_base}"
                 f"STATE_MEMORY:\n{state_mem}\n\n"
                 f"INFORMATION:\n{info}\n\n"
-                f"TASK: Give Diadem-only, template-ready guidance for the MASTER template.{initial_help_handling}{definition_handling}{variable_name_handling}{payment_terms_context}{single_position_handling}{all_positions_handling}{their_side_handling}{table_entries_handling}{business_question_handling}{tricky_behaviors_handling}{time_management_handling}{completion_handling}{strategy_handling}{conflict_handling}{empathy_handling}\n"
+                f"TASK: Give Diadem-only, template-ready guidance for the MASTER template.{initial_help_handling}{definition_handling}{variable_name_handling}{payment_terms_context}{single_position_handling}{all_positions_handling}{their_side_handling}{table_entries_handling}{business_question_handling}{tricky_behaviors_handling}{non_tactics_guard}{time_management_handling}{completion_handling}{strategy_handling}{conflict_handling}{empathy_handling}\n"
                 f"If FOCUS_FIELD is set: tell the user exactly what to type there and give 1–2 paste-ready lines.\n"
                 f"If user asks what variables: Use INFORMATION to suggest relevant variables conversationally, then ask which one they'd like to add. Do NOT show Low/High/Highest positions.\n"
                 f"Do NOT refuse. If INFORMATION is thin, still give best-effort Diadem guidance.{clarify_note}\n"
