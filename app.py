@@ -436,6 +436,41 @@ def _extract_user_text(payload: Dict[str, Any]) -> str:
             return s
     return ""
 
+def _extract_admin_settings(payload: Dict[str, Any]) -> Tuple[str, str]:
+    admin_prompt = _safe_str(payload.get("admin_prompt") or payload.get("adminPrompt"))
+    summary_guidance_all = _safe_str(payload.get("summary_guidance_all") or payload.get("summaryGuidanceAll"))
+    if admin_prompt:
+        admin_prompt = admin_prompt[:12000]
+    if summary_guidance_all:
+        summary_guidance_all = summary_guidance_all[:20000]
+    return admin_prompt, summary_guidance_all
+
+
+def _build_admin_system_addendum(admin_prompt: str = "", summary_guidance_all: str = "", mode_label: str = "") -> str:
+    admin_prompt = (admin_prompt or "").strip()
+    summary_guidance_all = (summary_guidance_all or "").strip()
+    if not admin_prompt and not summary_guidance_all:
+        return ""
+
+    mode_note = f" for {mode_label}" if mode_label else ""
+    parts = [
+        "\n\nSUPPLEMENTAL ADMIN GUIDANCE" + mode_note + ":",
+        "- This guidance is optional support only.",
+        "- It must not change the endpoint response schema, event format, or required output structure.",
+        "- It must not override explicit hard constraints already defined in the base system prompt.",
+        "- Use it only when relevant to the user request.",
+        "- Prefer the primary methodology and INFORMATION first; use admin guidance to refine tone, emphasis, and examples.",
+        "- Never mention admin guidance, uploaded examples, or internal settings in the user-facing answer.",
+    ]
+
+    if admin_prompt:
+        parts.append("\nADMIN_PROMPT:\n" + admin_prompt)
+    if summary_guidance_all:
+        parts.append("\nSUMMARY_GUIDANCE_ALL:\n" + summary_guidance_all)
+
+    return "\n".join(parts).strip()
+
+
 
 # =========================
 # TEXT CLEANUP (NO MARKDOWN)
@@ -1801,6 +1836,7 @@ def chat(payload: Dict = Body(...)):
     query = (payload.get("query") or "").strip()
     top_k = int(payload.get("top_k") or TOP_K)
     user_name = _extract_user_name(payload)
+    admin_prompt, summary_guidance_all = _extract_admin_settings(payload)
 
     session_id = _get_or_create_session_id(payload)
     request_id = str(uuid.uuid4())[:8]
@@ -1824,7 +1860,7 @@ def chat(payload: Dict = Body(...)):
     resp = openai.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT_CHAT},
+            {"role": "system", "content": SYSTEM_PROMPT_CHAT + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="chat")},
             {"role": "user", "content": user},
         ],
         temperature=0.2,
@@ -1847,6 +1883,7 @@ def chat_sse(payload: Dict = Body(...)):
     query = (payload.get("query") or "").strip()
     top_k = int(payload.get("top_k") or TOP_K)
     user_name = _extract_user_name(payload)
+    admin_prompt, summary_guidance_all = _extract_admin_settings(payload)
 
     def gen():
         start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
@@ -1867,7 +1904,7 @@ def chat_sse(payload: Dict = Body(...)):
                 f"INFORMATION:\n{context}"
             )
             messages = [
-            {"role": "system", "content": SYSTEM_PROMPT_CHAT},
+            {"role": "system", "content": SYSTEM_PROMPT_CHAT + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="chat")},
                 {"role": "user", "content": user},
             ]
 
@@ -2678,6 +2715,8 @@ def _master_llm_text(
     info: str,
     state_memory: str = "",
     conversation_context: str = "",
+    admin_prompt: str = "",
+    summary_guidance_all: str = "",
 ) -> str:
     # Compact user prompt. INFORMATION is retrieved from Pinecone.
     deal_line = "" if deal_value is None else f"DEAL_VALUE: {deal_value}\n"
@@ -2889,7 +2928,7 @@ def _master_llm_text(
     )
 
     messages = [
-        {"role": "system", "content": MASTER_SYSTEM_PROMPT_TEXT},
+        {"role": "system", "content": MASTER_SYSTEM_PROMPT_TEXT + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="master")},
         {"role": "user", "content": prompt_user},
     ]
     resp = openai.chat.completions.create(
@@ -2962,6 +3001,7 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
 
 
     user_name = _extract_user_name(payload)
+    admin_prompt, summary_guidance_all = _extract_admin_settings(payload)
 
     # First touch: show greeting only if it's a greeting message, otherwise skip and process directly
     if st.get("help_accepted") is None:
@@ -3151,6 +3191,8 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
             state_memory=state_memory_text,
             info=info,
             conversation_context=conversation_context,
+            admin_prompt=admin_prompt,
+            summary_guidance_all=summary_guidance_all,
         )
     except Exception as e:
         _jlog("master_template_llm_error", session_id=session_id, err=str(e)[:800])
@@ -3195,6 +3237,7 @@ def master_template(payload: Dict = Body(...)):
 def master_template_sse(payload: Dict = Body(...)):
     """SSE for MASTER template (streams assistant text)."""
     session_id = _get_or_create_session_id(payload)
+    admin_prompt, summary_guidance_all = _extract_admin_settings(payload)
 
     def gen():
         start_payload = json.dumps({"session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
@@ -3558,7 +3601,7 @@ def master_template_sse(payload: Dict = Body(...)):
                 f"\n\nCRITICAL FINAL RULE: Unless the user is explicitly asking for help filling a specific field (variable_name when FOCUS_FIELD is set, or asking 'what variable' or 'which variable'), DO NOT end your response with ANY question. End with a statement. The user will decide their next step. If you need to guide them, use statements like 'Consider...', 'Think about...', or 'You might want to...' instead of questions. This rule overrides any other instruction about asking questions."
             )
             messages = [
-                {"role": "system", "content": MASTER_SYSTEM_PROMPT_TEXT},
+                {"role": "system", "content": MASTER_SYSTEM_PROMPT_TEXT + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="master")},
                 {"role": "user", "content": prompt_user},
             ]
 
