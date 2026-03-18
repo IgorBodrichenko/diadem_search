@@ -4,22 +4,18 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-import fitz  # pymupdf
 import httpx
 from docx import Document
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI
 from openai import OpenAI
+from pydantic import BaseModel
+from pypdf import PdfReader
 
 app = FastAPI()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-
-# =========================
-# Request / Response models
-# =========================
 
 class ParseAdminGuidanceRequest(BaseModel):
     file_url: str
@@ -35,27 +31,15 @@ class ParseAdminGuidanceResponse(BaseModel):
     parse_error: Optional[str] = None
 
 
-# =========================
-# Helpers
-# =========================
-
 def clean_extracted_text(text: str) -> str:
     if not text:
         return ""
 
     text = text.replace("\x00", " ")
     text = text.replace("\r", "\n")
-
-    # remove too many blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
-
-    # normalize spaces
     text = re.sub(r"[ \t]+", " ", text)
-
-    # trim lines
     text = "\n".join(line.strip() for line in text.splitlines())
-
-    # remove repeated blank lines again after trimming
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     return text.strip()
@@ -68,11 +52,6 @@ def truncate_chars(text: str, limit: int = 15000) -> str:
 
 
 async def download_file(file_url: str) -> tuple[str, str]:
-    """
-    Downloads file and returns:
-    - local_path
-    - file_name
-    """
     async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as http:
         resp = await http.get(file_url)
         resp.raise_for_status()
@@ -96,7 +75,6 @@ def parse_docx(local_path: str) -> str:
         if txt:
             parts.append(txt)
 
-    # Also try tables
     for table in doc.tables:
         for row in table.rows:
             row_values = []
@@ -111,11 +89,11 @@ def parse_docx(local_path: str) -> str:
 
 
 def parse_pdf(local_path: str) -> str:
-    doc = fitz.open(local_path)
+    reader = PdfReader(local_path)
     parts = []
 
-    for page in doc:
-        txt = page.get_text("text")
+    for page in reader.pages:
+        txt = page.extract_text()
         if txt:
             parts.append(txt)
 
@@ -141,10 +119,6 @@ def extract_text_from_file(local_path: str, file_name: str) -> str:
 
 
 def build_fallback_summary(parsed_text: str, mode: str) -> str:
-    """
-    Fallback if OpenAI is unavailable.
-    Keeps it short and usable.
-    """
     preview = truncate_chars(parsed_text, 2500)
 
     return (
@@ -156,7 +130,11 @@ def build_fallback_summary(parsed_text: str, mode: str) -> str:
     )
 
 
-def generate_guidance_summary_with_openai(parsed_text: str, mode: str, admin_prompt: Optional[str]) -> str:
+def generate_guidance_summary_with_openai(
+    parsed_text: str,
+    mode: str,
+    admin_prompt: Optional[str]
+) -> str:
     if not client:
         return build_fallback_summary(parsed_text, mode)
 
@@ -207,10 +185,6 @@ Now produce a compact guidance block for the assistant prompt.
     summary = resp.choices[0].message.content or ""
     return summary.strip()
 
-
-# =========================
-# Endpoint
-# =========================
 
 @app.post("/parse-admin-guidance-file", response_model=ParseAdminGuidanceResponse)
 async def parse_admin_guidance_file(payload: ParseAdminGuidanceRequest):
