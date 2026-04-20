@@ -2977,6 +2977,7 @@ def _build_logic_grid_guidance(user_message: str, focus_field: str = "", state_m
     guidance.append(f"- Walk-away guidance: {rule.get('walk_away', '')}")
     guidance.append(f"- Trade-offs to look for: {', '.join(rule.get('trade_for', [])[:5])}.")
     guidance.append(f"- Challenge rule: {rule.get('challenge', '')}")
+    guidance.append("- CRITICAL: Do NOT flip the user’s positions into the other party’s perspective unless the user explicitly asks for the other side / their side / counterparty view.")
     if rule.get("good"):
         guidance.append(f"- What good looks like: {rule.get('good', '')}")
     if rule.get("weak"):
@@ -2993,6 +2994,12 @@ def _build_logic_grid_guidance(user_message: str, focus_field: str = "", state_m
         highest_v = positions.get("highest")
 
         direction = rule.get("direction", "")
+        if direction == "higher_better":
+            guidance.append("- CRITICAL: For this variable, higher should be better for us. Do NOT reverse or flip Low/High into the other party perspective.")
+        elif direction == "shorter_days_better":
+            guidance.append("- CRITICAL: For this variable, shorter is better for us. Do NOT reverse the positions unless the user explicitly asked for the other side.")
+        elif direction == "longer_better":
+            guidance.append("- CRITICAL: For this variable, longer should be better for us. Do NOT reverse the positions unless the user explicitly asked for the other side.")
         if direction == "shorter_days_better":
             if low_v is not None and high_v is not None and low_v <= high_v:
                 guidance.append("- HARD CHALLENGE: For payment terms, Low should be longer / worse for us and High should be shorter / better for us. Correct the direction and coach the user.")
@@ -3004,7 +3011,7 @@ def _build_logic_grid_guidance(user_message: str, focus_field: str = "", state_m
             if low_v is not None and high_v is not None and high_v <= low_v:
                 guidance.append("- HARD CHALLENGE: High should be more favourable than Low. Correct the ordering.")
             if spread_ratio is not None and spread_ratio < 0.05:
-                guidance.append("- CHALLENGE: The spread looks too tight. Push for more ambition.")
+                guidance.append("- HARD CHALLENGE: The spread looks too tight. Say clearly that the range is too narrow and push for a wider, more ambitious spread.")
         elif direction == "longer_better":
             if low_v is not None and high_v is not None and high_v <= low_v:
                 guidance.append("- HARD CHALLENGE: For deal length, High should be longer than Low. Correct the ordering.")
@@ -3025,6 +3032,7 @@ def _build_logic_grid_guidance(user_message: str, focus_field: str = "", state_m
             guidance.append("- If the user is only naming the variable, explain the direction clearly: shorter days are better for us.")
         if rule.get("direction") in ("less_better_unless_paid_for", "wider_better_if_committed"):
             guidance.append("- Ask for or infer the counter-trade: volume, term length, distribution, spend, or reporting.")
+    guidance.append("- If the user supplied positions, do NOT mark the variable complete until you have challenged weak ambition, weak spread, wrong direction, or missing trade-offs where relevant.")
     guidance.append("- Response mode: be specific, commercially sharp, and challenge weak ambition. Prefer statements over questions unless the flow explicitly requires a question.")
     return "\n".join(guidance) + "\n\n"
 
