@@ -3302,6 +3302,152 @@ def _maybe_logic_grid_direct_response(user_message: str, focus_field: str = "", 
                 "Treat extra marketing as conditional spend, not as open support."
             )
 
+
+    # Number of markets
+    if _logic_var_matches(var_name, "number of markets", "markets"):
+        return (
+            "Do not agree a broad market rollout by default.\n\n"
+            "Turn market expansion into a phased commitment:\n"
+            "- which markets first\n"
+            "- by when\n"
+            "- what success threshold unlocks the next market\n"
+            "- who funds localisation / launch support\n\n"
+            "Treat additional markets as earned expansion, not as an upfront give-away."
+        )
+
+    # Number of products or services
+    if _logic_var_matches(var_name, "number of products or services", "products", "services", "range", "sku"):
+        return (
+            "Do not offer the full range by default.\n\n"
+            "Start with a controlled range and make expansion conditional:\n"
+            "- core products or services first\n"
+            "- add more only after volume or performance is proven\n"
+            "- define who carries the launch cost\n"
+            "- set a review point before range expansion\n\n"
+            "Treat extra products or services as a tradeable variable, not a free inclusion."
+        )
+
+    # Notice period
+    if _logic_var_matches(var_name, "notice period", "notice", "termination notice"):
+        return (
+            "Do not accept a short notice period by default.\n\n"
+            "For notice period, longer is safer for us because it reduces termination risk.\n"
+            "Push for:\n"
+            "- a defined minimum notice window\n"
+            "- notice in writing\n"
+            "- cure period where appropriate\n"
+            "- no immediate termination except for serious breach\n\n"
+            "Treat short notice as a real concession, not standard wording."
+        )
+
+    # Volume
+    if _logic_var_matches(var_name, "volume", "minimum volume", "forecast", "minimum order"):
+        return (
+            "Do not rely on vague forecast language.\n\n"
+            "Push for a measurable volume commitment:\n"
+            "- minimum units or spend\n"
+            "- over what period\n"
+            "- whether it is binding\n"
+            "- what happens if it is missed\n\n"
+            "Volume only has value if it is specific and enforceable."
+        )
+
+    # Language customisation
+    if _logic_var_matches(var_name, "language customisation", "localisation", "translation", "language support"):
+        return (
+            "Do not commit to full localisation by default.\n\n"
+            "Scope language customisation tightly:\n"
+            "- which markets or languages\n"
+            "- what exactly is translated or adapted\n"
+            "- by when\n"
+            "- who pays for it\n\n"
+            "Treat broader localisation as phased work tied to rollout and commercial commitment."
+        )
+
+    # Integration support
+    if _logic_var_matches(var_name, "integration support", "integration", "implementation support", "technical support"):
+        return (
+            "Do not offer open-ended integration support at no cost.\n\n"
+            "Scope integration support tightly:\n"
+            "- what is included\n"
+            "- how many hours or workstreams\n"
+            "- implementation timeline\n"
+            "- who pays for anything beyond the agreed scope\n\n"
+            "Treat extra integration work as paid or conditional support, not a free concession."
+        )
+
+    # Free samples / free stock
+    if _logic_var_matches(var_name, "free samples", "free stock", "samples", "sampling"):
+        return (
+            "Do not give free stock broadly by default.\n\n"
+            "Keep samples tightly controlled:\n"
+            "- limited quantity\n"
+            "- launch only or trial only\n"
+            "- linked to a defined opportunity\n"
+            "- not a recurring entitlement\n\n"
+            "Free stock should support conversion, not become hidden margin leakage."
+        )
+
+    # Competitions
+    if _logic_var_matches(var_name, "competitions", "competition activity"):
+        return (
+            "Do not agree competition activity in vague terms.\n\n"
+            "Define it properly:\n"
+            "- what activity is being run\n"
+            "- who funds it\n"
+            "- duration and approvals\n"
+            "- what result it is expected to drive\n\n"
+            "Treat competitions as scoped promotional activity, not general support."
+        )
+
+    # Extra marketing activities
+    if _logic_var_matches(var_name, "extra marketing activities", "additional marketing"):
+        return (
+            "Do not agree extra marketing activity as open support.\n\n"
+            "Any extra activity should be tightly scoped:\n"
+            "- exact campaign\n"
+            "- timing\n"
+            "- owner and budget\n"
+            "- expected commercial outcome\n\n"
+            "Treat extra marketing as conditional spend tied to a measurable plan."
+        )
+
+    # Promotions (price)
+    if _logic_var_matches(var_name, "promotions", "promotions (price)", "promo", "price promotions"):
+        return (
+            "Do not let temporary promotions become permanent price erosion.\n\n"
+            "Any promotion should be controlled:\n"
+            "- fixed time window\n"
+            "- clear funding split\n"
+            "- agreed mechanics\n"
+            "- expected uplift or sell-through result\n\n"
+            "Promotions should be tactical and time-bound, not a disguised base-price concession."
+        )
+
+    # Data / analytics / reporting
+    if _logic_var_matches(var_name, "data and analytics", "reporting", "analytics", "data sharing"):
+        return (
+            "Do not agree broad bespoke reporting by default.\n\n"
+            "Scope data and reporting clearly:\n"
+            "- what data is shared\n"
+            "- how often\n"
+            "- in what format\n"
+            "- who owns or can reuse the data\n\n"
+            "Extra reporting should be limited, standardised, or paid for if it becomes custom work."
+        )
+
+    # Premium positioning
+    if _logic_var_matches(var_name, "premium positoning", "premium positioning", "positioning", "placement"):
+        return (
+            "Do not accept vague promises of premium positioning.\n\n"
+            "Turn it into a defined commitment:\n"
+            "- which placements or locations\n"
+            "- in how many stores or channels\n"
+            "- for how long\n"
+            "- what standards or visibility are included\n\n"
+            "Premium positioning only has value when it is specific and measurable."
+        )
+
     return None
 
 
