@@ -2706,6 +2706,328 @@ def _has_sufficient_info(user_message: str, info: str) -> bool:
     return len(info) > 200 and not _is_new_question(user_message)
 
 
+
+HARD_CODED_MASTER_VARIABLE_RULES: Dict[str, Dict[str, Any]] = {
+    "payment terms": {
+        "aliases": ["payment terms", "terms", "net terms", "days"],
+        "direction": "shorter_days_better",
+        "opening": "Try to anchor short. New customers can justify very short terms.",
+        "walk_away": "Do not extend terms without a real trade.",
+        "trade_for": ["price", "volume commitment", "term length", "forecast visibility", "distribution commitment"],
+        "challenge": "Challenge any weak spread or any attempt to frame longer terms as more ambitious.",
+        "examples": ["14 days", "30 days", "45 days", "60 days", "90 days", "120 days"],
+    },
+    "price": {
+        "aliases": ["price", "pricing", "margin", "rate", "fee"],
+        "direction": "higher_better",
+        "opening": "Anchor above target and protect margin.",
+        "walk_away": "Do not cut price first. Trade non-price variables before price.",
+        "trade_for": ["volume", "term length", "exclusivity", "faster payment", "reduced support scope"],
+        "challenge": "Challenge narrow spreads and premature discounting.",
+    },
+    "length of deal": {
+        "aliases": ["length of deal", "contract length", "term", "deal term", "agreement length"],
+        "direction": "longer_better",
+        "opening": "Open longer than target to create room to trade.",
+        "walk_away": "Do not shorten term without a clear gain in return.",
+        "trade_for": ["price", "volume commitment", "exclusivity", "forecasting", "payment terms"],
+        "challenge": "Challenge any easy movement to a shorter term.",
+    },
+    "exclusivity": {
+        "aliases": ["exclusivity", "exclusive", "sole supplier", "sole rights"],
+        "direction": "less_better_unless_paid_for",
+        "opening": "Avoid giving exclusivity by default.",
+        "walk_away": "Only concede exclusivity for a concrete return.",
+        "trade_for": ["minimum volume", "minimum spend", "longer term", "wider distribution", "launch commitment"],
+        "challenge": "Challenge exclusivity requests that are not tied to measurable commitments.",
+    },
+    "volume commitment": {
+        "aliases": ["volume", "volume commitment", "minimum volume", "forecast", "minimum order"],
+        "direction": "higher_better",
+        "opening": "Push for measurable volume or forecast commitments.",
+        "walk_away": "Do not concede valuable commercials against vague volume promises.",
+        "trade_for": ["price", "rebates", "distribution", "support", "marketing"],
+        "challenge": "Challenge vague or non-binding volume language.",
+    },
+    "rebates": {
+        "aliases": ["rebate", "rebates", "discount", "discounts"],
+        "direction": "lower_better",
+        "opening": "Keep rebates conditional and earned.",
+        "walk_away": "Never give unconditional rebates.",
+        "trade_for": ["volume tiers", "payment speed", "term length", "promotional commitments"],
+        "challenge": "Challenge flat discounts with no trigger.",
+    },
+    "returns policy": {
+        "aliases": ["returns", "returns policy", "buyback", "stock return"],
+        "direction": "tighter_better",
+        "opening": "Keep returns limited, conditional and time-bound.",
+        "walk_away": "Do not accept broad open-ended returns.",
+        "trade_for": ["trial volume", "launch support", "assortment breadth", "marketing"],
+        "challenge": "Challenge unlimited or vague returns language.",
+    },
+    "integration support": {
+        "aliases": ["integration", "integration support", "technical support", "implementation support"],
+        "direction": "narrower_scope_better",
+        "opening": "Keep integration support scoped and staged.",
+        "walk_away": "Do not absorb heavy integration work for free.",
+        "trade_for": ["term length", "implementation fees", "volume commitment", "premium positioning"],
+        "challenge": "Challenge open-ended technical support asks.",
+    },
+    "language customisation": {
+        "aliases": ["language customisation", "localisation", "translation", "language support"],
+        "direction": "narrower_scope_better",
+        "opening": "Limit localisation to agreed markets and milestones.",
+        "walk_away": "Do not promise broad localisation without commitment.",
+        "trade_for": ["market rollout", "volume", "term length", "launch support"],
+        "challenge": "Challenge customisation asks that are not tied to rollout scale.",
+    },
+    "trade marketing": {
+        "aliases": ["trade marketing", "marketing support", "co-op marketing"],
+        "direction": "lower_spend_better",
+        "opening": "Keep spend conditional and linked to execution.",
+        "walk_away": "Do not fund trade marketing without visibility and commitments.",
+        "trade_for": ["distribution", "promotions calendar", "reporting", "volume"],
+        "challenge": "Challenge spend requests with no measurable return.",
+    },
+    "promotions": {
+        "aliases": ["promotions", "promo", "promotion support"],
+        "direction": "fewer_better",
+        "opening": "Keep promotions selective and conditional.",
+        "walk_away": "Do not over-promise promotional frequency.",
+        "trade_for": ["feature visibility", "distribution", "volume", "reporting"],
+        "challenge": "Challenge broad promo expectations that erode margin.",
+    },
+    "reporting": {
+        "aliases": ["reporting", "analytics", "data sharing", "sell-out data"],
+        "direction": "more_detail_better",
+        "opening": "Ask for structured reporting and review cadence.",
+        "walk_away": "Do not accept performance obligations without data visibility.",
+        "trade_for": ["rebates", "marketing support", "distribution expansion"],
+        "challenge": "Challenge one-way accountability with no reporting access.",
+    },
+    "distribution": {
+        "aliases": ["distribution", "doors", "stores", "channels", "rollout"],
+        "direction": "wider_better_if_committed",
+        "opening": "Push for specific channels, doors, markets or timing.",
+        "walk_away": "Do not concede economics against vague distribution language.",
+        "trade_for": ["price", "marketing", "support", "customisation"],
+        "challenge": "Challenge vague phrases like 'we will try' or 'as available'.",
+    },
+    "premium positioning": {
+        "aliases": ["premium positioning", "positioning", "placement", "premium placement"],
+        "direction": "stronger_better",
+        "opening": "Seek premium placement and brand treatment.",
+        "walk_away": "Do not fund premium asks without visibility and execution.",
+        "trade_for": ["marketing support", "exclusivity", "promotions", "reporting"],
+        "challenge": "Challenge premium promises that are not specific.",
+    },
+    "support": {
+        "aliases": ["support", "service level", "training", "account support"],
+        "direction": "narrower_scope_better",
+        "opening": "Define support scope and cadence clearly.",
+        "walk_away": "Do not over-commit support without return.",
+        "trade_for": ["term length", "price", "volume", "reporting"],
+        "challenge": "Challenge open-ended support asks.",
+    },
+}
+
+
+MASTER_LOGIC_GRID_PATH = os.getenv("MASTER_LOGIC_GRID_PATH", "logic_grid.json").strip()
+
+def _default_aliases_for_variable(name: str) -> List[str]:
+    n = (name or "").strip().lower()
+    aliases = {n}
+    simple = re.sub(r"[^a-z0-9\s/&-]+", " ", n)
+    simple = re.sub(r"\s+", " ", simple).strip()
+    aliases.add(simple)
+    alias_map = {
+        "length of deal": ["contract length", "deal term", "term", "agreement length"],
+        "number of markets": ["markets", "market rollout", "territories", "regions"],
+        "number of products or services": ["range", "sku count", "products", "services", "assortment"],
+        "notice period": ["notice", "termination notice"],
+        "exclusivity": ["exclusive", "sole supplier", "sole rights"],
+        "volume": ["volume commitment", "minimum volume", "forecast", "minimum order"],
+        "rebates": ["discount", "discounts", "rebate"],
+        "language customisation": ["localisation", "translation", "language support"],
+        "integration support": ["integration", "technical support", "implementation support"],
+        "returns policy": ["returns", "buyback", "stock return"],
+        "free samples or free stock": ["free stock", "samples", "sampling"],
+        "competitions": ["competition activity", "consumer competitions"],
+        "trade marketing": ["marketing support", "co-op marketing"],
+        "extra marketing activities": ["additional marketing", "launch marketing"],
+        "promotions (price)": ["promotions", "promo", "price promotions"],
+        "data and analytics or reporting": ["reporting", "analytics", "data sharing", "sell-out data"],
+        "number of stores/ distribution": ["distribution", "doors", "stores", "channels", "rollout"],
+        "premium positoning": ["premium positioning", "positioning", "placement", "premium placement"],
+    }
+    for a in alias_map.get(n, []):
+        aliases.add(a)
+    return sorted(a for a in aliases if a)
+
+def _direction_from_text(direction_text: str, variable_name: str) -> str:
+    t = (direction_text or "").lower()
+    n = (variable_name or "").lower()
+    if "shorter" in t or "faster" in t:
+        return "shorter_days_better"
+    if "longer" in t:
+        return "longer_better"
+    if "higher" in t or "more = better" in t:
+        return "higher_better"
+    if "lower" in t or "less =" in t or "fewer" in t:
+        return "lower_better"
+    if "wider" in t:
+        return "wider_better_if_committed"
+    if "exclusiv" in n:
+        return "less_better_unless_paid_for"
+    if "distribution" in n or "stores" in n:
+        return "wider_better_if_committed"
+    if "position" in n:
+        return "stronger_better"
+    return "custom"
+
+def _load_external_logic_grid_rules() -> Dict[str, Dict[str, Any]]:
+    path = MASTER_LOGIC_GRID_PATH
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        items = payload.get("items", []) if isinstance(payload, dict) else []
+        out: Dict[str, Dict[str, Any]] = {}
+        for item in items:
+            name = str(item.get("variable") or "").strip()
+            if not name:
+                continue
+            key = name.lower()
+            out[key] = {
+                "aliases": _default_aliases_for_variable(name),
+                "direction": _direction_from_text(str(item.get("direction_of_value") or ""), name),
+                "opening": item.get("opening_position") or "",
+                "walk_away": item.get("walk_away_point") or "",
+                "trade_for": [s.strip() for s in re.split(r"[/,]| vs ", str(item.get("key_trade_offs") or "")) if s.strip()][:6],
+                "challenge": item.get("when_ai_should_challenge") or "",
+                "good": item.get("good_looks_like") or "",
+                "weak": item.get("weak_looks_like") or "",
+                "their_likely_position": item.get("their_likely_position") or "",
+                "example_response": item.get("example_response") or "",
+                "response_type": item.get("response_type") or "",
+            }
+        return out
+    except Exception as e:
+        _jlog("logic_grid_load_error", path=path, error=str(e))
+        return {}
+
+MASTER_VARIABLE_RULES: Dict[str, Dict[str, Any]] = dict(HARD_CODED_MASTER_VARIABLE_RULES)
+MASTER_VARIABLE_RULES.update(_load_external_logic_grid_rules())
+
+def _resolve_logic_variable(user_message: str, focus_field: str = "", state_memory: str = "") -> Optional[str]:
+    hay = " ".join([user_message or "", focus_field or "", state_memory or ""]).lower()
+    best_name, best_score = None, 0
+    for name, rule in MASTER_VARIABLE_RULES.items():
+        score = 0
+        for alias in rule.get("aliases", []):
+            alias_l = alias.lower()
+            if alias_l in hay:
+                score = max(score, len(alias_l))
+        if score > best_score:
+            best_name, best_score = name, score
+    return best_name
+
+def _extract_labeled_positions(user_message: str) -> Dict[str, float]:
+    msg = (user_message or "").lower()
+    out: Dict[str, float] = {}
+    patterns = [
+        (r"\b(low|mid|middle|high|highest)\b\s*(?:is|=|:)?\s*\$?\s*(\d+(?:\.\d+)?)", 0, 1),
+        (r"\$?\s*(\d+(?:\.\d+)?)\s*(?:days?|day|%|percent|usd|dollars?)?\s*(?:for|as)\s*(low|mid|middle|high|highest)\b", 1, 0),
+    ]
+    for pat, label_idx, value_idx in patterns:
+        for m in re.findall(pat, msg):
+            label = m[label_idx]
+            value = m[value_idx]
+            label = "mid" if label == "middle" else label
+            try:
+                out[label] = float(value)
+            except Exception:
+                pass
+    return out
+
+def _calc_spread_ratio(vals: Dict[str, float]) -> Optional[float]:
+    if not vals:
+        return None
+    nums = list(vals.values())
+    lo, hi = min(nums), max(nums)
+    if hi <= 0:
+        return None
+    return (hi - lo) / hi
+
+def _build_logic_grid_guidance(user_message: str, focus_field: str = "", state_memory: str = "") -> str:
+    var_name = _resolve_logic_variable(user_message, focus_field, state_memory)
+    if not var_name:
+        return ""
+
+    rule = MASTER_VARIABLE_RULES[var_name]
+    positions = _extract_labeled_positions(user_message)
+    spread_ratio = _calc_spread_ratio(positions)
+
+    guidance: List[str] = []
+    guidance.append("\n\nLOGIC GRID OVERRIDE:")
+    guidance.append(f"- Active variable: {var_name}.")
+    guidance.append(f"- Direction of value: {rule.get('direction', '')}.")
+    guidance.append(f"- Opening guidance: {rule.get('opening', '')}")
+    guidance.append(f"- Walk-away guidance: {rule.get('walk_away', '')}")
+    guidance.append(f"- Trade-offs to look for: {', '.join(rule.get('trade_for', [])[:5])}.")
+    guidance.append(f"- Challenge rule: {rule.get('challenge', '')}")
+    if rule.get("good"):
+        guidance.append(f"- What good looks like: {rule.get('good', '')}")
+    if rule.get("weak"):
+        guidance.append(f"- What weak looks like: {rule.get('weak', '')}")
+    if rule.get("their_likely_position"):
+        guidance.append(f"- Their likely position: {rule.get('their_likely_position', '')}")
+
+    if positions:
+        ordered = ", ".join(f"{k}={int(v) if float(v).is_integer() else v}" for k, v in sorted(positions.items()))
+        guidance.append(f"- Parsed user positions: {ordered}.")
+        guidance.append("- Use these parsed positions silently. Do NOT echo them back unless needed for correction.")
+        low_v = positions.get("low")
+        high_v = positions.get("high")
+        highest_v = positions.get("highest")
+
+        direction = rule.get("direction", "")
+        if direction == "shorter_days_better":
+            if low_v is not None and high_v is not None and low_v <= high_v:
+                guidance.append("- HARD CHALLENGE: For payment terms, Low should be longer / worse for us and High should be shorter / better for us. Correct the direction and coach the user.")
+            if high_v is not None and high_v > 30:
+                guidance.append("- HARD CHALLENGE: High point for payment terms looks weak. Push for a shorter try-for position.")
+            if spread_ratio is not None and spread_ratio < 0.20:
+                guidance.append("- CHALLENGE: The spread on payment terms looks narrow. Push for a wider negotiation range.")
+        elif direction == "higher_better":
+            if low_v is not None and high_v is not None and high_v <= low_v:
+                guidance.append("- HARD CHALLENGE: High should be more favourable than Low. Correct the ordering.")
+            if spread_ratio is not None and spread_ratio < 0.05:
+                guidance.append("- CHALLENGE: The spread looks too tight. Push for more ambition.")
+        elif direction == "longer_better":
+            if low_v is not None and high_v is not None and high_v <= low_v:
+                guidance.append("- HARD CHALLENGE: For deal length, High should be longer than Low. Correct the ordering.")
+            if spread_ratio is not None and spread_ratio < 0.15:
+                guidance.append("- CHALLENGE: The spread on deal length looks narrow. Push for more room.")
+        elif direction in ("lower_better", "lower_spend_better", "fewer_better", "tighter_better", "narrower_scope_better"):
+            if low_v is not None and high_v is not None and high_v >= low_v:
+                guidance.append("- HARD CHALLENGE: For this variable, High should usually be tighter / lower / more favourable than Low. Correct the ordering if needed.")
+        elif direction in ("less_better_unless_paid_for", "wider_better_if_committed"):
+            guidance.append("- CHALLENGE: This variable should not be conceded without a measurable counter-commitment.")
+        if highest_v is not None and high_v is not None:
+            if direction == "shorter_days_better" and highest_v >= high_v:
+                guidance.append("- CHALLENGE: Highest should be more ambitious than High. For payment terms that means even shorter.")
+            elif direction in ("higher_better", "longer_better", "more_detail_better", "stronger_better") and highest_v <= high_v:
+                guidance.append("- CHALLENGE: Highest should be more ambitious than High.")
+    else:
+        if var_name == "payment terms":
+            guidance.append("- If the user is only naming the variable, explain the direction clearly: shorter days are better for us.")
+        if rule.get("direction") in ("less_better_unless_paid_for", "wider_better_if_committed"):
+            guidance.append("- Ask for or infer the counter-trade: volume, term length, distribution, spend, or reporting.")
+    guidance.append("- Response mode: be specific, commercially sharp, and challenge weak ambition. Prefer statements over questions unless the flow explicitly requires a question.")
+    return "\n".join(guidance) + "\n\n"
+
 def _master_llm_text(
     user_message: str,
     active_section_id: str,
@@ -2722,6 +3044,8 @@ def _master_llm_text(
     deal_line = "" if deal_value is None else f"DEAL_VALUE: {deal_value}\n"
     name_line = user_name.strip() if user_name else ""
     mem_line = (state_memory or "").strip()
+
+    logic_grid_guidance = _build_logic_grid_guidance(user_message, focus_field, state_memory)
 
     # Build user message with conversation context like /chat
     if conversation_context:
@@ -2921,6 +3245,7 @@ def _master_llm_text(
         f"STATE_MEMORY:\n{mem_line}\n\n"
         f"INFORMATION:\n{info}\n\n"
         f"TASK: Give Diadem-only, template-ready guidance for the MASTER template.{initial_help_handling}{definition_handling}{variable_name_handling}{payment_terms_context}{single_position_handling}{all_positions_handling}{their_side_handling}{table_entries_handling}{business_question_handling}{tricky_behaviors_handling}{non_tactics_guard}{time_management_handling}{completion_handling}{strategy_handling}{conflict_handling}{empathy_handling}\n"
+        f"{logic_grid_guidance}"
         f"If FOCUS_FIELD is set: tell the user exactly what to type there and give 1–2 paste-ready lines.\n"
         f"If user asks what variables: Use INFORMATION to suggest relevant variables conversationally, then ask which one they'd like to add. Do NOT show Low/High/Highest positions.\n"
         f"Do NOT refuse. If INFORMATION is thin, still give best-effort Diadem guidance.\n"
@@ -3568,6 +3893,8 @@ def master_template_sse(payload: Dict = Body(...)):
                 if is_time_constraint or pomodoro_mentioned:
                     time_management_handling += " CRITICAL: When discussing time management techniques (especially Pomodoro Technique or when user mentions 'not enough time to cover everything'), you MUST explicitly offer: 'Would it help if I show you more about the Pomodoro Technique?' or 'I can show you the slides/model that explain the Pomodoro Technique in more detail.' Do not just mention it - actively offer to show more information or provide a deeper dive."
 
+            logic_grid_guidance = _build_logic_grid_guidance(user_message, focus_field_sse, state_mem)
+
             # Build user message with conversation context like /chat
             if conversation_context:
                 user_message_base = (
@@ -3595,6 +3922,7 @@ def master_template_sse(payload: Dict = Body(...)):
                 f"STATE_MEMORY:\n{state_mem}\n\n"
                 f"INFORMATION:\n{info}\n\n"
                 f"TASK: Give Diadem-only, template-ready guidance for the MASTER template.{initial_help_handling}{definition_handling}{variable_name_handling}{payment_terms_context}{single_position_handling}{all_positions_handling}{their_side_handling}{table_entries_handling}{business_question_handling}{tricky_behaviors_handling}{non_tactics_guard}{time_management_handling}{completion_handling}{strategy_handling}{conflict_handling}{empathy_handling}\n"
+                f"{logic_grid_guidance}"
                 f"If FOCUS_FIELD is set: tell the user exactly what to type there and give 1–2 paste-ready lines.\n"
                 f"If user asks what variables: Use INFORMATION to suggest relevant variables conversationally, then ask which one they'd like to add. Do NOT show Low/High/Highest positions.\n"
                 f"Do NOT refuse. If INFORMATION is thin, still give best-effort Diadem guidance.{clarify_note}\n"
