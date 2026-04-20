@@ -3069,6 +3069,10 @@ def _build_logic_grid_enforcement(user_message: str, focus_field: str = "", stat
     return "\n".join(guidance) + "\n\n"
 
 
+def _logic_var_matches(var_name: str, *needles: str) -> bool:
+    v = (var_name or "").lower()
+    return any(n.lower() in v for n in needles)
+
 def _maybe_logic_grid_direct_response(user_message: str, focus_field: str = "", state_memory: str = "") -> Optional[str]:
     var_name = _resolve_logic_variable(user_message, focus_field, state_memory)
     if not var_name:
@@ -3087,7 +3091,7 @@ def _maybe_logic_grid_direct_response(user_message: str, focus_field: str = "", 
     spread_ratio = _calc_spread_ratio(positions)
 
     # Payment terms with labeled positions
-    if var_name == "payment terms" and positions:
+    if _logic_var_matches(var_name, "payment terms") and positions:
         reversed_dir = low_v is not None and high_v is not None and low_v < high_v
         highest_wrong = high_v is not None and highest_v is not None and highest_v >= high_v
         if reversed_dir or highest_wrong:
@@ -3105,9 +3109,12 @@ def _maybe_logic_grid_direct_response(user_message: str, focus_field: str = "", 
             )
 
     # Price with labeled positions
-    if var_name == "price" and positions:
+    if _logic_var_matches(var_name, "price") and positions:
         reversed_dir = low_v is not None and high_v is not None and high_v <= low_v
-        weak_spread = spread_ratio is not None and spread_ratio < 0.08
+        abs_spread = None
+        if low_v is not None and highest_v is not None:
+            abs_spread = highest_v - low_v
+        weak_spread = (spread_ratio is not None and spread_ratio < 0.12) or (abs_spread is not None and abs_spread <= 3)
         if reversed_dir or weak_spread:
             msg = []
             if reversed_dir:
@@ -3125,7 +3132,7 @@ def _maybe_logic_grid_direct_response(user_message: str, focus_field: str = "", 
             return "".join(msg)
 
     # Exclusivity
-    if var_name == "exclusivity":
+    if _logic_var_matches(var_name, "exclusivity"):
         return (
             "Do not give exclusivity by default.\n\n"
             "If they want exclusivity, treat it as a high-value ask that must be paid for.\n"
@@ -3138,17 +3145,17 @@ def _maybe_logic_grid_direct_response(user_message: str, focus_field: str = "", 
         )
 
     # Distribution
-    if var_name == "distribution":
+    if _logic_var_matches(var_name, "distribution", "stores"):
         msg = (user_message or "").lower()
         if "try" in msg or "more stores" in msg or "as available" in msg:
             return (
                 "That distribution language is too vague.\n\n"
-                "Do not trade value against 'we will try'. Push for specific commitments instead:\n"
+                "Do not trade value against 'we will try'. Challenge it first and turn it into a measurable commitment:\n"
                 "- how many stores or doors\n"
                 "- which channels or markets\n"
                 "- by when\n"
                 "- what happens if the rollout is missed\n\n"
-                "Challenge the vagueness first, then convert it into a measurable distribution commitment."
+                "Only discuss trade-offs after they give a specific distribution commitment."
             )
 
     return None
