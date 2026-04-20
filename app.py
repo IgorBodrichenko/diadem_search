@@ -3034,6 +3034,38 @@ def _build_logic_grid_guidance(user_message: str, focus_field: str = "", state_m
             guidance.append("- Ask for or infer the counter-trade: volume, term length, distribution, spend, or reporting.")
     guidance.append("- If the user supplied positions, do NOT mark the variable complete until you have challenged weak ambition, weak spread, wrong direction, or missing trade-offs where relevant.")
     guidance.append("- Response mode: be specific, commercially sharp, and challenge weak ambition. Prefer statements over questions unless the flow explicitly requires a question.")
+
+def _build_logic_grid_enforcement(user_message: str, focus_field: str = "", state_memory: str = "") -> str:
+    var_name = _resolve_logic_variable(user_message, focus_field, state_memory)
+    positions = _extract_labeled_positions(user_message)
+    if not var_name or not positions:
+        return ""
+    rule = MASTER_VARIABLE_RULES.get(var_name, {})
+    direction = rule.get("direction", "")
+    lines: List[str] = []
+    lines.append("LOGIC GRID ENFORCEMENT:")
+    lines.append("- FINAL AUTHORITY: Follow this block over any generic instruction about 'their side', template completion, or moving to the next variable.")
+    lines.append("- Do NOT discuss the other party perspective unless the user explicitly asked for the other side.")
+    lines.append("- Do NOT mark the variable complete if the positions are weak, reversed, or need revision.")
+    if direction == "shorter_days_better":
+        lines.append("- Payment terms rule: shorter days are better for us.")
+        lines.append("- Correct structure: Low = longest / worst acceptable, High = shorter / better, Highest = shortest / most ambitious.")
+        low_v = positions.get("low")
+        high_v = positions.get("high")
+        highest_v = positions.get("highest")
+        if low_v is not None and high_v is not None and low_v < high_v:
+            lines.append("- The user's current direction is reversed. Say that clearly.")
+        if high_v is not None and highest_v is not None and highest_v >= high_v:
+            lines.append("- Highest must be more ambitious than High. For payment terms that means even shorter, not longer.")
+        lines.append("- Give a corrected example range such as Low 90 days / High 30 days / Highest 14 days when appropriate.")
+    elif direction == "higher_better":
+        lines.append("- Higher-better rule: High and Highest must be more favourable than Low. Do not reverse the positions.")
+        lines.append("- If the spread is weak, say explicitly that the range is too narrow and needs more ambition.")
+    elif direction == "longer_better":
+        lines.append("- Longer-better rule: High and Highest must be longer / more favourable than Low.")
+    lines.append("- End with a coaching statement, not with 'this variable is complete', unless the positions are genuinely strong and correctly structured.")
+    return "\\n".join(lines) + "\\n\\n"
+
     return "\n".join(guidance) + "\n\n"
 
 def _master_llm_text(
@@ -3054,6 +3086,7 @@ def _master_llm_text(
     mem_line = (state_memory or "").strip()
 
     logic_grid_guidance = _build_logic_grid_guidance(user_message, focus_field, state_memory)
+    logic_grid_enforcement = _build_logic_grid_enforcement(user_message, focus_field, state_memory)
 
     # Build user message with conversation context like /chat
     if conversation_context:
@@ -3254,6 +3287,7 @@ def _master_llm_text(
         f"INFORMATION:\n{info}\n\n"
         f"TASK: Give Diadem-only, template-ready guidance for the MASTER template.{initial_help_handling}{definition_handling}{variable_name_handling}{payment_terms_context}{single_position_handling}{all_positions_handling}{their_side_handling}{table_entries_handling}{business_question_handling}{tricky_behaviors_handling}{non_tactics_guard}{time_management_handling}{completion_handling}{strategy_handling}{conflict_handling}{empathy_handling}\n"
         f"{logic_grid_guidance}"
+        f"{logic_grid_enforcement}"
         f"If FOCUS_FIELD is set: tell the user exactly what to type there and give 1–2 paste-ready lines.\n"
         f"If user asks what variables: Use INFORMATION to suggest relevant variables conversationally, then ask which one they'd like to add. Do NOT show Low/High/Highest positions.\n"
         f"Do NOT refuse. If INFORMATION is thin, still give best-effort Diadem guidance.\n"
@@ -3902,6 +3936,7 @@ def master_template_sse(payload: Dict = Body(...)):
                     time_management_handling += " CRITICAL: When discussing time management techniques (especially Pomodoro Technique or when user mentions 'not enough time to cover everything'), you MUST explicitly offer: 'Would it help if I show you more about the Pomodoro Technique?' or 'I can show you the slides/model that explain the Pomodoro Technique in more detail.' Do not just mention it - actively offer to show more information or provide a deeper dive."
 
             logic_grid_guidance = _build_logic_grid_guidance(user_message, focus_field_sse, state_mem)
+            logic_grid_enforcement = _build_logic_grid_enforcement(user_message, focus_field_sse, state_mem)
 
             # Build user message with conversation context like /chat
             if conversation_context:
@@ -3931,6 +3966,7 @@ def master_template_sse(payload: Dict = Body(...)):
                 f"INFORMATION:\n{info}\n\n"
                 f"TASK: Give Diadem-only, template-ready guidance for the MASTER template.{initial_help_handling}{definition_handling}{variable_name_handling}{payment_terms_context}{single_position_handling}{all_positions_handling}{their_side_handling}{table_entries_handling}{business_question_handling}{tricky_behaviors_handling}{non_tactics_guard}{time_management_handling}{completion_handling}{strategy_handling}{conflict_handling}{empathy_handling}\n"
                 f"{logic_grid_guidance}"
+                f"{logic_grid_enforcement}"
                 f"If FOCUS_FIELD is set: tell the user exactly what to type there and give 1–2 paste-ready lines.\n"
                 f"If user asks what variables: Use INFORMATION to suggest relevant variables conversationally, then ask which one they'd like to add. Do NOT show Low/High/Highest positions.\n"
                 f"Do NOT refuse. If INFORMATION is thin, still give best-effort Diadem guidance.{clarify_note}\n"
