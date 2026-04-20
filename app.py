@@ -2920,18 +2920,53 @@ def _load_external_logic_grid_rules() -> Dict[str, Dict[str, Any]]:
 MASTER_VARIABLE_RULES: Dict[str, Dict[str, Any]] = dict(HARD_CODED_MASTER_VARIABLE_RULES)
 MASTER_VARIABLE_RULES.update(_load_external_logic_grid_rules())
 
-def _resolve_logic_variable(user_message: str, focus_field: str = "", state_memory: str = "") -> Optional[str]:
-    hay = " ".join([user_message or "", focus_field or "", state_memory or ""]).lower()
+def _best_logic_variable_in_text(text: str) -> Tuple[Optional[str], int]:
+    hay = (text or "").lower()
     best_name, best_score = None, 0
     for name, rule in MASTER_VARIABLE_RULES.items():
         score = 0
         for alias in rule.get("aliases", []):
-            alias_l = alias.lower()
+            alias_l = alias.lower().strip()
+            if not alias_l:
+                continue
             if alias_l in hay:
-                score = max(score, len(alias_l))
+                local_score = len(alias_l)
+                if hay.startswith(alias_l):
+                    local_score += 100
+                if re.search(rf"\b{re.escape(alias_l)}\b", hay):
+                    local_score += 20
+                score = max(score, local_score)
         if score > best_score:
             best_name, best_score = name, score
-    return best_name
+    return best_name, best_score
+
+def _resolve_logic_variable(user_message: str, focus_field: str = "", state_memory: str = "") -> Optional[str]:
+    # 1) Prefer the CURRENT user message.
+    msg = (user_message or "").strip()
+    name, score = _best_logic_variable_in_text(msg)
+    if name and score >= 20:
+        return name
+
+    # 2) If the user wrote a short label-like message, check the first clause only.
+    first_clause = re.split(r"[\n\.:;\-]", msg, maxsplit=1)[0].strip().lower()
+    if first_clause:
+        name2, score2 = _best_logic_variable_in_text(first_clause)
+        if name2 and score2 >= 20:
+            return name2
+
+    # 3) Use focus_field only as a fallback.
+    ff = (focus_field or "").strip()
+    name3, score3 = _best_logic_variable_in_text(ff)
+    if name3 and score3 >= 20:
+        return name3
+
+    # 4) Use state_memory only as a last resort for vague follow-ups.
+    sm = (state_memory or "").strip()
+    name4, score4 = _best_logic_variable_in_text(sm)
+    if name4 and score4 >= 120:
+        return name4
+
+    return None
 
 def _extract_labeled_positions(user_message: str) -> Dict[str, float]:
     msg = (user_message or "").lower()
@@ -3074,7 +3109,10 @@ def _logic_var_matches(var_name: str, *needles: str) -> bool:
     return any(n.lower() in v for n in needles)
 
 def _maybe_logic_grid_direct_response(user_message: str, focus_field: str = "", state_memory: str = "") -> Optional[str]:
-    var_name = _resolve_logic_variable(user_message, focus_field, state_memory)
+    # For direct rule-based interception, use the CURRENT message first to avoid sticky carry-over.
+    var_name = _resolve_logic_variable(user_message, "", "")
+    if not var_name:
+        var_name = _resolve_logic_variable(user_message, focus_field, state_memory)
     if not var_name:
         return None
     positions = _extract_labeled_positions(user_message)
