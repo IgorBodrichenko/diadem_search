@@ -3202,7 +3202,22 @@ def _maybe_logic_grid_direct_response(user_message: str, focus_field: str = "", 
             reversed_dir = low_v is not None and high_v is not None and high_v <= low_v
             weak_highest = high_v is not None and highest_v is not None and highest_v <= high_v
             weak_spread = (spread_ratio is not None and spread_ratio < 0.35)
-            if reversed_dir or weak_highest or weak_spread:
+
+            if reversed_dir:
+                return (
+                    "These deal length positions are reversed.\n\n"
+                    "For length of deal, longer is better for us.\n"
+                    "- Low = shortest acceptable term\n"
+                    "- High = longer / better\n"
+                    "- Highest = longest credible commitment\n\n"
+                    "A stronger structure would be something like:\n"
+                    "- Low = 12 months\n"
+                    "- High = 18 months\n"
+                    "- Highest = 24 or 30 months\n\n"
+                    "Revise the positions so each step becomes longer, not shorter."
+                )
+
+            if weak_highest or weak_spread:
                 return (
                     "Push for a longer and more ambitious deal term.\n\n"
                     "For length of deal, longer is better for us.\n"
@@ -3213,8 +3228,21 @@ def _maybe_logic_grid_direct_response(user_message: str, focus_field: str = "", 
                     "- Low = 12 months\n"
                     "- High = 18 months\n"
                     "- Highest = 24 or 30 months\n\n"
-                    "Do not drift into the other party perspective here. First make your range stronger."
+                    "Make the top end more ambitious. Do not drift into the other party perspective here."
                 )
+
+            return (
+                "This deal length structure is directionally correct.\n\n"
+                "For length of deal, longer is better for us.\n"
+                "- Low = shortest acceptable term\n"
+                "- High = longer / better\n"
+                "- Highest = longest credible commitment\n\n"
+                "Your current structure works as a base:\n"
+                f"- Low = {_fmt(low_v)} months\n"
+                f"- High = {_fmt(high_v)} months\n"
+                f"- Highest = {_fmt(highest_v)} months\n\n"
+                "Now pressure-test the top end and ask whether Highest should be pushed further while staying credible."
+            )
 
     # Rebates
     if _logic_var_matches(var_name, "rebate", "rebates"):
