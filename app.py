@@ -3158,6 +3158,84 @@ def _maybe_logic_grid_direct_response(user_message: str, focus_field: str = "", 
                 "Only discuss trade-offs after they give a specific distribution commitment."
             )
 
+    # Length of deal
+    if _logic_var_matches(var_name, "length of deal", "deal length", "term length", "contract term"):
+        if positions:
+            reversed_dir = low_v is not None and high_v is not None and high_v <= low_v
+            weak_highest = high_v is not None and highest_v is not None and highest_v <= high_v
+            weak_spread = (spread_ratio is not None and spread_ratio < 0.35)
+            if reversed_dir or weak_highest or weak_spread:
+                return (
+                    "Push for a longer and more ambitious deal term.\n\n"
+                    "For length of deal, longer is better for us.\n"
+                    "- Low = shortest acceptable term\n"
+                    "- High = longer / better\n"
+                    "- Highest = longest credible commitment\n\n"
+                    "A stronger example would be something like:\n"
+                    "- Low = 12 months\n"
+                    "- High = 18 months\n"
+                    "- Highest = 24 or 30 months\n\n"
+                    "Do not drift into the other party perspective here. First make your range stronger."
+                )
+
+    # Rebates
+    if _logic_var_matches(var_name, "rebate", "rebates"):
+        if positions:
+            reversed_dir = low_v is not None and high_v is not None and high_v >= low_v
+            weak_highest = high_v is not None and highest_v is not None and highest_v >= high_v
+            if reversed_dir or weak_highest:
+                return (
+                    "These rebate positions are reversed.\n\n"
+                    "For rebates, lower is better for us unless the rebate is tightly conditional.\n"
+                    "- Low = highest / worst acceptable rebate\n"
+                    "- High = lower / better rebate\n"
+                    "- Highest = lowest or fully conditional rebate\n\n"
+                    "A stronger structure would be something like:\n"
+                    "- Low = 10% fixed rebate\n"
+                    "- High = 5% rebate linked to thresholds\n"
+                    "- Highest = rebate only if volume or growth targets are hit\n\n"
+                    "Do not treat a bigger rebate as a more ambitious position for us."
+                )
+        msg = (user_message or "").lower()
+        if "fixed" in msg or "guaranteed" in msg or "standard" in msg:
+            return (
+                "Do not accept rebates as a fixed tax on doing business.\n\n"
+                "Push to make any rebate conditional on real performance:\n"
+                "- volume\n"
+                "- growth\n"
+                "- time period\n"
+                "- agreed targets\n\n"
+                "A rebate is only defensible if the buyer earns it."
+            )
+
+    # Returns policy
+    if _logic_var_matches(var_name, "returns policy", "returns"):
+        msg = (user_message or "").lower()
+        if "open-ended" in msg or "open ended" in msg or "any time" in msg:
+            return (
+                "Do not accept open-ended returns.\n\n"
+                "Tighten the policy so the risk is controlled:\n"
+                "- defined return window\n"
+                "- capped volumes\n"
+                "- product condition rules\n"
+                "- approval required\n\n"
+                "Returns should be exceptional and tightly defined, not a standing transfer of risk back to you."
+            )
+
+    # Trade marketing / extra marketing
+    if _logic_var_matches(var_name, "trade marketing", "extra marketing", "marketing support", "marketing activities"):
+        msg = (user_message or "").lower()
+        if "extra" in msg or "support" in msg or "marketing" in msg:
+            return (
+                "Do not agree general marketing support by default.\n\n"
+                "Any marketing activity should be scoped and tied to a measurable commercial outcome:\n"
+                "- specific campaign or launch\n"
+                "- defined duration\n"
+                "- who pays what\n"
+                "- what result it must drive\n\n"
+                "Treat extra marketing as conditional spend, not as open support."
+            )
+
     return None
 
 
