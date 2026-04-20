@@ -3068,6 +3068,92 @@ def _build_logic_grid_enforcement(user_message: str, focus_field: str = "", stat
 
     return "\n".join(guidance) + "\n\n"
 
+
+def _maybe_logic_grid_direct_response(user_message: str, focus_field: str = "", state_memory: str = "") -> Optional[str]:
+    var_name = _resolve_logic_variable(user_message, focus_field, state_memory)
+    if not var_name:
+        return None
+    positions = _extract_labeled_positions(user_message)
+    direction = MASTER_VARIABLE_RULES.get(var_name, {}).get("direction", "")
+
+    def _fmt(v: Optional[float]) -> str:
+        if v is None:
+            return "?"
+        return str(int(v)) if float(v).is_integer() else str(v)
+
+    low_v = positions.get("low")
+    high_v = positions.get("high")
+    highest_v = positions.get("highest")
+    spread_ratio = _calc_spread_ratio(positions)
+
+    # Payment terms with labeled positions
+    if var_name == "payment terms" and positions:
+        reversed_dir = low_v is not None and high_v is not None and low_v < high_v
+        highest_wrong = high_v is not None and highest_v is not None and highest_v >= high_v
+        if reversed_dir or highest_wrong:
+            return (
+                "These payment term positions are reversed.\n\n"
+                "For payment terms, shorter is better for us.\n"
+                f"- Low = longest / worst acceptable\n"
+                f"- High = shorter / better\n"
+                f"- Highest = shortest / most ambitious\n\n"
+                "A stronger structure would be something like:\n"
+                "- Low = 90 days\n"
+                "- High = 30 days\n"
+                "- Highest = 14 days\n\n"
+                "Revise the positions in that direction. Do not make Highest longer than High."
+            )
+
+    # Price with labeled positions
+    if var_name == "price" and positions:
+        reversed_dir = low_v is not None and high_v is not None and high_v <= low_v
+        weak_spread = spread_ratio is not None and spread_ratio < 0.08
+        if reversed_dir or weak_spread:
+            msg = []
+            if reversed_dir:
+                msg.append("These price positions are reversed.\n")
+                msg.append("For price, higher is better for us.\n")
+                msg.append("- Low = least favourable but still acceptable\n")
+                msg.append("- High = better for us\n")
+                msg.append("- Highest = most ambitious credible position\n")
+            else:
+                msg.append("Your price spread is too narrow.\n")
+                msg.append("Do not keep Low, High and Highest this close together.\n")
+            msg.append("\nA stronger example would be something like:\n")
+            msg.append("- Low = 10%\n- High = 13%\n- Highest = 15%\n")
+            msg.append("\nPush for a wider, more ambitious range. Do not flip into the other party perspective.")
+            return "".join(msg)
+
+    # Exclusivity
+    if var_name == "exclusivity":
+        return (
+            "Do not give exclusivity by default.\n\n"
+            "If they want exclusivity, treat it as a high-value ask that must be paid for.\n"
+            "Only consider it in exchange for measurable commitments such as:\n"
+            "- minimum volume or spend\n"
+            "- longer contract term\n"
+            "- wider distribution\n"
+            "- launch commitment\n\n"
+            "Your next move is to challenge it and ask what concrete commitment they will give in return."
+        )
+
+    # Distribution
+    if var_name == "distribution":
+        msg = (user_message or "").lower()
+        if "try" in msg or "more stores" in msg or "as available" in msg:
+            return (
+                "That distribution language is too vague.\n\n"
+                "Do not trade value against 'we will try'. Push for specific commitments instead:\n"
+                "- how many stores or doors\n"
+                "- which channels or markets\n"
+                "- by when\n"
+                "- what happens if the rollout is missed\n\n"
+                "Challenge the vagueness first, then convert it into a measurable distribution commitment."
+            )
+
+    return None
+
+
 def _master_llm_text(
     user_message: str,
     active_section_id: str,
@@ -3087,6 +3173,10 @@ def _master_llm_text(
 
     logic_grid_guidance = _build_logic_grid_guidance(user_message, focus_field, state_memory)
     logic_grid_enforcement = _build_logic_grid_enforcement(user_message, focus_field, state_memory)
+
+    direct_logic_response = _maybe_logic_grid_direct_response(user_message, focus_field, state_memory)
+    if direct_logic_response:
+        return direct_logic_response
 
     # Build user message with conversation context like /chat
     if conversation_context:
@@ -3937,6 +4027,12 @@ def master_template_sse(payload: Dict = Body(...)):
 
             logic_grid_guidance = _build_logic_grid_guidance(user_message, focus_field_sse, state_mem)
             logic_grid_enforcement = _build_logic_grid_enforcement(user_message, focus_field_sse, state_mem)
+
+            direct_logic_response = _maybe_logic_grid_direct_response(user_message, focus_field_sse, state_mem)
+            if direct_logic_response:
+                yield f"data: {json.dumps({'token': direct_logic_response})}\n\n"
+                yield f"data: {json.dumps({'done': True})}\n\n"
+                return
 
             # Build user message with conversation context like /chat
             if conversation_context:
