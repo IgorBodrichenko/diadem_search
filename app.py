@@ -50,7 +50,7 @@ def _with_debug(resp: Dict[str, Any], **dbg):
 # CONFIG
 # =========================
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "claude-3-5-sonnet-20241022")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "claude-3-5-sonnet-20240620")
 
 TOP_K = int(os.getenv("TOP_K", "10"))
 PINECONE_TOPK_RAW = int(os.getenv("PINECONE_TOPK_RAW", "30"))
