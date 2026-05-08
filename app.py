@@ -1851,7 +1851,7 @@ def chat(payload: Dict = Body(...)):
         temperature=0.2,
     )
 
-    answer = strip_markdown_chars((resp.content[0].text or "").strip())
+    answer = _finalize_chat_text((resp.content[0].text or ""), max_questions=1)
     if answer:
         opener = _pick_opener(session_id, user_name, "qa_last_opener")
         answer = _rewrite_bad_opening(answer, opener)
@@ -1893,14 +1893,12 @@ def chat_sse(payload: Dict = Body(...)):
                 {"role": "user", "content": user},
             ]
 
-        chunks = _iter_text_as_sse_chunks(
-            _openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2),
-            min_chars=28,
-        )
+        full_text = "".join(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2))
+        full_text = _finalize_chat_text(full_text, max_questions=1)
+        chunks = _iter_text_as_sse_chunks([full_text], min_chars=28)
 
         # Emit chunks
         for part in chunks:
-            part = strip_markdown_chars(part)
             data = json.dumps({"text": part}, ensure_ascii=False)
             yield f"event: chunk\ndata: {data}\n\n"
 
@@ -2698,6 +2696,31 @@ def _finalize_master_text(text: str, max_words: int = 320) -> str:
     return t.strip()
 
 
+def _limit_question_marks(text: str, max_questions: int = 1) -> str:
+    t = (text or "").strip()
+    if not t:
+        return ""
+    seen = 0
+    out = []
+    for ch in t:
+        if ch == "?":
+            seen += 1
+            out.append("?" if seen <= max_questions else ".")
+        else:
+            out.append(ch)
+    cleaned = "".join(out)
+    cleaned = re.sub(r"\.{2,}", "...", cleaned)
+    cleaned = re.sub(r"\s+\.", ".", cleaned)
+    return cleaned.strip()
+
+
+def _finalize_chat_text(text: str, max_questions: int = 1) -> str:
+    t = strip_markdown_chars((text or "").strip())
+    if not t:
+        return ""
+    return _limit_question_marks(t, max_questions=max_questions)
+
+
 def _extract_last_question(text: str) -> str:
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
     for ln in reversed(lines):
@@ -3190,6 +3213,14 @@ def _maybe_logic_grid_direct_response(user_message: str, focus_field: str = "", 
                 "- Highest = 14 days\n\n"
                 "Revise the positions in that direction. Do not make Highest longer than High."
             )
+        return (
+            "Your payment terms positions are structured correctly.\n\n"
+            "For payment terms, shorter is better for you, so this direction is right: "
+            f"Low at {_fmt(low_v)} days, High at {_fmt(high_v)} days, and Highest at {_fmt(highest_v)} days.\n\n"
+            "The ambition is strongest at the top end, which is where it should be. The key coaching point is not to concede too quickly from Highest down toward High without getting something back in return.\n\n"
+            "If you move on payment terms, make that move conditional on something valuable coming back to you, such as stronger price, firmer volume, or a longer deal term.\n\n"
+            "This variable is well structured and gives you real room to trade."
+        )
 
     # Price with labeled positions
     if _logic_var_matches(var_name, "price") and positions:
