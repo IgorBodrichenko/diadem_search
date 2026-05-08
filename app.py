@@ -3665,7 +3665,7 @@ def _master_llm_text(
         f"\n\nCRITICAL FINAL RULE: Unless the user is explicitly asking for help filling a specific field (variable_name when FOCUS_FIELD is set, or asking 'what variable' or 'which variable'), DO NOT end your response with ANY question. End with a statement. The user will decide their next step. If you need to guide them, use statements like 'Consider...', 'Think about...', or 'You might want to...' instead of questions. This rule overrides any other instruction about asking questions."
     )
 
-    messages = [user", "content": prompt_user},
+    messages = [{"role": "user", "content": prompt_user},
     ]
     resp = anthropod.messages.create(
         model=CHAT_MODEL,
@@ -3674,8 +3674,7 @@ def _master_llm_text(
         system=MASTER_SYSTEM_PROMPT_TEXT + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="master"),
         temperature=0.2,
     )
-    text = strip_markdown_chars((resp.content[0].tex
-    text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
+    text = strip_markdown_chars((resp.content[0].text or "").strip())
 
     # Never allow the generic refusal line in this mode
     if text.strip().lower() in ("i can't find this in the provided documents.", "i can’t find this in the provided documents."):
