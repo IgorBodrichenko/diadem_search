@@ -12,12 +12,14 @@ from PIL import Image
 import pytesseract
 import tiktoken
 from pinecone import Pinecone
+from anthropic import Anthropic
 from openai import OpenAI
 
 # -------------------------
 # ENV CONFIG
 # -------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_ENV = os.getenv("PINECONE_ENV")  # e.g. us-east-1
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")  # diadem-ai
@@ -29,13 +31,14 @@ CHUNK_TOKENS = 800
 CHUNK_OVERLAP = 150
 UPSERT_BATCH_SIZE = int(os.getenv("UPSERT_BATCH_SIZE", "100"))
 
-if not all([OPENAI_API_KEY, PINECONE_API_KEY, PINECONE_INDEX_NAME, PINECONE_ENV]):
+if not all([OPENAI_API_KEY, ANTHROPIC_API_KEY, PINECONE_API_KEY, PINECONE_INDEX_NAME, PINECONE_ENV]):
     raise RuntimeError("Missing required environment variables")
 
 # -------------------------
 # CLIENT INIT
 # -------------------------
 openai = OpenAI(api_key=OPENAI_API_KEY)
+anthropod = Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
 pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -112,13 +115,14 @@ def describe_image(ocr_text: str) -> str:
         f"OCR TEXT:\n{ocr_text}"
     )
 
-    response = openai.chat.completions.create(
-        model="gpt-4o-mini",
+    response = anthropod.messages.create(
+        model="claude-3-5-sonnet-20241022",
         messages=[{"role": "user", "content": prompt}],
+        max_tokens=500,
         temperature=0.0
     )
 
-    return response.choices[0].message.content.strip()
+    return response.content[0].text.strip()
 
 # -------------------------
 # CHUNKING

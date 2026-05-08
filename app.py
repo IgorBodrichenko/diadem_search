@@ -15,6 +15,7 @@ from fastapi import FastAPI, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
+from anthropic import Anthropic
 from openai import OpenAI
 from pinecone import Pinecone
 from dotenv import load_dotenv
@@ -49,7 +50,7 @@ def _with_debug(resp: Dict[str, Any], **dbg):
 # CONFIG
 # =========================
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "claude-3-5-sonnet-20241022")
 
 TOP_K = int(os.getenv("TOP_K", "10"))
 PINECONE_TOPK_RAW = int(os.getenv("PINECONE_TOPK_RAW", "30"))
@@ -83,6 +84,7 @@ def _slog(event: str, **fields):
 CONFIRM_EVERY_N = int(os.getenv("COACH_CONFIRM_EVERY_N", "3"))  # checkpoint confirm after N answers (default 3)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
 PINECONE_HOST = os.getenv("PINECONE_HOST")
@@ -203,6 +205,8 @@ def _fetch_template_state_text(template_id: str, request_id: str = "") -> str:
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY missing")
+if not ANTHROPIC_API_KEY:
+    raise RuntimeError("ANTHROPIC_API_KEY missing")
 if not PINECONE_API_KEY:
     raise RuntimeError("PINECONE_API_KEY missing")
 if not PINECONE_INDEX_NAME:
@@ -211,6 +215,7 @@ if not PINECONE_HOST:
     raise RuntimeError("PINECONE_HOST missing")
 
 openai = OpenAI(api_key=OPENAI_API_KEY)
+anthropod = Anthropic(api_key=ANTHROPIC_API_KEY)
 pc = Pinecone(api_key=PINECONE_API_KEY)
 
 index = pc.Index(
@@ -219,34 +224,30 @@ index = pc.Index(
 )
 
 # =========================
-# OPENAI STREAM HELPERS (SSE)
+# CLAUDE STREAM HELPERS (SSE)
 # =========================
 def _openai_stream_text(messages: List[Dict[str, str]], model: str, temperature: float = 0.2):
-    """Yield incremental text deltas from OpenAI streaming API."""
+    """Yield incremental text deltas from Claude streaming API."""
     try:
-        stream = openai.chat.completions.create(
+        with anthropod.messages.stream(
             model=model,
             messages=messages,
+            max_tokens=4096,
             temperature=temperature,
-            stream=True,
-        )
-        for ev in stream:
-            try:
-                delta = ev.choices[0].delta
-                txt = getattr(delta, "content", None)
-                if txt:
-                    yield txt
-            except Exception:
-                continue
+        ) as stream:
+            for text in stream.text_stream:
+                if text:
+                    yield text
     except Exception as e:
         # If streaming fails, fallback to a single non-streamed response
         try:
-            resp = openai.chat.completions.create(
+            resp = anthropod.messages.create(
                 model=model,
                 messages=messages,
+                max_tokens=4096,
                 temperature=temperature,
             )
-            full = (resp.choices[0].message.content or "")
+            full = (resp.content[0].text or "")
             if full:
                 yield full
         except Exception:
@@ -1332,8 +1333,9 @@ ACTIVE_SECTION_POLICY = (
 
 LIMITS_POLICY = (
     "\nInteraction limits:\n"
-    "- Keep responses <= 180 words unless the user asks for more.\n"
-    "- Ask at most 2 clarifying questions before producing a best-effort paste-ready output.\n"
+    "- Q&A responses: 150-250 words max. Template fills: 200-400 words max.\n"
+    "- Ask AT MOST 1-2 questions per response.\n"
+    "- After 2 questions, generate best-effort paste-ready output.\n"
 )
 
 
@@ -1341,44 +1343,27 @@ SYSTEM_PROMPT_QA = (
     "You are a negotiation coach operating strictly within the MASTER methodology.\n"
     "Guide users through preparation using natural, conversational dialogue.\n\n"
 
-    "CRITICAL RULES:\n"
-    "- Use ONLY INFORMATION. If INFORMATION has methodology guidance (standards, ranges, best practices, lists, tables, or any structured content), you MUST use it - do NOT ask generic questions instead.\n"
-    "- When INFORMATION contains lists, bullet points, or structured content that answers the question, you MUST present that content in your response (in a conversational way, not as a list).\n"
-    "- When user mentions a variable: ALWAYS check INFORMATION first. If INFORMATION contains guidance, you MUST provide that guidance in your response before asking any questions.\n"
-    "- Do NOT give generic negotiation advice outside the methodology.\n"
-    "- For initial variable setup questions: Ask what variables they have in mind. Do NOT mention positions, happy zone, MY LIST, THEIR LIST, or structure concepts.\n"
-    "- Do NOT introduce positions (Low/High/Highest) until user mentions them explicitly.\n"
-    "- When user mentions positions: Validate using definitions below, challenge ambition, ask about other party's perspective.\n\n"
+    "Core rules:\n"
+    "- Use ONLY INFORMATION. If INFORMATION has methodology guidance, you MUST use it.\n"
+    "- When INFORMATION contains structured content (lists, tables, ranges, standards), present it conversationally, not as a bullet list.\n"
+    "- Do NOT repeat or paraphrase the user's question - answer directly and immediately.\n"
+    "- Answer in 150-250 words unless user asks for more.\n"
+    "- Ask AT MOST ONE clarifying question to move forward.\n"
+    "- Do NOT give generic negotiation advice outside the methodology.\n\n"
 
-    "When INFORMATION is provided and relevant:\n"
-    "- ALWAYS use INFORMATION to answer the question. If INFORMATION contains the answer (even if it's a list, table, or structured content), you MUST provide it.\n"
-    "- Do NOT say 'I can't find this' if INFORMATION contains relevant content that answers the question.\n"
-    "- Present the information from INFORMATION in a natural, conversational way.\n"
-    "- Do NOT repeat the user's question or prompt in your response - give the answer directly.\n\n"
+    "For variable questions:\n"
+    "- When user mentions a variable: Check INFORMATION first, provide guidance before asking questions.\n"
+    "- Do NOT introduce positions (Low/High/Highest) until user mentions them.\n"
+    "- When user mentions positions: Validate using INFORMATION, challenge ambition, ask about other party's perspective.\n"
+    "- Explain position definitions ONLY if user explicitly asks.\n\n"
 
-    "When INFORMATION is empty or truly unrelated:\n"
-    "- Only then say: 'I can't find this in the provided materials.'\n"
-    "- Do NOT ask about variables if the user's question is NOT about variables.\n"
-    "- Only ask about variables if the user's question is specifically about setting up variables.\n\n"
+    "Position definitions (use ONLY when asked):\n"
+    "MY LIST: Low = least favorable acceptable, High = most favorable, Highest = most ambitious credible.\n"
+    "For payment terms: shorter = High (better), longer = Low (worse). For price: higher = High (better), lower = Low (worse).\n\n"
 
-    "When INFORMATION doesn't have specific variable guidance but has general methodology:\n"
-    "- Use methodology principles from INFORMATION (prepare variables, understand value/cost, set positions, plan for both parties).\n"
-    "- Guide users through the methodology process step-by-step.\n"
-    "- Do NOT give generic advice - instead guide them to think about what's favorable for their situation using methodology principles.\n"
-    "- Reference methodology concepts from INFORMATION when available.\n\n"
-
-    "Position Definitions (use ONLY when user mentions Low/High/Highest):\n"
-    "MY LIST: Low = least favorable but acceptable, High = most favorable, Highest = most ambitious credible position.\n"
-    "Favorable depends on variable type: For payment terms (shorter = High, longer = Low), for price (higher = High, lower = Low).\n"
-    "When validating: Challenge ambition, check spread, ask about other party's perspective.\n\n"
-
-    "Response style:\n"
-    "- Natural, conversational sentences. NO lists, bullets, or rigid formats.\n"
-    "- Do NOT repeat or paraphrase the user's question - answer directly.\n"
-    "- Start with empathy or acknowledgment if appropriate, but get straight to the answer.\n"
-    "- End with ONE question that moves forward - but ONLY if it's relevant to the current topic. Do NOT redirect to variables unless the question is specifically about variables.\n"
-    "- IMPORTANT: If INFORMATION contains relevant content (even if it's a list or structured), you MUST use it. Only refuse if INFORMATION is truly empty or completely unrelated to the question.\n\n"
-    
+    "When INFORMATION is empty or unrelated:\n"
+    "- Say: 'I can't find this in the provided materials.'\n"
+    "- Do NOT ask about variables unless user's question is specifically about variables.\n"
     + VARIABLES_POLICY
     + ACTIVE_SECTION_POLICY
     + LIMITS_POLICY
@@ -1398,28 +1383,25 @@ SYSTEM_PROMPT_EXPLAIN = (
 )
 
 SYSTEM_PROMPT_CHAT = (
-    "You are a professional assistant.\n"
-    "Your primary knowledge source is the retrieved INFORMATION from Pinecone.\n"
-    "Always prioritise INFORMATION when it is relevant to the user's question.\n"
+    "You are a professional negotiation coach based on the MASTER methodology.\n"
+    "Your job: answer questions using retrieved INFORMATION as your primary source. Be conversational, direct, and practical.\n"
     "\n"
     "Core behaviour:\n"
-    "- If INFORMATION is relevant, base your answer primarily on it.\n"
-    "- If INFORMATION is partially relevant, combine it with minimal general knowledge.\n"
-    "- If INFORMATION is empty or not relevant, you may answer using general knowledge.\n"
-    "- Never invent or fabricate facts that contradict INFORMATION.\n"
+    "- Base your answer on INFORMATION when relevant. If INFORMATION is empty or unrelated, use general knowledge only.\n"
+    "- Never mention documents, pages, sources, citations, or reference materials.\n"
+    "- Do NOT repeat or paraphrase the user's question - answer directly.\n"
+    "- Avoid unnecessary verbosity. Keep answers under 250 words unless user asks for more.\n"
+    "- Use natural business language, not framework dumping or lists.\n"
     "\n"
-    "Response rules:\n"
-    "- Output plain text only.\n"
-    "- Do NOT mention documents, pages, sources, citations, or the word 'context'.\n"
-    "- Do NOT explain that you are using Pinecone or retrieved materials.\n"
-    "- Keep answers clear, professional, and structured.\n"
-    "- Avoid unnecessary verbosity.\n"
-    "- Ask at most ONE clarifying question if the request is unclear.\n"
+    "Question rules:\n"
+    "- Ask AT MOST ONE clarifying question to move forward.\n"
+    "- If answer is unclear or incomplete, generate best-effort output rather than asking more questions.\n"
     "- If USER_NAME is provided, greet only once at the beginning of the conversation.\n"
     "\n"
-    + VARIABLES_POLICY
-    + ACTIVE_SECTION_POLICY
-    + LIMITS_POLICY
+    "Special case - Tactics/Difficult behaviour:\n"
+    "- If user asks about tactics, power play, losing control, or tricky buyers: answer as a live coach first using INFORMATION.\n"
+    "- Do NOT default to variable mapping or template structure for tactics questions.\n"
+    "- Provide one practical coaching move, then one optional question.\n"
 )
 
 
@@ -1602,15 +1584,16 @@ def _generate_final(mode: str, state: Dict[str, Any], top_k: int, user_name: str
     _jlog("final_generate", session_id=session_id, mode=mode)
     info = _retrieve_info_for_coach(mode, "final summary", top_k)
     final_user = _make_final_user_message(mode, state, info, user_name=user_name)
-    resp_llm = openai.chat.completions.create(
+    resp_llm = anthropod.messages.create(
         model=CHAT_MODEL,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT_COACH_FINAL},
             {"role": "user", "content": final_user},
         ],
+        max_tokens=4096,
+        system=SYSTEM_PROMPT_COACH_FINAL,
         temperature=0.2,
     )
-    text = strip_markdown_chars((resp_llm.choices[0].message.content or "").strip())
+    text = strip_markdown_chars((resp_llm.content[0].text or "").strip())
     opener = _pick_opener(session_id, user_name, "coach_last_opener")
     text = _rewrite_bad_opening(text, opener)
 
@@ -1857,16 +1840,17 @@ def chat(payload: Dict = Body(...)):
         f"INFORMATION:\n{context}"
     )
 
-    resp = openai.chat.completions.create(
+    resp = anthropod.messages.create(
         model=CHAT_MODEL,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT_CHAT + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="chat")},
             {"role": "user", "content": user},
         ],
+        max_tokens=4096,
+        system=SYSTEM_PROMPT_CHAT + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="chat"),
         temperature=0.2,
     )
 
-    answer = strip_markdown_chars((resp.choices[0].message.content or "").strip())
+    answer = strip_markdown_chars((resp.content[0].text or "").strip())
     if answer:
         opener = _pick_opener(session_id, user_name, "qa_last_opener")
         answer = _rewrite_bad_opening(answer, opener)
@@ -2022,25 +2006,20 @@ Core behaviour:
 - When user first accepts help and no active_section_id is set or active_section_id is empty: Guide them to start with their first variable in MY LIST. Say "Let's start with your first variable. What variable would you like to add to MY LIST?" Do NOT jump to other sections like confidence or goals.
 
 CRITICAL RULES (from Journey doc + /chat):
-- Max 3 clarification questions before generating output. After 3 questions, you MUST provide a paste-ready answer.
-- Use ONLY INFORMATION. If INFORMATION has methodology guidance (standards, ranges, best practices, lists, tables, or any structured content), you MUST use it - do NOT ask generic questions instead.
-- When INFORMATION contains lists, bullet points, or structured content that answers the question, you MUST present that content in your response (in a conversational way, not as a list).
-- When user asks about variables for MY LIST: Use INFORMATION to provide helpful variable suggestions conversationally, then ask which one they want to start with. Do NOT just ask "what variable" without providing helpful context from INFORMATION.
-- Do NOT repeat or paraphrase the user's question - answer directly.
-- Do NOT simply echo back what the user just said. Instead, provide coaching, challenge their thinking, suggest improvements, or guide them forward using INFORMATION.
-- ALWAYS prioritize the user's CURRENT message. Do NOT ignore what they just said or redirect to unrelated previous topics.
-- When user expresses frustration, concern, or difficulty, ALWAYS show empathy first (acknowledge their feeling), then provide guidance using INFORMATION. Do NOT ignore their message.
-- When user asks about strategy or mentions specific positions/conflicts, provide comprehensive guidance using INFORMATION. Look at all their variables if available, challenge prioritization, and suggest tactical approaches.
+- Max 1-2 questions per response. After 2 questions, you MUST provide a paste-ready answer even if incomplete.
+- Keep responses succinct: 200-400 words for template fills, 150-250 for Q&A unless user asks for more.
+- Use ONLY INFORMATION. If INFORMATION has methodology guidance (standards, ranges, best practices, lists, tables, or any structured content), you MUST use it.
+- When INFORMATION contains lists or structured content, present it conversationally, not as a bullet list.
+- Do NOT repeat or paraphrase the user's question - answer directly and immediately.
+- Do NOT simply echo back what the user just said. Provide coaching, challenge, suggest improvements using INFORMATION.
+- ALWAYS prioritize the user's CURRENT message. Do NOT ignore or redirect to unrelated topics.
+- When user expresses frustration: Show empathy first, then provide guidance using INFORMATION.
+- When user asks about strategy or positions: Provide comprehensive guidance using INFORMATION. Challenge prioritization, suggest tactical approaches.
 - Do NOT give generic negotiation advice outside the methodology.
-- Never output the sentence: "I can only help with questions related to the provided materials."
-- Never dump a full framework list.
-- Never dump all preparation steps at once.
-- Never reset or restart the flow unless the user explicitly asks to restart.
-- Never insert mid-session greetings.
-- Always build directly on the user's last choice, number, or statement.
-- If the user selects A/B/C, continue developing that exact path.
-- Do not repeat similar bullet lists across turns.
-- Do not ignore the user's actual question.
+- Never dump a full framework list. Never dump all steps at once.
+- Never reset or restart unless explicitly asked. Never insert mid-session greetings.
+- Always build directly on the user's last choice or statement.
+- If user selects A/B/C, continue developing that exact path.
 
 Template-First Writing Contract:
 - AI outputs must map 1:1 to template fields
@@ -2102,15 +2081,20 @@ Tactics and difficult behaviour guidance:
 - Do NOT use the word 'context' in the user-facing answer.
 - Avoid soft wrap-up lines such as 'Consider how you can apply this', 'Think about what resonates most', or similar reflective coaching endings. End with a firm practical statement unless a field-specific forward question is clearly required.
 
+Response structure for template filling:
+- When populating positions (Low/Mid/High): Show YOUR WIN ZONE, THEIR WIN ZONE, TRADE-OFFS, then ONE question.
+- Do NOT ask more than 1-2 questions per response.
+- Keep responses succinct: 200-400 words for template fills, 150-250 for Q&A.
+- Never repeat or echo what user just said. Provide coaching value instead.
+- For specific questions: answer directly first, ask one optional follow-up if needed.
+
 Style:
 - Direct, businesslike, and practical.
 - Plain text only. No markdown.
-- Use short bullets only when structured input is necessary.
-- Separate sections with blank lines.
-- End every turn with ONE focused question that advances the template (unless you've already asked 3 questions, then provide the answer).
-- Show empathy and coaching through dialogue, not scripted questions.
-- After completing a variable: Provide coaching value, then naturally guide to the next step. Do NOT use generic questions like "what variable would you like to add next" - instead, suggest what makes sense based on INFORMATION and the template structure.
-- When user indicates completion or wants strategy help: Transition to providing negotiation strategy, scripts, tactics, or coaching. Do NOT keep asking for more variables. Answer their questions fully and provide actionable guidance.
+- Use bullets only for position structures (Low/Mid/High).
+- End with ONE focused question that advances the template.
+- After completing a variable: Provide coaching value, then naturally guide to the next step. Suggest based on INFORMATION and structure, not generic questions.
+- When user indicates completion or wants strategy: Transition to full negotiation strategy. Answer their questions fully. Do NOT keep asking for more variables.
 """
 def _mnt_default_state_text() -> Dict[str, Any]:
     return {
@@ -3681,15 +3665,16 @@ def _master_llm_text(
         f"\n\nCRITICAL FINAL RULE: Unless the user is explicitly asking for help filling a specific field (variable_name when FOCUS_FIELD is set, or asking 'what variable' or 'which variable'), DO NOT end your response with ANY question. End with a statement. The user will decide their next step. If you need to guide them, use statements like 'Consider...', 'Think about...', or 'You might want to...' instead of questions. This rule overrides any other instruction about asking questions."
     )
 
-    messages = [
-        {"role": "system", "content": MASTER_SYSTEM_PROMPT_TEXT + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="master")},
-        {"role": "user", "content": prompt_user},
+    messages = [user", "content": prompt_user},
     ]
-    resp = openai.chat.completions.create(
+    resp = anthropod.messages.create(
         model=CHAT_MODEL,
         messages=messages,
+        max_tokens=4096,
+        system=MASTER_SYSTEM_PROMPT_TEXT + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="master"),
         temperature=0.2,
     )
+    text = strip_markdown_chars((resp.content[0].tex
     text = strip_markdown_chars((resp.choices[0].message.content or "").strip())
 
     # Never allow the generic refusal line in this mode
