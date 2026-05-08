@@ -1395,6 +1395,7 @@ SYSTEM_PROMPT_CHAT = (
     "\n"
     "Question rules:\n"
     "- Ask AT MOST ONE clarifying question to move forward.\n"
+    "- Use AT MOST ONE question mark in the entire reply. Do not stack rhetorical questions.\n"
     "- If answer is unclear or incomplete, generate best-effort output rather than asking more questions.\n"
     "- If USER_NAME is provided, greet only once at the beginning of the conversation.\n"
     "\n"
@@ -3596,7 +3597,7 @@ def _master_llm_text(
                     unique_positions.add(match.lower())
     
     if position_found and len(unique_positions) >= 2:  # At least 2 positions mentioned
-        all_positions_handling = "\n\nIMPORTANT: User provided positions (possibly all at once). Do NOT repeat or echo back the positions. Instead, use INFORMATION to scrutinize and challenge directly: Is ambition appropriate? Is the spread sufficient? Could they be more ambitious? For payment terms: Challenge if they could try shorter terms (e.g., 'Could you be more ambitious with your high point? Why not try 14 days? Especially if it is a new customer.'). Also mention the other party's perspective as a statement: 'Consider where the other party will be looking to lock down payment terms. Think from the other party's perspective their low, mid and high (worst for you, best for them) position.' Provide coaching value, then confirm the variable is complete and state that you're ready for the next variable. Do NOT ask questions - use statements only."
+        all_positions_handling = "\n\nIMPORTANT: User provided positions (possibly all at once). Do NOT repeat or echo back the positions. Instead, use INFORMATION to scrutinize and challenge directly: Is ambition appropriate? Is the spread sufficient? Could they be more ambitious? For payment terms: Challenge if they could try shorter terms (e.g., 'Your high point could probably be more ambitious. A shorter term such as 14 days may be credible, especially with a new customer.'). Stay on the user's side only unless they explicitly ask for the other party's perspective. Provide coaching value, then confirm the variable is complete and state that you're ready for the next variable. Do NOT ask questions - use statements only."
     
     # Special handling for their side / other party perspective
     their_side_handling = ""
@@ -4252,7 +4253,7 @@ def master_template_sse(payload: Dict = Body(...)):
                             unique_positions.add(match.lower())
             
             if position_found and len(unique_positions) >= 2:  # At least 2 positions mentioned
-                all_positions_handling = "\n\nIMPORTANT: User provided positions (possibly all at once). Do NOT repeat or echo back the positions. Instead, use INFORMATION to scrutinize and challenge directly: Is ambition appropriate? Is the spread sufficient? Could they be more ambitious? For payment terms: Challenge if they could try shorter terms (e.g., 'Could you be more ambitious with your high point? Why not try 14 days? Especially if it is a new customer.'). Also mention the other party's perspective as a statement: 'Consider where the other party will be looking to lock down payment terms. Think from the other party's perspective their low, mid and high (worst for you, best for them) position.' Provide coaching value, then confirm the variable is complete and state that you're ready for the next variable. Do NOT ask questions - use statements only."
+                all_positions_handling = "\n\nIMPORTANT: User provided positions (possibly all at once). Do NOT repeat or echo back the positions. Instead, use INFORMATION to scrutinize and challenge directly: Is ambition appropriate? Is the spread sufficient? Could they be more ambitious? For payment terms: Challenge if they could try shorter terms (e.g., 'Your high point could probably be more ambitious. A shorter term such as 14 days may be credible, especially with a new customer.'). Stay on the user's side only unless they explicitly ask for the other party's perspective. Provide coaching value, then confirm the variable is complete and state that you're ready for the next variable. Do NOT ask questions - use statements only."
             
             # Special handling for their side / other party perspective
             their_side_handling = ""
