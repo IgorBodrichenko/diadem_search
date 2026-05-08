@@ -2637,6 +2637,66 @@ def _truncate_words(text: str, max_words: int = 140) -> str:
     return " ".join(words[:max_words]).strip()
 
 
+def _truncate_complete_sentences(text: str, max_words: int) -> str:
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    if not t:
+        return ""
+    words = t.split()
+    if len(words) <= max_words:
+        return t
+
+    clipped = " ".join(words[:max_words]).strip()
+    sentence_breaks = [
+        clipped.rfind(". "),
+        clipped.rfind("! "),
+        clipped.rfind("? "),
+        clipped.rfind("."),
+        clipped.rfind("!"),
+        clipped.rfind("?"),
+    ]
+    best_break = max(sentence_breaks)
+    if best_break >= int(len(clipped) * 0.6):
+        clipped = clipped[: best_break + 1].strip()
+    elif clipped[-1] not in ".!?":
+        clipped = clipped.rstrip(",;:-") + "..."
+    return clipped
+
+
+def _paragraphize_text(text: str, sentences_per_paragraph: int = 2) -> str:
+    t = re.sub(r"\r\n?", "\n", (text or "").strip())
+    if not t:
+        return ""
+    if "\n\n" in t:
+        return re.sub(r"\n{3,}", "\n\n", t).strip()
+    if "\n- " in t or t.startswith("-"):
+        return re.sub(r"\n{3,}", "\n\n", t).strip()
+
+    flat = re.sub(r"\s+", " ", t).strip()
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", flat) if s.strip()]
+    if len(sentences) < 3:
+        return flat
+
+    paragraphs = []
+    chunk = []
+    for sentence in sentences:
+        chunk.append(sentence)
+        if len(chunk) >= sentences_per_paragraph:
+            paragraphs.append(" ".join(chunk).strip())
+            chunk = []
+    if chunk:
+        paragraphs.append(" ".join(chunk).strip())
+    return "\n\n".join(paragraphs).strip()
+
+
+def _finalize_master_text(text: str, max_words: int = 320) -> str:
+    t = strip_markdown_chars((text or "").strip())
+    if not t:
+        return ""
+    t = _truncate_complete_sentences(t, max_words)
+    t = _paragraphize_text(t, sentences_per_paragraph=2)
+    return t.strip()
+
+
 def _extract_last_question(text: str) -> str:
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
     for ln in reversed(lines):
@@ -3674,7 +3734,7 @@ def _master_llm_text(
         system=MASTER_SYSTEM_PROMPT_TEXT + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="master"),
         temperature=0.2,
     )
-    text = strip_markdown_chars((resp.content[0].text or "").strip())
+    text = _finalize_master_text((resp.content[0].text or ""), max_words=320)
 
     # Never allow the generic refusal line in this mode
     if text.strip().lower() in ("i can't find this in the provided documents.", "i can’t find this in the provided documents."):
@@ -3695,7 +3755,7 @@ def _master_llm_text(
                 "- Then I’ll give you exact template wording."
             )
 
-    return _truncate_words(text, 180)  # 180 words per Journey doc
+    return _finalize_master_text(text, max_words=320)
 
 
 
@@ -4362,7 +4422,7 @@ def master_template_sse(payload: Dict = Body(...)):
                 data = json.dumps({"text": part}, ensure_ascii=False)
                 yield f"event: chunk\ndata: {data}\n\n"
 
-            full_text = strip_markdown_chars("".join(full_parts)).strip()
+            full_text = _finalize_master_text("".join(full_parts), max_words=320)
             
             # Never allow the generic refusal line in this mode
             if full_text.strip().lower() in ("i can't find this in the provided documents.", "i can't find this in the provided documents."):
@@ -4382,9 +4442,6 @@ def master_template_sse(payload: Dict = Body(...)):
                         "- Tell me which field you're filling (deal value / variables / goals / walk-away / concessions).\n"
                         "- Then I'll give you exact template wording."
                     )
-            
-            # Truncate to 180 words per Journey doc
-            full_text = _truncate_words(full_text, 180)
             
             # Add empathy/opener like /chat (but for SSE, we need to prepend to first chunk or handle differently)
             # Since we've already streamed, we'll apply opener logic to the saved text for next turn
