@@ -1339,6 +1339,77 @@ LIMITS_POLICY = (
 )
 
 
+MASTER_SYSTEM_PROMPT_PATH = os.getenv("MASTER_SYSTEM_PROMPT_PATH", "Diadem_AI_System_Prompt_v1.txt").strip()
+
+
+def _load_master_system_prompt_text() -> str:
+    """Load master system prompt from a local text file with a safe fallback."""
+    path = MASTER_SYSTEM_PROMPT_PATH or "Diadem_AI_System_Prompt_v1.txt"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            txt = f.read().strip()
+            if txt:
+                return txt
+    except Exception as e:
+        _jlog("master_prompt_load_error", path=path, err=str(e)[:300])
+
+    return (
+        "You are the Diadem AI negotiation coach. "
+        "Coach first, then use the MASTER template when useful. "
+        "Use plain text only and focus on commercially practical guidance."
+    )
+
+
+def _build_master_user_context_block(payload: Dict[str, Any], state: Dict[str, Any], user_message: str) -> str:
+    """Build optional USER CONTEXT block to prepend before the master system prompt."""
+    payload = payload or {}
+    state = state or {}
+
+    def _pick(*keys: str) -> str:
+        for k in keys:
+            s = _safe_str(payload.get(k))
+            if s:
+                return s
+        return ""
+
+    slots = state.get("slots") if isinstance(state.get("slots"), dict) else {}
+
+    name = _extract_user_name(payload) or _safe_str(state.get("user_name"))
+    role = _pick("role", "user_role", "job_title", "title")
+    industry = _pick("industry", "sector")
+    tendencies = _pick("known_tendencies", "tendencies", "known_tendency")
+    current_negotiation = _pick("current_negotiation", "negotiation", "deal_summary") or _safe_str(slots.get("current_negotiation"))
+    if not current_negotiation:
+        current_negotiation = _safe_str(user_message)[:220]
+
+    last_session_summary = _pick("last_session_summary", "session_summary", "summary")
+    if not last_session_summary:
+        convo = _mnt_build_conversation_context(state)
+        last_session_summary = _safe_str(convo).replace("\n", " ")[:280]
+
+    fields = [
+        ("Name", name),
+        ("Role", role),
+        ("Industry", industry),
+        ("Known tendencies", tendencies),
+        ("Current negotiation", current_negotiation),
+        ("Last session summary", last_session_summary),
+    ]
+    lines = [f"{k}: {v}" for k, v in fields if _safe_str(v)]
+    if not lines:
+        return ""
+
+    return "USER CONTEXT\n" + "\n".join(lines)
+
+
+def _master_system_prompt_runtime(payload: Dict[str, Any], state: Dict[str, Any], user_message: str) -> str:
+    base = _load_master_system_prompt_text()
+    ctx = _build_master_user_context_block(payload, state, user_message)
+    if not ctx:
+        return base
+    return f"{ctx}\n\n{base}"
+
+
 SYSTEM_PROMPT_QA = (
     "You are a negotiation coach operating strictly within the MASTER methodology.\n"
     "Guide users through preparation using natural, conversational dialogue.\n\n"
@@ -2095,6 +2166,10 @@ Style:
 - After completing a variable: Provide coaching value, then naturally guide to the next step. Suggest based on INFORMATION and structure, not generic questions.
 - When user indicates completion or wants strategy: Transition to full negotiation strategy. Answer their questions fully. Do NOT keep asking for more variables.
 """
+
+# Runtime source of truth: updated prompt file shipped with the repo.
+MASTER_SYSTEM_PROMPT_TEXT = _load_master_system_prompt_text()
+
 def _mnt_default_state_text() -> Dict[str, Any]:
     return {
         "mode": MASTER_MODE,
@@ -3538,6 +3613,7 @@ def _master_llm_text(
     conversation_context: str = "",
     admin_prompt: str = "",
     summary_guidance_all: str = "",
+    runtime_system_prompt: str = "",
 ) -> str:
     # Compact user prompt. INFORMATION is retrieved from Pinecone.
     deal_line = "" if deal_value is None else f"DEAL_VALUE: {deal_value}\n"
@@ -3759,11 +3835,12 @@ def _master_llm_text(
 
     messages = [{"role": "user", "content": prompt_user},
     ]
+    system_prompt = runtime_system_prompt or MASTER_SYSTEM_PROMPT_TEXT
     resp = anthropod.messages.create(
         model=CHAT_MODEL,
         messages=messages,
         max_tokens=4096,
-        system=MASTER_SYSTEM_PROMPT_TEXT + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="master"),
+        system=system_prompt + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="master"),
         temperature=0.2,
     )
     text = _finalize_master_text((resp.content[0].text or ""), max_words=320)
@@ -3991,6 +4068,7 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
 
     # Build conversation context like /chat
     conversation_context = _mnt_build_conversation_context(st)
+    runtime_system_prompt = _master_system_prompt_runtime(payload, st, user_message)
 
     # Build state memory text for the LLM (answers + template snapshot + MASTER phase guidance)
     phase_label = _PHASE_LABEL.get(st.get("phase") or "", "")
@@ -4023,6 +4101,7 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
             conversation_context=conversation_context,
             admin_prompt=admin_prompt,
             summary_guidance_all=summary_guidance_all,
+            runtime_system_prompt=runtime_system_prompt,
         )
     except Exception as e:
         _jlog("master_template_llm_error", session_id=session_id, err=str(e)[:800])
@@ -4441,8 +4520,9 @@ def master_template_sse(payload: Dict = Body(...)):
                 f"Do NOT refuse. If INFORMATION is thin, still give best-effort Diadem guidance.{clarify_note}\n"
                 f"\n\nCRITICAL FINAL RULE: Unless the user is explicitly asking for help filling a specific field (variable_name when FOCUS_FIELD is set, or asking 'what variable' or 'which variable'), DO NOT end your response with ANY question. End with a statement. The user will decide their next step. If you need to guide them, use statements like 'Consider...', 'Think about...', or 'You might want to...' instead of questions. This rule overrides any other instruction about asking questions."
             )
+            runtime_system_prompt = _master_system_prompt_runtime(payload, st, user_message)
             messages = [
-                {"role": "system", "content": MASTER_SYSTEM_PROMPT_TEXT + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="master")},
+                {"role": "system", "content": runtime_system_prompt + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="master")},
                 {"role": "user", "content": prompt_user},
             ]
 
