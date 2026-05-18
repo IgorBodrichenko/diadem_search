@@ -227,30 +227,57 @@ index = pc.Index(
 # CLAUDE STREAM HELPERS (SSE)
 # =========================
 def _openai_stream_text(messages: List[Dict[str, str]], model: str, temperature: float = 0.2):
-    """Yield incremental text deltas from Claude streaming API."""
+    """Yield incremental text deltas from Claude API with robust system-message handling."""
+    system_parts: List[str] = []
+    clean_messages: List[Dict[str, str]] = []
+
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "").strip().lower()
+        content = msg.get("content")
+        if role == "system":
+            if isinstance(content, str) and content.strip():
+                system_parts.append(content.strip())
+            continue
+        if role in ("user", "assistant") and isinstance(content, str):
+            clean_messages.append({"role": role, "content": content})
+
+    system_prompt = "\n\n".join(system_parts).strip() if system_parts else None
+
     try:
-        with anthropod.messages.stream(
-            model=model,
-            messages=messages,
-            max_tokens=4096,
-            temperature=temperature,
-        ) as stream:
+        stream_kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": clean_messages,
+            "max_tokens": 4096,
+            "temperature": temperature,
+        }
+        if system_prompt:
+            stream_kwargs["system"] = system_prompt
+
+        with anthropod.messages.stream(**stream_kwargs) as stream:
             for text in stream.text_stream:
                 if text:
                     yield text
     except Exception as e:
+        _jlog("stream_error", err=str(e)[:300], model=model)
         # If streaming fails, fallback to a single non-streamed response
         try:
-            resp = anthropod.messages.create(
-                model=model,
-                messages=messages,
-                max_tokens=4096,
-                temperature=temperature,
-            )
+            create_kwargs: Dict[str, Any] = {
+                "model": model,
+                "messages": clean_messages,
+                "max_tokens": 4096,
+                "temperature": temperature,
+            }
+            if system_prompt:
+                create_kwargs["system"] = system_prompt
+
+            resp = anthropod.messages.create(**create_kwargs)
             full = (resp.content[0].text or "")
             if full:
                 yield full
-        except Exception:
+        except Exception as fallback_error:
+            _jlog("stream_fallback_error", err=str(fallback_error)[:300], model=model)
             yield "Server error."
 
 def _sse_headers():
@@ -1878,6 +1905,41 @@ def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bo
 # =========================
 # ROUTES
 # =========================
+def _chat_build_conversation_context(history: Any, max_turns: int = 4) -> str:
+    """Normalize chat history into a compact context block for retrieval and response grounding."""
+    if not isinstance(history, list) or not history:
+        return ""
+
+    parts: List[str] = []
+
+    # Format A: [{"role": "user|assistant", "content": "..."}, ...]
+    if all(isinstance(x, dict) and ("role" in x or "content" in x) for x in history):
+        tail = history[-(max_turns * 2):]
+        for msg in tail:
+            role = str(msg.get("role") or "").strip().lower()
+            content = str(msg.get("content") or "").strip()
+            if not content:
+                continue
+            if role == "user":
+                parts.append(f"User: {content}")
+            elif role == "assistant":
+                parts.append(f"Assistant: {content}")
+        return "\n".join(parts).strip()
+
+    # Format B: [{"user": "...", "assistant": "..."}, ...]
+    tail = history[-max_turns:]
+    for turn in tail:
+        if not isinstance(turn, dict):
+            continue
+        user_msg = str(turn.get("user") or turn.get("u") or "").strip()
+        assistant_msg = str(turn.get("assistant") or turn.get("a") or "").strip()
+        if user_msg:
+            parts.append(f"User: {user_msg}")
+        if assistant_msg:
+            parts.append(f"Assistant: {assistant_msg}")
+    return "\n".join(parts).strip()
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "debug": DEBUG}
@@ -1890,6 +1952,7 @@ def health():
 def chat(payload: Dict = Body(...)):
     query = (payload.get("query") or "").strip()
     top_k = int(payload.get("top_k") or TOP_K)
+    history = payload.get("history") or []
     user_name = _extract_user_name(payload)
     admin_prompt, summary_guidance_all = _extract_admin_settings(payload)
 
@@ -1903,12 +1966,18 @@ def chat(payload: Dict = Body(...)):
     if _is_smalltalk(query):
         return {"answer": _smalltalk_reply(user_name), "session_id": session_id}
 
-    matches = get_matches(query, top_k, request_id=request_id)
+    conversation_context = _chat_build_conversation_context(history)
+    retrieval_query = query
+    if conversation_context:
+        retrieval_query = f"{query}\n\nRECENT_CONVERSATION:\n{conversation_context}"
+
+    matches = get_matches(retrieval_query, top_k, request_id=request_id)
     context = build_context(matches, request_id=request_id) if matches else ""
 
     user = (
         f"USER_NAME:\n{user_name}\n\n"
         f"QUESTION:\n{query}\n\n"
+        f"CONVERSATION_CONTEXT:\n{conversation_context}\n\n"
         f"INFORMATION:\n{context}"
     )
 
@@ -1938,6 +2007,7 @@ def chat_sse(payload: Dict = Body(...)):
 
     query = (payload.get("query") or "").strip()
     top_k = int(payload.get("top_k") or TOP_K)
+    history = payload.get("history") or []
     user_name = _extract_user_name(payload)
     admin_prompt, summary_guidance_all = _extract_admin_settings(payload)
 
@@ -1951,12 +2021,18 @@ def chat_sse(payload: Dict = Body(...)):
         elif _is_smalltalk(query):
             chunks = [_smalltalk_reply(user_name)]
         else:
-            matches = get_matches(query, top_k, request_id=request_id)
+            conversation_context = _chat_build_conversation_context(history)
+            retrieval_query = query
+            if conversation_context:
+                retrieval_query = f"{query}\n\nRECENT_CONVERSATION:\n{conversation_context}"
+
+            matches = get_matches(retrieval_query, top_k, request_id=request_id)
             context = build_context(matches, request_id=request_id) if matches else ""
 
             user = (
                 f"USER_NAME:\n{user_name}\n\n"
                 f"QUESTION:\n{query}\n\n"
+                f"CONVERSATION_CONTEXT:\n{conversation_context}\n\n"
                 f"INFORMATION:\n{context}"
             )
             messages = [
