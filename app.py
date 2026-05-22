@@ -2196,6 +2196,8 @@ def chat(payload: Dict = Body(...)):
     )
 
     answer = _finalize_chat_text((resp.content[0].text or ""), max_questions=1)
+    if assets and _looks_like_low_context_deflection(answer):
+        answer = _chat_practical_fallback(assets)
     if answer:
         opener = _pick_opener(session_id, user_name, "qa_last_opener")
         answer = _rewrite_bad_opening(answer, opener)
@@ -2250,6 +2252,8 @@ def chat_sse(payload: Dict = Body(...)):
             full_text = "".join(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2))
 
         full_text = _finalize_chat_text(full_text, max_questions=1)
+        if assets and _looks_like_low_context_deflection(full_text):
+            full_text = _chat_practical_fallback(assets)
         chunks = _iter_text_as_sse_chunks([full_text], min_chars=28)
 
         # Emit chunks
@@ -3082,6 +3086,77 @@ def _finalize_chat_text(text: str, max_questions: int = 1) -> str:
     if not t:
         return ""
     return _limit_question_marks(t, max_questions=max_questions)
+
+
+def _looks_like_low_context_deflection(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    markers = [
+        "information retrieved doesn't contain",
+        "doesn't contain the actual",
+        "not fully captured",
+        "go directly to",
+        "course materials",
+        "portal where those slides live",
+        "to avoid pointing you in the wrong direction",
+    ]
+    return any(m in t for m in markers)
+
+
+def _assets_reference_lines(assets: List[Dict[str, Any]], max_items: int = 3) -> List[str]:
+    lines: List[str] = []
+    for a in (assets or [])[:max_items]:
+        src = str(a.get("source") or "Slide source")
+        page = a.get("page")
+        if page is None:
+            lines.append(f"- {src}")
+        else:
+            lines.append(f"- {src} (page {page})")
+    return lines
+
+
+def _chat_practical_fallback(assets: List[Dict[str, Any]]) -> str:
+    refs = _assets_reference_lines(assets, max_items=3)
+    refs_block = "\n".join(refs) if refs else "- MASTER Negotiator Slides"
+    text = (
+        "Here is the practical model to follow now:\n"
+        "- Build your MASTER plan from variables, not only price.\n"
+        "- Set Low, High, Highest positions for each variable.\n"
+        "- Prepare If you... then I... trade lines.\n"
+        "- Keep a clear walk-away and ambition level.\n\n"
+        "Top slide references:\n"
+        f"{refs_block}"
+    )
+    return _finalize_chat_text(text, max_questions=0)
+
+
+def _master_practical_fallback(assets: List[Dict[str, Any]], focus_field: str = "") -> str:
+    refs = _assets_reference_lines(assets, max_items=3)
+    refs_block = "\n".join(refs) if refs else "- MASTER Negotiator Slides"
+
+    focus_line = ""
+    if focus_field:
+        focus_line = f"\nCurrent focus field: {focus_field}. Keep the next input in that field only."
+
+    text = (
+        "Use this practical MASTER structure now:\n"
+        "1. M - Mindset and self-knowing\n"
+        "2. A - Ambition and preparation\n"
+        "3. S - Situation and style choice\n"
+        "4. T - Tactics response plan\n"
+        "5. E - Engage: proposal and live conversation\n"
+        "6. R - Roles, alignment, control\n\n"
+        "Top slide references to follow:\n"
+        f"{refs_block}\n\n"
+        "Paste-ready start for your template:\n"
+        "- My List: 5 tradable variables\n"
+        "- Their List: expected asks for each variable\n"
+        "- Positions per variable: Low, High, Highest\n"
+        "- Walk-away point and non-negotiables"
+        f"{focus_line}"
+    )
+    return _finalize_master_text(text, max_words=320)
 
 
 def _extract_last_question(text: str) -> str:
@@ -4400,6 +4475,9 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
         # add one short line if not already covered
         text = (text + "\n\nDeal value: enter the total commercial value as a number.").strip()
 
+    if assets and _looks_like_low_context_deflection(text):
+        text = _master_practical_fallback(assets, focus_field=st.get("focus_field") or "")
+
     # Add empathy/opener like /chat
     if text and text.strip() != "I can't find this in the provided documents.":
         opener = _pick_opener(session_id, user_name, "mnt_last_opener")
@@ -4832,6 +4910,8 @@ def master_template_sse(payload: Dict = Body(...)):
                 yield f"event: assets\ndata: {assets_payload}\n\n"
 
             full_text = _finalize_master_text("".join(full_parts), max_words=320)
+            if assets and _looks_like_low_context_deflection(full_text):
+                full_text = _master_practical_fallback(assets, focus_field=st.get("focus_field") or "")
             
             # Never allow the generic refusal line in this mode
             if full_text.strip().lower() in ("i can't find this in the provided documents.", "i can't find this in the provided documents."):
