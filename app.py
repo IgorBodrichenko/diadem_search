@@ -3117,24 +3117,18 @@ def _assets_reference_lines(assets: List[Dict[str, Any]], max_items: int = 3) ->
 
 
 def _chat_practical_fallback(assets: List[Dict[str, Any]]) -> str:
-    refs = _assets_reference_lines(assets, max_items=3)
-    refs_block = "\n".join(refs) if refs else "- MASTER Negotiator Slides"
     text = (
         "Here is the practical model to follow now:\n"
         "- Build your MASTER plan from variables, not only price.\n"
         "- Set Low, High, Highest positions for each variable.\n"
         "- Prepare If you... then I... trade lines.\n"
         "- Keep a clear walk-away and ambition level.\n\n"
-        "Top slide references:\n"
-        f"{refs_block}"
+        "Relevant visual examples are attached below."
     )
     return _finalize_chat_text(text, max_questions=0)
 
 
 def _master_practical_fallback(assets: List[Dict[str, Any]], focus_field: str = "") -> str:
-    refs = _assets_reference_lines(assets, max_items=3)
-    refs_block = "\n".join(refs) if refs else "- MASTER Negotiator Slides"
-
     focus_line = ""
     if focus_field:
         focus_line = f"\nCurrent focus field: {focus_field}. Keep the next input in that field only."
@@ -3147,8 +3141,7 @@ def _master_practical_fallback(assets: List[Dict[str, Any]], focus_field: str = 
         "4. T - Tactics response plan\n"
         "5. E - Engage: proposal and live conversation\n"
         "6. R - Roles, alignment, control\n\n"
-        "Top slide references to follow:\n"
-        f"{refs_block}\n\n"
+        "Relevant visual examples are attached below.\n\n"
         "Paste-ready start for your template:\n"
         "- My List: 5 tradable variables\n"
         "- Their List: expected asks for each variable\n"
