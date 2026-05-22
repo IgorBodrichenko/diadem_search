@@ -1405,6 +1405,7 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
           request_id=request_id,
           queries=queries)
     all_results: List[List[Dict]] = []
+    failed_queries = 0
     for q in queries:
         try:
             t0 = time.time()
@@ -1419,8 +1420,26 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
                   ms=ms,
                   matches_count=len(matches),
                   top_matches=[_brief_match(x) for x in matches[:SEARCH_LOG_MAX_MATCHES]])
-        except Exception:
+        except Exception as e:
+            failed_queries += 1
+            _jlog(
+                "pinecone_query_error",
+                request_id=request_id,
+                q=q,
+                err=str(e)[:500],
+                index_name=PINECONE_INDEX_NAME,
+                host=PINECONE_HOST,
+            )
             continue
+
+    if failed_queries == len(queries):
+        _jlog(
+            "pinecone_all_queries_failed",
+            request_id=request_id,
+            queries=queries,
+            index_name=PINECONE_INDEX_NAME,
+            host=PINECONE_HOST,
+        )
 
     merged = _merge_dedup_matches(all_results)
     _slog("search_merged",
