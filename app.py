@@ -226,6 +226,26 @@ index = pc.Index(
     host=os.getenv("PINECONE_HOST")
 )
 
+# Keep embedding dimension aligned with Pinecone index dimension.
+EMBED_QUERY_DIM = EMBED_DIM
+try:
+    idx_info = pc.describe_index(PINECONE_INDEX_NAME)
+    if isinstance(idx_info, dict):
+        EMBED_QUERY_DIM = int(idx_info.get("dimension") or EMBED_QUERY_DIM)
+    else:
+        EMBED_QUERY_DIM = int(getattr(idx_info, "dimension", EMBED_QUERY_DIM) or EMBED_QUERY_DIM)
+except Exception as e:
+    _jlog("pinecone_describe_index_error", err=str(e)[:400], index_name=PINECONE_INDEX_NAME, host=PINECONE_HOST)
+
+_jlog(
+    "embedding_dim_config",
+    model=EMBED_MODEL,
+    requested_dim=EMBED_DIM,
+    query_dim=EMBED_QUERY_DIM,
+    index_name=PINECONE_INDEX_NAME,
+    host=PINECONE_HOST,
+)
+
 # =========================
 # CLAUDE STREAM HELPERS (SSE)
 # =========================
@@ -840,7 +860,7 @@ def embed_query(text: str) -> List[float]:
     resp = openai.embeddings.create(
         model=EMBED_MODEL,
         input=[text],
-        dimensions=EMBED_DIM,
+        dimensions=EMBED_QUERY_DIM,
     )
     return resp.data[0].embedding
 
