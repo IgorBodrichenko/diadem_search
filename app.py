@@ -75,6 +75,9 @@ SEARCH_DEBUG_LOGS = os.getenv("SEARCH_DEBUG_LOGS", "0").strip().lower() in ("1",
 SEARCH_LOG_MAX_MATCHES = int(os.getenv("SEARCH_LOG_MAX_MATCHES", "8"))   # how many matches to print
 SEARCH_LOG_TEXT_PREVIEW = int(os.getenv("SEARCH_LOG_TEXT_PREVIEW", "140"))  # chars of text preview in logs
 
+# Optional hybrid slide keyword boost for assets (semantic retrieval stays primary)
+SLIDE_INDEX_PATH = os.getenv("SLIDE_INDEX_PATH", "slide_index.json")
+
 def _slog(event: str, **fields):
     """Search logs (opt-in) that you can copy from server logs."""
     if SEARCH_DEBUG_LOGS:
@@ -957,6 +960,100 @@ def _tokenize(s: str) -> List[str]:
     return toks
 
 
+def _norm_text(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _safe_read_json(path: str) -> Dict[str, Any]:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_slide_keyword_entries() -> List[Tuple[str, set, List[str]]]:
+    data = _safe_read_json(SLIDE_INDEX_PATH)
+    raw_lookup = data.get("keyword_lookup") if isinstance(data.get("keyword_lookup"), dict) else {}
+    out: List[Tuple[str, set, List[str]]] = []
+    for kw, slide_ids in raw_lookup.items():
+        if not isinstance(kw, str):
+            continue
+        if not isinstance(slide_ids, list):
+            continue
+        kw_norm = _norm_text(kw)
+        if not kw_norm:
+            continue
+        ids = [str(s).strip().lower() for s in slide_ids if str(s).strip()]
+        if not ids:
+            continue
+        out.append((kw_norm, set(kw_norm.split()), ids))
+    return out
+
+
+SLIDE_KEYWORD_ENTRIES = _load_slide_keyword_entries()
+
+
+def _slide_keyword_scores(query: str) -> Dict[str, float]:
+    q_norm = _norm_text(query)
+    if not q_norm:
+        return {}
+
+    q_toks = set(_tokenize(q_norm))
+    scores: Dict[str, float] = {}
+
+    for kw_norm, kw_toks, ids in SLIDE_KEYWORD_ENTRIES:
+        score = 0.0
+
+        # Exact/phrase containment has priority.
+        if len(kw_norm) >= 4 and kw_norm in q_norm:
+            score += 3.0
+
+        # Token overlap fallback for partial phrasing differences.
+        if kw_toks and q_toks:
+            overlap = len(kw_toks & q_toks)
+            if overlap >= 2 or (len(kw_toks) > 0 and (overlap / max(1, len(kw_toks))) >= 0.66):
+                score += float(overlap)
+
+        if score <= 0:
+            continue
+
+        for sid in ids:
+            scores[sid] = scores.get(sid, 0.0) + score
+
+    return scores
+
+
+def _asset_slide_id(md: Dict[str, Any], source: str = "", page: Any = None) -> str:
+    for key in ("id", "slide_id"):
+        v = str(md.get(key) or "").strip().lower()
+        if v.startswith("slide_"):
+            return v
+
+    try:
+        p = int(page)
+        if p > 0:
+            return f"slide_{p:03d}"
+    except Exception:
+        pass
+
+    src = str(source or "").lower()
+    m = re.search(r"slide[_\-\s]?(\d{1,3})", src)
+    if m:
+        try:
+            p = int(m.group(1))
+            return f"slide_{p:03d}"
+        except Exception:
+            return ""
+    return ""
+
+
 def _keyword_query(query: str) -> str:
     toks = _tokenize(query)[:18]
     return " ".join(toks)
@@ -1209,6 +1306,73 @@ def _brief_match(m: Dict, label: str = "") -> Dict[str, Any]:
         "id": m.get("id") or "",
         "preview": txt,
     }
+
+
+def _extract_chat_assets(matches: List[Dict], max_items: int = 3, query: str = "") -> List[Dict[str, Any]]:
+    """Build optional slide/template asset references for frontend rendering."""
+    assets: List[Dict[str, Any]] = []
+    seen: set = set()
+    keyword_scores = _slide_keyword_scores(query)
+    candidates: List[Tuple[float, int, Dict[str, Any]]] = []
+
+    for idx, m in enumerate(matches or []):
+        md = (m.get("metadata") or {})
+
+        source = (
+            (md.get("file_name") or "")
+            or (md.get("source") or "")
+            or (md.get("file") or "")
+            or (md.get("doc_id") or "")
+        )
+        page = md.get("page")
+        image_url = (
+            (md.get("image_url") or "")
+            or (md.get("img_url") or "")
+            or (md.get("asset_url") or "")
+            or (md.get("url") or "")
+        )
+
+        if not source and not image_url:
+            continue
+
+        source_l = str(source).lower()
+        if "slide" in source_l:
+            asset_type = "slide_example"
+        elif "template" in source_l:
+            asset_type = "template_example"
+        else:
+            asset_type = "reference_example"
+
+        key = (asset_type, str(source), str(page), str(image_url))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        txt = str(md.get("text") or "").strip().replace("\n", " ")
+        if len(txt) > 180:
+            txt = txt[:180] + "..."
+
+        asset = {
+            "type": asset_type,
+            "source": source,
+            "page": page,
+            "image_url": image_url,
+            "preview": txt,
+            "has_image": bool(image_url),
+        }
+
+        sid = _asset_slide_id(md, source=source, page=page)
+        kw = float(keyword_scores.get(sid, 0.0))
+        # Keep semantic ordering as base, apply keyword boost as tie-break/priority.
+        rank_score = kw + (0.25 if bool(image_url) else 0.0)
+        candidates.append((rank_score, idx, asset))
+
+    # Higher keyword score first, then preserve original retrieval order.
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    for _, _, asset in candidates[:max_items]:
+        assets.append(asset)
+
+    return assets
 
 def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) -> List[Dict]:
     q_clean = (query or "").strip()
@@ -1961,10 +2125,10 @@ def chat(payload: Dict = Body(...)):
     _cleanup_sessions()
 
     if not query:
-        return JSONResponse({"answer": "", "session_id": session_id})
+        return JSONResponse({"answer": "", "session_id": session_id, "assets": []})
 
     if _is_smalltalk(query):
-        return {"answer": _smalltalk_reply(user_name), "session_id": session_id}
+        return {"answer": _smalltalk_reply(user_name), "session_id": session_id, "assets": []}
 
     conversation_context = _chat_build_conversation_context(history)
     retrieval_query = query
@@ -1973,6 +2137,7 @@ def chat(payload: Dict = Body(...)):
 
     matches = get_matches(retrieval_query, top_k, request_id=request_id)
     context = build_context(matches, request_id=request_id) if matches else ""
+    assets = _extract_chat_assets(matches, max_items=3, query=query)
 
     user = (
         f"USER_NAME:\n{user_name}\n\n"
@@ -1996,7 +2161,7 @@ def chat(payload: Dict = Body(...)):
         opener = _pick_opener(session_id, user_name, "qa_last_opener")
         answer = _rewrite_bad_opening(answer, opener)
 
-    return {"answer": answer, "session_id": session_id}
+    return {"answer": answer, "session_id": session_id, "assets": assets}
 
 
 @app.post("/chat/sse")
@@ -2015,11 +2180,13 @@ def chat_sse(payload: Dict = Body(...)):
         start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
         yield f"event: start\ndata: {start_payload}\n\n"
 
+        assets: List[Dict[str, Any]] = []
+
         # Smalltalk / empty
         if not query:
-            chunks = [""]
+            full_text = ""
         elif _is_smalltalk(query):
-            chunks = [_smalltalk_reply(user_name)]
+            full_text = _smalltalk_reply(user_name)
         else:
             conversation_context = _chat_build_conversation_context(history)
             retrieval_query = query
@@ -2028,6 +2195,7 @@ def chat_sse(payload: Dict = Body(...)):
 
             matches = get_matches(retrieval_query, top_k, request_id=request_id)
             context = build_context(matches, request_id=request_id) if matches else ""
+            assets = _extract_chat_assets(matches, max_items=3, query=query)
 
             user = (
                 f"USER_NAME:\n{user_name}\n\n"
@@ -2040,7 +2208,8 @@ def chat_sse(payload: Dict = Body(...)):
                 {"role": "user", "content": user},
             ]
 
-        full_text = "".join(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2))
+            full_text = "".join(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2))
+
         full_text = _finalize_chat_text(full_text, max_questions=1)
         chunks = _iter_text_as_sse_chunks([full_text], min_chars=28)
 
@@ -2049,7 +2218,11 @@ def chat_sse(payload: Dict = Body(...)):
             data = json.dumps({"text": part}, ensure_ascii=False)
             yield f"event: chunk\ndata: {data}\n\n"
 
-        done_payload = json.dumps({"done": True}, ensure_ascii=False)
+        if assets:
+            assets_payload = json.dumps({"assets": assets}, ensure_ascii=False)
+            yield f"event: assets\ndata: {assets_payload}\n\n"
+
+        done_payload = json.dumps({"done": True, "assets": assets}, ensure_ascii=False)
         yield f"event: done\ndata: {done_payload}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=_sse_headers())
@@ -4097,6 +4270,7 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
             matches = raw2 or []
 
     info = build_context(matches, request_id=request_id) if matches else ""
+    assets = _extract_chat_assets(matches, max_items=3, query=user_message)
 
     # --- MASTER phase guidance (M/A/S/T/E/R) ---
     # Skip phase guidance if user just accepted help and no active_section_id is set (guide to variables first)
@@ -4204,7 +4378,7 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
         _mnt_push_history(st, user_message, text)
 
     _mnt_save_state_text(session_id, st)
-    return {"session_id": session_id, "mode": MASTER_MODE, "text": text, "done": False}
+    return {"session_id": session_id, "mode": MASTER_MODE, "text": text, "done": False, "assets": assets}
 
 
 @app.post("/master/template")
@@ -4212,10 +4386,12 @@ def master_template(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
     try:
         out = master_template_turn_text(payload, session_id=session_id)
+        if "assets" not in out:
+            out["assets"] = []
         return JSONResponse(out)
     except Exception as e:
         _jlog("master_template_error", session_id=session_id, err=str(e))
-        return JSONResponse({"text": "Server error.", "session_id": session_id, "mode": MASTER_MODE, "done": False}, status_code=500)
+        return JSONResponse({"text": "Server error.", "session_id": session_id, "mode": MASTER_MODE, "done": False, "assets": []}, status_code=500)
 
 
 @app.post("/master/template/sse")
@@ -4227,6 +4403,7 @@ def master_template_sse(payload: Dict = Body(...)):
     def gen():
         start_payload = json.dumps({"session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
         yield f"event: start\ndata: {start_payload}\n\n"
+        assets: List[Dict[str, Any]] = []
 
         try:
             # Load/update state (same as non-SSE) but without the consent gate
@@ -4261,7 +4438,7 @@ def master_template_sse(payload: Dict = Body(...)):
                     data = json.dumps({"text": txt}, ensure_ascii=False)
                     yield f"event: chunk\ndata: {data}\n\n"
                     _mnt_save_state_text(session_id, st)
-                    done_payload = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
+                    done_payload = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE, "assets": assets}, ensure_ascii=False)
                     yield f"event: done\ndata: {done_payload}\n\n"
                     return
                 else:
@@ -4292,7 +4469,7 @@ def master_template_sse(payload: Dict = Body(...)):
                 data = json.dumps({"text": txt}, ensure_ascii=False)
                 yield f"event: chunk\ndata: {data}\n\n"
                 _mnt_save_state_text(session_id, st)
-                done_payload = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
+                done_payload = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE, "assets": assets}, ensure_ascii=False)
                 yield f"event: done\ndata: {done_payload}\n\n"
                 return
 
@@ -4313,6 +4490,7 @@ def master_template_sse(payload: Dict = Body(...)):
                     raw2 = get_matches(rag_query + " negotiation", TOP_K, request_id=request_id)
                     matches = raw2 or []
             info = build_context(matches, request_id=request_id) if matches else ""
+            assets = _extract_chat_assets(matches, max_items=3, query=user_message)
             
             # Build conversation context like /chat
             conversation_context = _mnt_build_conversation_context(st)
@@ -4610,6 +4788,10 @@ def master_template_sse(payload: Dict = Body(...)):
                 data = json.dumps({"text": part}, ensure_ascii=False)
                 yield f"event: chunk\ndata: {data}\n\n"
 
+            if assets:
+                assets_payload = json.dumps({"assets": assets}, ensure_ascii=False)
+                yield f"event: assets\ndata: {assets_payload}\n\n"
+
             full_text = _finalize_master_text("".join(full_parts), max_words=320)
             
             # Never allow the generic refusal line in this mode
@@ -4649,14 +4831,14 @@ def master_template_sse(payload: Dict = Body(...)):
                 st["last_question"] = ""
 
             _mnt_save_state_text(session_id, st)
-            done_payload = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
+            done_payload = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE, "assets": assets}, ensure_ascii=False)
             yield f"event: done\ndata: {done_payload}\n\n"
 
         except Exception as e:
             _jlog("master_template_sse_error", session_id=session_id, err=str(e)[:800])
             err_chunk = json.dumps({"text": "Internal error. Please retry."}, ensure_ascii=False)
             yield f"event: chunk\ndata: {err_chunk}\n\n"
-            err_done = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE}, ensure_ascii=False)
+            err_done = json.dumps({"done": True, "session_id": session_id, "mode": MASTER_MODE, "assets": assets}, ensure_ascii=False)
             yield f"event: done\ndata: {err_done}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=_sse_headers())

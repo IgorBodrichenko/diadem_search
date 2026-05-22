@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import uuid
 import time
 from typing import List, Dict, Any
@@ -25,11 +26,17 @@ PINECONE_ENV = os.getenv("PINECONE_ENV")  # e.g. us-east-1
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")  # diadem-ai
 
 EMBED_MODEL = "text-embedding-3-small"
-EMBED_DIM = 1536  # REQUIRED for this model
+EMBED_DIM = int(os.getenv("EMBED_DIM", "1536"))
 
 CHUNK_TOKENS = 800
 CHUNK_OVERLAP = 150
 UPSERT_BATCH_SIZE = int(os.getenv("UPSERT_BATCH_SIZE", "100"))
+
+# Optional slide image enrichment (for Bubble/Drive-hosted images)
+SLIDE_INDEX_PATH = os.getenv("SLIDE_INDEX_PATH", "slide_index.json")
+SLIDE_URL_MAP_PATH = os.getenv("SLIDE_URL_MAP_PATH", "slide_image_urls.json")
+SLIDE_IMAGE_BASE_URL = os.getenv("SLIDE_IMAGE_BASE_URL", "").strip().rstrip("/")
+ATTACH_SLIDE_URLS_FOR_ALL_PDFS = os.getenv("ATTACH_SLIDE_URLS_FOR_ALL_PDFS", "0").strip().lower() in ("1", "true", "yes", "y", "on")
 
 if not all([OPENAI_API_KEY, ANTHROPIC_API_KEY, PINECONE_API_KEY, PINECONE_INDEX_NAME, PINECONE_ENV]):
     raise RuntimeError("Missing required environment variables")
@@ -44,7 +51,141 @@ anthropod = Anthropic(api_key=ANTHROPIC_API_KEY)
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(PINECONE_INDEX_NAME)
 
+# Align embedding output dimension with the Pinecone index dimension.
+# This prevents 400 errors when index dimension differs from model default.
+INDEX_DIM = EMBED_DIM
+try:
+    index_info = pc.describe_index(PINECONE_INDEX_NAME)
+    if isinstance(index_info, dict):
+        INDEX_DIM = int(index_info.get("dimension") or INDEX_DIM)
+    else:
+        INDEX_DIM = int(getattr(index_info, "dimension", INDEX_DIM) or INDEX_DIM)
+except Exception:
+    INDEX_DIM = EMBED_DIM
+
 ENC = tiktoken.get_encoding("cl100k_base")
+
+
+def _safe_read_json(path: str) -> Dict[str, Any]:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _parse_page_from_slide_id(slide_id: str) -> int:
+    # Expects values like slide_001, slide_079
+    if not isinstance(slide_id, str):
+        return 0
+    try:
+        tail = slide_id.split("_")[-1]
+        return int(tail)
+    except Exception:
+        return 0
+
+
+def _load_slide_assets() -> Dict[str, Any]:
+    """Build by-page image URL + metadata from optional local mapping files."""
+    by_page: Dict[int, str] = {}
+    meta_by_page: Dict[int, Dict[str, str]] = {}
+
+    # 1) slide_index.json: supports building URLs from base + file names
+    index_data = _safe_read_json(SLIDE_INDEX_PATH)
+    slides = index_data.get("slides") if isinstance(index_data.get("slides"), dict) else {}
+    for slide_id, slide in slides.items():
+        page = _parse_page_from_slide_id(slide_id)
+        if page <= 0 or not isinstance(slide, dict):
+            continue
+
+        file_name = str(slide.get("file") or "").strip()
+        if file_name and SLIDE_IMAGE_BASE_URL:
+            by_page[page] = f"{SLIDE_IMAGE_BASE_URL}/{file_name}"
+
+        title = str(slide.get("title") or "").strip()
+        topics = slide.get("topics") if isinstance(slide.get("topics"), list) else []
+        tags = ", ".join(str(t).strip() for t in topics if str(t).strip())
+        meta_by_page[page] = {
+            "slide_id": slide_id,
+            "name": title,
+            "category": "negotiation_slide",
+            "tags": tags,
+        }
+
+    # 2) slide_image_urls.json override mapping (if provided)
+    # Supported shapes:
+    # {"by_page": {"1": "https://...", "2": "https://..."}}
+    # {"1": "https://...", "2": "https://..."}
+    # {"slide_001": "https://..."}
+    # {"slide_001": {"image_url": "https://..."}}
+    map_data = _safe_read_json(SLIDE_URL_MAP_PATH)
+    if map_data:
+        scope = map_data.get("by_page") if isinstance(map_data.get("by_page"), dict) else map_data
+        if isinstance(scope, dict):
+            for k, v in scope.items():
+                page = 0
+                if isinstance(k, str) and k.startswith("slide_"):
+                    page = _parse_page_from_slide_id(k)
+                else:
+                    try:
+                        page = int(str(k))
+                    except Exception:
+                        page = 0
+                if page <= 0:
+                    continue
+
+                if isinstance(v, str):
+                    url = v.strip()
+                elif isinstance(v, dict):
+                    url = str(v.get("image_url") or v.get("url") or "").strip()
+                else:
+                    url = ""
+                if url:
+                    by_page[page] = url
+
+    return {"by_page": by_page, "meta_by_page": meta_by_page}
+
+
+SLIDE_ASSETS = _load_slide_assets()
+
+
+def _should_attach_slide_assets(source_name: str) -> bool:
+    if ATTACH_SLIDE_URLS_FOR_ALL_PDFS:
+        return True
+    s = (source_name or "").lower()
+    return "master negotiator" in s
+
+
+def _enrich_slide_metadata(base_md: Dict[str, Any], source_name: str, page: int) -> Dict[str, Any]:
+    md = dict(base_md)
+    if not _should_attach_slide_assets(source_name):
+        return md
+
+    by_page = SLIDE_ASSETS.get("by_page") if isinstance(SLIDE_ASSETS.get("by_page"), dict) else {}
+    meta_by_page = SLIDE_ASSETS.get("meta_by_page") if isinstance(SLIDE_ASSETS.get("meta_by_page"), dict) else {}
+
+    slide_url = by_page.get(page)
+    if slide_url:
+        md["image_url"] = slide_url
+
+    s_meta = meta_by_page.get(page) or {}
+    if s_meta.get("slide_id"):
+        md["id"] = s_meta.get("slide_id")
+    if s_meta.get("name"):
+        md["name"] = s_meta.get("name")
+    if s_meta.get("category"):
+        md["category"] = s_meta.get("category")
+    if s_meta.get("tags"):
+        md["tags"] = s_meta.get("tags")
+
+    # Keep a rich description field for vector traceability/UI payloads
+    if md.get("text"):
+        md["description"] = md.get("text")
+
+    return md
 
 # -------------------------
 # PDF EXTRACTION
@@ -188,16 +329,17 @@ def prepare_documents(items: List[Dict[str, Any]], source_name: str) -> List[Dic
         if item["type"] == "text":
             chunks = chunk_text(item["text"])
             for idx, chunk in enumerate(chunks, 1):
+                md = _enrich_slide_metadata({
+                    "page": page,
+                    "type": "text",
+                    "source": source_name,
+                    "priority": 10,   # HIGH – methodology rules
+                    "text": chunk,    # store text for retrieval/use
+                }, source_name, page)
                 documents.append({
                     "id": f"text-p{page}-{idx}-{uuid.uuid4().hex[:8]}",
                     "text": chunk,
-                    "metadata": {
-                        "page": page,
-                        "type": "text",
-                        "source": source_name,
-                        "priority": 10,   # HIGH – methodology rules
-                        "text": chunk     # ✅ store text for retrieval/use
-                    }
+                    "metadata": md,
                 })
 
         else:
@@ -205,16 +347,18 @@ def prepare_documents(items: List[Dict[str, Any]], source_name: str) -> List[Dic
             description = describe_image(ocr)
             content = f"[IMAGE – page {page}]\n{description}\n\nOCR:\n{ocr}"
 
+            md = _enrich_slide_metadata({
+                "page": page,
+                "type": "image",
+                "source": source_name,
+                "priority": 7,      # Visual frameworks
+                "text": content,    # store text for retrieval/use
+            }, source_name, page)
+
             documents.append({
                 "id": f"img-p{page}-{item['img_index']}-{uuid.uuid4().hex[:8]}",
                 "text": content,
-                "metadata": {
-                    "page": page,
-                    "type": "image",
-                    "source": source_name,
-                    "priority": 7,      # Visual frameworks
-                    "text": content     # ✅ store text for retrieval/use
-                }
+                "metadata": md,
             })
 
     return documents
@@ -225,7 +369,8 @@ def prepare_documents(items: List[Dict[str, Any]], source_name: str) -> List[Dic
 def embed_texts(texts: List[str]) -> List[List[float]]:
     response = openai.embeddings.create(
         model=EMBED_MODEL,
-        input=texts
+        input=texts,
+        dimensions=INDEX_DIM,
     )
     return [item.embedding for item in response.data]
 
@@ -258,6 +403,7 @@ if __name__ == "__main__":
         raise FileNotFoundError(pdf_path)
 
     print("Extracting PDF content...")
+    print(f"Embedding model: {EMBED_MODEL}, dimensions: {INDEX_DIM}")
     items = extract_pdf_items(pdf_path)
 
     print("Preparing documents...")
