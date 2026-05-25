@@ -51,6 +51,15 @@ def truncate_chars(text: str, limit: int = 15000) -> str:
     return text[:limit]
 
 
+def _looks_like_text(text: str) -> bool:
+    if not text:
+        return False
+
+    total = len(text)
+    printable = sum(1 for char in text if char.isprintable() or char in "\r\n\t")
+    return (printable / total) >= 0.85
+
+
 async def download_file(file_url: str) -> tuple[str, str]:
     async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as http:
         resp = await http.get(file_url)
@@ -101,8 +110,31 @@ def parse_pdf(local_path: str) -> str:
 
 
 def parse_txt(local_path: str) -> str:
-    with open(local_path, "r", encoding="utf-8", errors="ignore") as f:
-        return f.read()
+    raw = Path(local_path).read_bytes()
+    if not raw:
+        return ""
+
+    encodings = [
+        "utf-8-sig",
+        "utf-8",
+        "utf-16",
+        "utf-16-le",
+        "utf-16-be",
+        "cp1251",
+        "cp1252",
+        "latin-1",
+    ]
+
+    for encoding in encodings:
+        try:
+            decoded = raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+        if _looks_like_text(decoded):
+            return decoded
+
+    return raw.decode("utf-8", errors="replace")
 
 
 def extract_text_from_file(local_path: str, file_name: str) -> str:
@@ -207,12 +239,17 @@ async def parse_admin_guidance_file(payload: ParseAdminGuidanceRequest):
         parsed_text = clean_extracted_text(extracted_text)
 
         if not parsed_text:
+            file_size = os.path.getsize(local_path) if local_path and os.path.exists(local_path) else 0
             return ParseAdminGuidanceResponse(
                 status="error",
                 file_name=file_name,
                 parsed_text="",
                 file_summary="",
-                parse_error="No readable text found in uploaded file."
+                parse_error=(
+                    "No readable text found in uploaded file. "
+                    f"File size: {file_size} bytes. "
+                    "If this is a text file, save it as UTF-8, UTF-16, or plain text with visible characters."
+                )
             )
 
         file_summary = generate_guidance_summary_with_openai(
