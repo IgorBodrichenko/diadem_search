@@ -529,7 +529,13 @@ def _build_admin_system_addendum(admin_prompt: str = "", summary_guidance_all: s
 def strip_markdown_chars(text: str) -> str:
     if not text:
         return ""
-    return text.replace("*", "").replace("`", "").replace("_", "")
+    return (
+        text.replace("*", "")
+        .replace("`", "")
+        .replace("_", "")
+        .replace("—", "-")
+        .replace("–", "-")
+    )
 
 
 # =========================
@@ -567,7 +573,7 @@ def _is_supplier_renewal_demo_query(text: str) -> bool:
 
 
 def _supplier_renewal_demo_answer() -> str:
-    return (
+    answer = (
         "Pushing back on price alone is a weak move - it signals that price is your only lever, "
         "which actually hands them power.\n\n"
         "The 15% is a classic anchoring tactic. They have opened high expecting you to negotiate down. "
@@ -597,6 +603,7 @@ def _supplier_renewal_demo_answer() -> str:
         "choice. Add enough variables to move away from a price-only conversation. Use the guide on completing "
         "the plan as you build it. [Slide 52]"
     )
+    return strip_markdown_chars(answer)
 
 
 def _supplier_renewal_demo_assets() -> List[Dict[str, Any]]:
@@ -673,8 +680,8 @@ def _rewrite_bad_opening(full_text: str, opener: str) -> str:
     m = re.search(r"[.!?]\s+", t)
     if m:
         rest = t[m.end():].strip()
-        return f"{opener} {rest}".strip() if rest else opener
-    return opener
+        return strip_markdown_chars(f"{opener} {rest}".strip() if rest else opener)
+    return strip_markdown_chars(opener)
 
 # =========================
 # CHAT CONVERSATION HISTORY
