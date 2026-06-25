@@ -595,13 +595,13 @@ def _supplier_renewal_demo_answer() -> str:
         "Here are some Diadem materials you will be familiar with to help:\n\n"
         "The negotiation zone: It sounds like you are in a Graphite relationship because you have been "
         "trading for many years. Both parties will have different objectives, and the right outcome is to "
-        "trade variables rather than collapse into a price only conversation. [Slide 48]\n\n"
+        "trade variables rather than collapse into a price only conversation.\n\n"
         "Getting into the right mindset: Because this is a long term relationship, put the preparation in: "
         "prepare your mindset, set your ambition, and make sure you have support from inside your organisation "
-        "to empower you to achieve the best outcome. [Slide 51]\n\n"
+        "to empower you to achieve the best outcome.\n\n"
         "Create your MASTER plan: Complete the table available in templates and save it to a folder of your "
         "choice. Add enough variables to move away from a price only conversation. Use the guide on completing "
-        "the plan as you build it. [Slide 52]"
+        "the plan as you build it."
     )
     return strip_markdown_chars(answer)
 
