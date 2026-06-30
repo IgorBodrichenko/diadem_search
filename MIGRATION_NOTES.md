@@ -44,13 +44,13 @@
 
 ```bash
 # Existing (still needed)
-OPENAI_API_KEY=sk-...
-PINECONE_API_KEY=...
-PINECONE_INDEX_NAME=...
-PINECONE_HOST=...
+OPENAI_API_KEY=
+PINECONE_API_KEY=
+PINECONE_INDEX_NAME=
+PINECONE_HOST=
 
 # NEW - Must add for Claude
-ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_API_KEY=
 ```
 
 ## Testing Checklist
