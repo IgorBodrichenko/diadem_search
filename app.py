@@ -555,79 +555,6 @@ def _smalltalk_reply(user_name: str) -> str:
     return "Hi. How can I help?"
 
 
-def _is_supplier_renewal_demo_query(text: str) -> bool:
-    q = _norm_q(text)
-    if not q:
-        return False
-    renewal_signal = "supplier" in q and ("renewal" in q or "renew" in q)
-    price_signal = "15%" in q or "15 percent" in q or "price increase" in q
-    relationship_signal = "years" in q or "long term" in q or "long-term" in q
-    pushback_signal = "push back" in q or "price" in q
-    return renewal_signal and price_signal and relationship_signal and pushback_signal
-
-
-def _supplier_renewal_demo_answer() -> str:
-    return (
-        "Pushing back on price alone is a weak move - it signals that price is your only lever, "
-        "which actually hands them power.\n\n"
-        "The 15% is a classic anchoring tactic. They have opened high expecting you to negotiate down. "
-        "Do not react to the number. Reframe to variables first.\n\n"
-        "Before price even comes up, put these on the table:\n\n"
-        "- Contract length\n"
-        "- Payment terms\n"
-        "- Service levels and response times\n"
-        "- Volume commitments\n"
-        "- Implementation support\n\n"
-        "This shifts you from a price fight to a value negotiation - you now have things to trade, "
-        "not just concede.\n\n"
-        "When you do address the 15%, call it calmly: \"That's a significant ask - we need to find a "
-        "position that works commercially for both of us.\" Then stop talking. Silence after a challenge "
-        "is a power move.\n\n"
-        "One more thing: a supplier pushing hard at renewal is a buying signal. They need your continued "
-        "business, which means you have more leverage than you think.\n\n"
-        "What variables beyond price do you have available to trade - contract length, volume, payment terms?\n\n"
-        "Here are some Diadem materials you will be familiar with to help:\n\n"
-        "The negotiation zone: It sounds like you are in a Graphite relationship because you have been "
-        "trading for many years. Both parties will have different objectives, and the right outcome is to "
-        "trade variables rather than collapse into a price-only conversation. [Slide 48]\n\n"
-        "Getting into the right mindset: Because this is a long-term relationship, put the preparation in: "
-        "prepare your mindset, set your ambition, and make sure you have support from inside your organisation "
-        "to empower you to achieve the best outcome. [Slide 51]\n\n"
-        "Create your MASTER plan: Complete the table available in templates and save it to a folder of your "
-        "choice. Add enough variables to move away from a price-only conversation. Use the guide on completing "
-        "the plan as you build it. [Slide 52]"
-    )
-
-
-def _supplier_renewal_demo_assets() -> List[Dict[str, Any]]:
-    return [
-        {
-            "type": "slide_example",
-            "source": "Master Negotiator Slides.pdf",
-            "page": 48,
-            "image_url": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1779441430866x982754253400636200/slide_048.jpg",
-            "preview": "The negotiation zone: Graphite relationship and trading variables.",
-            "has_image": True,
-        },
-        {
-            "type": "slide_example",
-            "source": "Master Negotiator Slides.pdf",
-            "page": 51,
-            "image_url": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1779441440041x502084015064677500/slide_051.jpg",
-            "preview": "Getting into the right mindset: prepare mindset, ambition, and support.",
-            "has_image": True,
-        },
-        {
-            "type": "slide_example",
-            "source": "Master Negotiator Slides.pdf",
-            "page": 52,
-            "image_url": "https://13c0ec5b5b0fe16e72723d12df317a2b.cdn.bubble.io/f1779441443281x667314529347787500/slide_052.jpg",
-            "preview": "Create your MASTER plan: add enough variables to avoid a price-only conversation.",
-            "has_image": True,
-        },
-    ]
-
-
 # =========================
 # VARIATION
 # =========================
@@ -2242,13 +2169,6 @@ def chat(payload: Dict = Body(...)):
     if _is_smalltalk(query):
         return {"answer": _smalltalk_reply(user_name), "session_id": session_id, "assets": []}
 
-    if _is_supplier_renewal_demo_query(query):
-        return {
-            "answer": _supplier_renewal_demo_answer(),
-            "session_id": session_id,
-            "assets": _supplier_renewal_demo_assets(),
-        }
-
     conversation_context = _chat_build_conversation_context(history)
     retrieval_query = query
     if conversation_context:
@@ -2308,9 +2228,6 @@ def chat_sse(payload: Dict = Body(...)):
             full_text = ""
         elif _is_smalltalk(query):
             full_text = _smalltalk_reply(user_name)
-        elif _is_supplier_renewal_demo_query(query):
-            full_text = _supplier_renewal_demo_answer()
-            assets = _supplier_renewal_demo_assets()
         else:
             conversation_context = _chat_build_conversation_context(history)
             retrieval_query = query
