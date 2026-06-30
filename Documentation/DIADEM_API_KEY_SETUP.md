@@ -5,8 +5,8 @@
 This project needs several environment variables to run.
 
 ```env
-OPENAI_API_KEY=<your_openai_api_key>
-ANTHROPIC_API_KEY=<your_anthropic_api_key>
+OPENAI_API_KEY=
+ANTHROPIC_API_KEY=
 PINECONE_API_KEY=
 PINECONE_INDEX_NAME=
 PINECONE_HOST=
@@ -46,12 +46,10 @@ Go to [OpenAI Platform](https://platform.openai.com/).
 
 Create or open a project, then create an API key.
 
-(<your_openai_api_key>)
-
 Use it as:
 
 ```env
-OPENAI_API_KEY=sk-...
+OPENAI_API_KEY=
 ```
 
 ### Anthropic / Claude
@@ -63,7 +61,7 @@ Create an API key from the Anthropic Console.
 Use it as:
 
 ```env
-ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_API_KEY=
 ```
 
 ### Pinecone
@@ -84,8 +82,6 @@ The index name and host come from the specific Pinecone index page.
 
 Official docs: [Pinecone API keys](https://docs.pinecone.io/guides/projects/manage-api-keys)
 
-pinecone temporary test key = pcsk_63dZTZ_P7BphDtixQKhsKE73n2FSc3YQYY2rtLXMGre6abRjNDWNVx2NbNKD6WDNXNa4SU
-
 ### Bubble
 
 Only needed if the backend should read Bubble template state.
@@ -95,8 +91,8 @@ Go to your Bubble app settings and enable the Data API.
 Use:
 
 ```env
-BUBBLE_API_BASE=https://yourapp.bubbleapps.io/api/1.1/obj
-BUBBLE_API_KEY=your-bubble-token
+BUBBLE_API_BASE=
+BUBBLE_API_KEY=
 ```
 
 Official docs: [Bubble Data API](https://manual.bubble.io/core-resources/api/the-bubble-api/the-data-api)
@@ -112,20 +108,20 @@ C:\Users\lukeb\Desktop\diadem_search-test_v3\diadem_search-test_v3\.env
 Example:
 
 ```env
-OPENAI_API_KEY=<your_openai_api_key>
-ANTHROPIC_API_KEY=<your_anthropic_api_key>
-PINECONE_API_KEY=your-pinecone-key
-PINECONE_INDEX_NAME=your-index-name
-PINECONE_HOST=https://your-pinecone-index-host
+OPENAI_API_KEY=
+ANTHROPIC_API_KEY=
+PINECONE_API_KEY=
+PINECONE_INDEX_NAME=
+PINECONE_HOST=
 
-BUBBLE_API_BASE=https://yourapp.bubbleapps.io/api/1.1/obj
-BUBBLE_API_KEY=your-bubble-token
+BUBBLE_API_BASE=
+BUBBLE_API_KEY=
 ```
 
 For ingestion:
 
 ```env
-PINECONE_ENV=your-pinecone-region
+PINECONE_ENV=
 ```
 
 ## Where To Put The Keys On Render

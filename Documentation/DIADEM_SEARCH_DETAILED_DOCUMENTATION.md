@@ -855,8 +855,8 @@ Example:
 ```bash
 python bubble_bulk_upload_slides.py ^
   --dir path/to/slides ^
-  --bubble-base-url https://yourapp.bubbleapps.io ^
-  --bubble-api-token your-token ^
+  --bubble-base-url "" ^
+  --bubble-api-token "" ^
   --bubble-env test
 ```
 
@@ -980,11 +980,11 @@ pip install -r requirements.txt
 Set environment variables. For PowerShell:
 
 ```powershell
-$env:OPENAI_API_KEY="..."
-$env:ANTHROPIC_API_KEY="..."
-$env:PINECONE_API_KEY="..."
-$env:PINECONE_INDEX_NAME="..."
-$env:PINECONE_HOST="..."
+$env:OPENAI_API_KEY=""
+$env:ANTHROPIC_API_KEY=""
+$env:PINECONE_API_KEY=""
+$env:PINECONE_INDEX_NAME=""
+$env:PINECONE_HOST=""
 ```
 
 Run:
