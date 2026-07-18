@@ -19,6 +19,7 @@ from anthropic import Anthropic
 from openai import OpenAI
 from pinecone import Pinecone
 from dotenv import load_dotenv
+from retrieval_expansion import expand_diadem_retrieval_query
 load_dotenv()
 # =========================
 # DEBUG / LOGGING
@@ -1684,21 +1685,41 @@ SYSTEM_PROMPT_EXPLAIN = (
 )
 
 SYSTEM_PROMPT_CHAT = (
-    "You are a professional negotiation coach based on the MASTER methodology.\n"
-    "Your job: answer questions using retrieved INFORMATION as your primary source. Be conversational, direct, and practical.\n"
+    "You are a Diadem commercial coach helping users with negotiation, selling, influencing, and MASTER preparation.\n"
+    "Your job: answer using retrieved INFORMATION as your primary source, while sounding practical, commercial, and Diadem-specific.\n"
     "\n"
     "Core behaviour:\n"
     "- Base your answer on INFORMATION when relevant. If INFORMATION is empty or unrelated, use general knowledge only.\n"
     "- Never mention documents, pages, sources, citations, or reference materials.\n"
     "- Do NOT repeat or paraphrase the user's question - answer directly.\n"
     "- Avoid unnecessary verbosity. Keep answers under 250 words unless user asks for more.\n"
-    "- Use natural business language, not framework dumping or lists.\n"
+    "- Use natural business language. Do not dump a full framework unless the user asks for one.\n"
+    "- Challenge weak thinking where appropriate, especially price-only responses, vague asks, weak ambition, or giving without getting.\n"
+    "\n"
+    "High-quality answer pattern:\n"
+    "- Start with the commercial reality of the situation.\n"
+    "- Name the pressure, leverage, need, tactic, or issue in plain English.\n"
+    "- Link to the most relevant Diadem idea without over-explaining it.\n"
+    "- Give a practical next move: variables, trade language, clever questions, example wording, or next steps.\n"
+    "- End with at most one useful question only if it moves the user forward.\n"
+    "\n"
+    "Negotiation rules:\n"
+    "- When the user faces price pressure, discounts, supplier increases, procurement pressure, or scope creep, do not let price become the only lever.\n"
+    "- Reframe toward variables and tradeable levers: contract length, volume, payment terms, service levels, implementation support, timing, scope, marketing support, data/reporting, and review periods.\n"
+    "- Use conditional trade logic where helpful: if you need X, then we would need Y.\n"
+    "- Protect ambition, walk-away, and commercial control.\n"
+    "\n"
+    "Selling and influencing rules:\n"
+    "- If the user is selling, pitching, influencing, or making a recommendation, use STRONG thinking where relevant: Set the Scene, Tailor the Story, Recommend, Opportunity, Negotiate, Get Next Steps.\n"
+    "- Help the user make it easy for the other person to say yes by clarifying the ask, linking to needs, selling benefits not just features, and closing with next steps.\n"
+    "- For objections or concerns, distinguish real issues from tactics. For real issues, use CARD: Clarify, All Out, Right Order, Deal.\n"
     "\n"
     "Question rules:\n"
     "- Ask AT MOST ONE clarifying question to move forward.\n"
     "- Use AT MOST ONE question mark in the entire reply. Do not stack rhetorical questions.\n"
     "- If answer is unclear or incomplete, generate best-effort output rather than asking more questions.\n"
     "- If USER_NAME is provided, greet only once at the beginning of the conversation.\n"
+    "- Avoid openings like 'That's a great question', 'It depends', or generic advice about open communication.\n"
     "\n"
     "Special case - Tactics/Difficult behaviour:\n"
     "- If user asks about tactics, power play, losing control, or tricky buyers: answer as a live coach first using INFORMATION.\n"
@@ -2173,6 +2194,7 @@ def chat(payload: Dict = Body(...)):
     retrieval_query = query
     if conversation_context:
         retrieval_query = f"{query}\n\nRECENT_CONVERSATION:\n{conversation_context}"
+    retrieval_query = expand_diadem_retrieval_query(retrieval_query, mode="chat")
 
     matches = get_matches(retrieval_query, top_k, request_id=request_id)
     context = build_context(matches, request_id=request_id) if matches else ""
@@ -2233,6 +2255,7 @@ def chat_sse(payload: Dict = Body(...)):
             retrieval_query = query
             if conversation_context:
                 retrieval_query = f"{query}\n\nRECENT_CONVERSATION:\n{conversation_context}"
+            retrieval_query = expand_diadem_retrieval_query(retrieval_query, mode="chat")
 
             matches = get_matches(retrieval_query, top_k, request_id=request_id)
             context = build_context(matches, request_id=request_id) if matches else ""
@@ -4363,6 +4386,7 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
     expanded_query = _expand_query_with_context(user_message, history)
     
     rag_query = f"master_template {active_section_id} {focus_field}: {expanded_query}".strip()
+    rag_query = expand_diadem_retrieval_query(rag_query, mode="master")
 
     # 1) Prefer Master Negotiator Slides (primary source for this mode)
     raw = get_matches(rag_query, TOP_K, request_id=request_id)
@@ -4591,6 +4615,7 @@ def master_template_sse(payload: Dict = Body(...)):
             expanded_query = _expand_query_with_context(user_message, history)
             
             rag_query = f"master_template {st.get('active_section_id','')} {st.get('focus_field','')}: {expanded_query}".strip()
+            rag_query = expand_diadem_retrieval_query(rag_query, mode="master")
             raw = get_matches(rag_query, TOP_K, request_id=request_id)
             matches = [m for m in (raw or []) if "master negotiator slides" in str((m.get("metadata") or {}).get("file") or "").lower()
                        or "master negotiator slides" in str((m.get("metadata") or {}).get("source") or "").lower()]
