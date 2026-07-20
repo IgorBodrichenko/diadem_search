@@ -22,6 +22,11 @@ def expand_diadem_retrieval_query(user_message: str, mode: str = "chat") -> str:
     q = message.lower()
     additions: List[str] = []
 
+    if mode.lower().startswith("document"):
+        additions.append(
+            "document review classify qualify review deliver strengths top three priorities takeaway suggested resources delegate upload"
+        )
+
     if mode.lower().startswith("master"):
         additions.append(
             "MASTER negotiation template variables Low High Highest ambition walk-away trade concessions preparation"
@@ -65,6 +70,16 @@ def expand_diadem_retrieval_query(user_message: str, mode: str = "chat") -> str:
     if _has_any(q, ["sell", "selling", "pitch", "recommendation", "proposal", "influence", "persuade"]):
         additions.append(
             "STRONG selling storyboard Set the Scene Tailor the Story Recommend Opportunity Negotiate Get Next Steps commercial benefit make it easy to say yes"
+        )
+
+    if _has_any(q, ["present", "presentation", "presenting", "audience", "slides", "deck", "delivery", "inspire"]):
+        additions.append(
+            "Inspired Presenting inner confidence audience needs strong introduction attention points data story inspired delivery rehearse end with conviction"
+        )
+
+    if _has_any(q, ["review", "upload", "document", "transcript", "proposal", "deck", "feedback"]):
+        additions.append(
+            "document review strengths first top three priorities before after rewrite Takeaway Suggested resources classify qualify review deliver"
         )
 
     if _has_any(q, ["need", "needs", "discovery", "question", "questions", "customer wants"]):

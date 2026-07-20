@@ -19,6 +19,14 @@ from anthropic import Anthropic
 from openai import OpenAI
 from pinecone import Pinecone
 from dotenv import load_dotenv
+from diadem_document_review import (
+    DIADEM_CALIBRATION_ADDENDUM,
+    DOCUMENT_REVIEW_SYSTEM_PROMPT,
+    build_document_review_user_prompt,
+    classify_document_review,
+    extract_document_text,
+    first_present,
+)
 from retrieval_expansion import expand_diadem_retrieval_query
 load_dotenv()
 # =========================
@@ -2213,7 +2221,7 @@ def chat(payload: Dict = Body(...)):
             {"role": "user", "content": user},
         ],
         max_tokens=4096,
-        system=SYSTEM_PROMPT_CHAT + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="chat"),
+        system=SYSTEM_PROMPT_CHAT + DIADEM_CALIBRATION_ADDENDUM + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="chat"),
         temperature=0.2,
     )
 
@@ -2268,7 +2276,7 @@ def chat_sse(payload: Dict = Body(...)):
                 f"INFORMATION:\n{context}"
             )
             messages = [
-            {"role": "system", "content": SYSTEM_PROMPT_CHAT + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="chat")},
+            {"role": "system", "content": SYSTEM_PROMPT_CHAT + DIADEM_CALIBRATION_ADDENDUM + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="chat")},
                 {"role": "user", "content": user},
             ]
 
@@ -4219,7 +4227,7 @@ def _master_llm_text(
         model=CHAT_MODEL,
         messages=messages,
         max_tokens=4096,
-        system=system_prompt + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="master"),
+        system=system_prompt + DIADEM_CALIBRATION_ADDENDUM + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="master"),
         temperature=0.2,
     )
     text = _finalize_master_text((resp.content[0].text or ""), max_words=320)
@@ -4911,7 +4919,7 @@ def master_template_sse(payload: Dict = Body(...)):
             )
             runtime_system_prompt = _master_system_prompt_runtime(payload, st, user_message)
             messages = [
-                {"role": "system", "content": runtime_system_prompt + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="master")},
+                {"role": "system", "content": runtime_system_prompt + DIADEM_CALIBRATION_ADDENDUM + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="master")},
                 {"role": "user", "content": prompt_user},
             ]
 
@@ -4979,6 +4987,64 @@ def master_template_sse(payload: Dict = Body(...)):
             yield f"event: done\ndata: {err_done}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=_sse_headers())
+
+
+@app.post("/document/review")
+def document_review(payload: Dict = Body(...)):
+    """Review pasted/extracted delegate material using Diadem document-review rules."""
+    session_id = _get_or_create_session_id(payload)
+    request_id = str(uuid.uuid4())[:8]
+    _cleanup_sessions()
+
+    document_text = extract_document_text(payload)
+    if not document_text:
+        return JSONResponse(
+            {
+                "text": "Please upload or paste the document text you would like me to review.",
+                "session_id": session_id,
+                "classification": {},
+                "assets": [],
+            },
+            status_code=400,
+        )
+
+    admin_prompt, summary_guidance_all = _extract_admin_settings(payload)
+    classification = classify_document_review(payload, document_text)
+    review_focus = first_present(payload, "review_focus", "reviewFocus", "focus", "question", "query")
+    retrieval_seed = " ".join(
+        [
+            "document review",
+            classification.get("document_type", ""),
+            classification.get("likely_module", ""),
+            review_focus,
+            document_text[:1600],
+        ]
+    )
+    retrieval_query = expand_diadem_retrieval_query(retrieval_seed, mode="document_review")
+
+    matches = get_matches(retrieval_query, int(payload.get("top_k") or TOP_K), request_id=request_id)
+    info = build_context(matches, request_id=request_id) if matches else ""
+    assets = _extract_chat_assets(matches, max_items=3, query=retrieval_seed)
+
+    user_prompt = build_document_review_user_prompt(payload, classification, document_text, info)
+
+    resp = anthropod.messages.create(
+        model=CHAT_MODEL,
+        messages=[{"role": "user", "content": user_prompt}],
+        max_tokens=4096,
+        system=DOCUMENT_REVIEW_SYSTEM_PROMPT
+        + DIADEM_CALIBRATION_ADDENDUM
+        + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="document_review"),
+        temperature=0.2,
+    )
+
+    text = _finalize_chat_text((resp.content[0].text or ""), max_questions=3)
+    return {
+        "text": text,
+        "session_id": session_id,
+        "classification": classification,
+        "assets": assets,
+    }
 
 
 
