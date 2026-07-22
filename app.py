@@ -1490,6 +1490,7 @@ def _extract_chat_assets(matches: List[Dict], max_items: int = 3, query: str = "
     assets: List[Dict[str, Any]] = []
     seen: set = set()
     keyword_scores = _slide_keyword_scores(query)
+    profile = _diadem_retrieval_profile(query)
     candidates: List[Tuple[float, int, Dict[str, Any]]] = []
 
     for idx, m in enumerate(matches or []):
@@ -1540,11 +1541,14 @@ def _extract_chat_assets(matches: List[Dict], max_items: int = 3, query: str = "
 
         sid = _asset_slide_id(md, source=source, page=page)
         kw = float(keyword_scores.get(sid, 0.0))
-        # Keep semantic ordering as base, apply keyword boost as tie-break/priority.
-        rank_score = kw + (0.25 if bool(image_url) else 0.0)
+        module_bonus = _diadem_match_bonus(profile, md, txt)
+
+        # Assets are what users visibly see, so module/source relevance matters
+        # more here than raw semantic order. Keep retrieval order as the tie-break.
+        rank_score = module_bonus + kw + (0.5 if bool(image_url) else 0.0)
         candidates.append((rank_score, idx, asset))
 
-    # Higher keyword score first, then preserve original retrieval order.
+    # Higher module/keyword score first, then preserve original retrieval order.
     candidates.sort(key=lambda x: (-x[0], x[1]))
     for _, _, asset in candidates[:max_items]:
         assets.append(asset)

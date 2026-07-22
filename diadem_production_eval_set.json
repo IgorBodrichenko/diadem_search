@@ -1,0 +1,164 @@
+{
+  "version": "2026-07-22",
+  "purpose": "Production evaluation set for Diadem AI answer quality and retrieval grounding.",
+  "scoring_scale": {
+    "0": "missing or actively wrong",
+    "1": "weak or generic",
+    "2": "acceptable",
+    "3": "strong",
+    "4": "excellent"
+  },
+  "cases": [
+    {
+      "id": "master_supplier_renewal_price_increase",
+      "module": "MASTER Negotiator",
+      "endpoint": "/chat",
+      "payload": {
+        "query": "A supplier renewal is coming up. They are asking for a 15% price increase and saying their costs have gone up. We have worked with them for years, so I do not want to damage the relationship, but I also do not want this to become a price-only conversation. How should I handle it?",
+        "top_k": 5
+      },
+      "must_include": ["anchor", "variables", "contract length", "payment terms", "trade"],
+      "should_include": ["Graphite", "relationship", "ambition", "MASTER", "service levels", "volume"],
+      "avoid": ["just push back", "accept the increase", "discount immediately"],
+      "asset_should_prefer": ["Master Negotiator", "Negotiation"]
+    },
+    {
+      "id": "master_payment_terms_pressure",
+      "module": "MASTER Negotiator",
+      "endpoint": "/chat",
+      "payload": {
+        "query": "The other side wants to move us from 60 day payment terms to 30 days. I know this affects cash flow but I am not sure how to treat it in the negotiation.",
+        "top_k": 5
+      },
+      "must_include": ["payment terms", "variable", "trade"],
+      "should_include": ["value", "cash flow", "Low", "High", "Highest", "concession"],
+      "avoid": ["say yes", "purely legal"]
+    },
+    {
+      "id": "master_deadline_tactic",
+      "module": "MASTER Negotiator",
+      "endpoint": "/chat",
+      "payload": {
+        "query": "Procurement have told me this is their final offer and I need to agree today or the deal is off. What should I do?",
+        "top_k": 5
+      },
+      "must_include": ["pressure", "walk", "deadline"],
+      "should_include": ["confidence", "balanced playing field", "tactic", "pause", "commercial control"],
+      "avoid": ["panic", "accept today"]
+    },
+    {
+      "id": "master_prepare_first_meeting",
+      "module": "MASTER Negotiator",
+      "endpoint": "/chat",
+      "payload": {
+        "query": "I have my first negotiation meeting tomorrow and I have not prepared properly. What are the most important things to get clear before I go in?",
+        "top_k": 5
+      },
+      "must_include": ["variables", "ambition", "walk-away"],
+      "should_include": ["MASTER", "mindset", "support", "shopping list", "objective"],
+      "avoid": ["wing it"]
+    },
+    {
+      "id": "master_scope_creep",
+      "module": "MASTER Negotiator",
+      "endpoint": "/chat",
+      "payload": {
+        "query": "The client keeps asking for small extra things for free. I want to protect the relationship but stop the scope creep. How should I respond?",
+        "top_k": 5
+      },
+      "must_include": ["scope", "trade", "value"],
+      "should_include": ["variables", "if", "then", "commercial", "relationship"],
+      "avoid": ["do it for free"]
+    },
+    {
+      "id": "strong_customer_says_too_expensive",
+      "module": "STRONG Selling",
+      "endpoint": "/chat",
+      "payload": {
+        "query": "A customer says our proposal is too expensive. How do I respond without just discounting?",
+        "top_k": 5
+      },
+      "must_include": ["value", "need", "question"],
+      "should_include": ["STRONG", "Opportunity", "benefit", "objection", "next step"],
+      "avoid": ["discount immediately", "argue"]
+    },
+    {
+      "id": "strong_proposal_is_too_generic",
+      "module": "STRONG Selling",
+      "endpoint": "/chat",
+      "payload": {
+        "query": "My proposal feels generic and I do not think it makes the customer need strong enough. How should I improve it?",
+        "top_k": 5
+      },
+      "must_include": ["customer", "need", "recommendation"],
+      "should_include": ["Set the Scene", "Tailor the Story", "Opportunity", "benefit", "next steps"],
+      "avoid": ["add more features"]
+    },
+    {
+      "id": "strong_no_clear_next_step",
+      "module": "STRONG Selling",
+      "endpoint": "/chat",
+      "payload": {
+        "query": "I had a good sales meeting but left without a clear next step. How do I recover it?",
+        "top_k": 5
+      },
+      "must_include": ["next step", "customer", "specific"],
+      "should_include": ["Get Next Steps", "commitment", "follow up", "value"],
+      "avoid": ["just check in"]
+    },
+    {
+      "id": "presenting_executive_audience",
+      "module": "Inspired Presenting",
+      "endpoint": "/chat",
+      "payload": {
+        "query": "I need to present to a senior audience and I am worried my slides are too detailed. How should I structure the presentation?",
+        "top_k": 5
+      },
+      "must_include": ["audience", "message", "slides"],
+      "should_include": ["Inspired Presenting", "opening", "story", "confidence", "takeaway"],
+      "avoid": ["read every slide"]
+    },
+    {
+      "id": "presenting_confidence",
+      "module": "Inspired Presenting",
+      "endpoint": "/chat",
+      "payload": {
+        "query": "I know my material but I lose confidence when presenting. What should I do before the session?",
+        "top_k": 5
+      },
+      "must_include": ["confidence", "rehearse", "audience"],
+      "should_include": ["opening", "delivery", "message", "conviction"],
+      "avoid": ["just relax"]
+    },
+    {
+      "id": "document_review_negotiation_plan",
+      "module": "Document Review",
+      "endpoint": "/document/review",
+      "payload": {
+        "document_text": "Draft plan: Supplier wants a 15 percent price increase. We want to keep the relationship and avoid a price-only conversation. Possible variables are contract length, payment terms, service levels and volume commitments. We need to decide how to open the conversation.",
+        "situation": "Supplier renewal negotiation",
+        "audience": "Internal procurement lead",
+        "desired_outcome": "Prepare a stronger negotiation plan",
+        "top_k": 5
+      },
+      "must_include": ["strengths", "priorities", "takeaway"],
+      "should_include": ["variables", "ambition", "trade", "MASTER", "review"],
+      "avoid": ["slide", "page"]
+    },
+    {
+      "id": "document_review_sales_proposal",
+      "module": "Document Review",
+      "endpoint": "/document/review",
+      "payload": {
+        "document_text": "Proposal draft: We are the market leader and have a wide range of services. Our solution is reliable, flexible and cost effective. We would like to work with you next year and can provide account management and reporting.",
+        "situation": "Sales proposal after a discovery call",
+        "audience": "Prospective customer",
+        "desired_outcome": "Get agreement to a second meeting and proposal review",
+        "top_k": 5
+      },
+      "must_include": ["strengths", "priorities", "rewrite"],
+      "should_include": ["customer need", "value", "Opportunity", "next step", "commercial"],
+      "avoid": ["copy exactly", "developer"]
+    }
+  ]
+}
