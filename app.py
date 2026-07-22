@@ -1897,6 +1897,48 @@ SYSTEM_PROMPT_CHAT = (
 )
 
 
+def _chat_response_contract(query: str) -> str:
+    """Build a per-question contract from the Diadem calibration documents."""
+    profile = _diadem_retrieval_profile(query)
+    primary = str(profile.get("primary") or "general")
+
+    common = (
+        "Required Q&A shape:\n"
+        "- Open with a warm, commercially sharp acknowledgement or reframe.\n"
+        "- Give practical guidance in short paragraphs or bullets.\n"
+        "- Include a 'Takeaway:' line.\n"
+        "- Include 'Suggested resources:' with one or two relevant Diadem tools/models and a one-line reason. Do not include slide numbers.\n"
+        "- Do not expose documents, sources, retrieval, pages, or developer notes."
+    )
+
+    if primary == "master":
+        module = (
+            "Lead module: MASTER Negotiator.\n"
+            "Must use relevant MASTER language from the calibration examples: mindset, ambition, Balanced playing field, Confidence, variables, Low/High/Highest, walk-away, Coal/Graphite/Diamond, tactics, conditional proposals, and trade rather than concede.\n"
+            "If the question involves relationship, supplier renewal, price pressure, or deadlock, prefer Graphite and variables unless the situation is clearly Coal or Diamond."
+        )
+    elif primary == "strong":
+        module = (
+            "Lead module: STRONG Selling.\n"
+            "Must use the relevant STRONG step explicitly: Set the Scene, Tailor the Story, Recommend, Opportunity, Negotiate, or Get Next Steps.\n"
+            "For price objections, include a clever question, reconnect to customer needs, name the benefit or Opportunity, protect the ask, and end with a specific next step.\n"
+            "For vague closes or missed follow-up, use Get Next Steps and specify what, who, and when."
+        )
+    elif primary == "presenting":
+        module = (
+            "Lead module: Inspired Presenting.\n"
+            "Must use relevant Inspired Presenting language: purpose, outcome, audience, clear message, strong introduction, attention change, story, delivery, rehearsal, confidence, and conviction.\n"
+            "For senior audiences, lead with the message and outcome before slide detail."
+        )
+    else:
+        module = (
+            "Lead module: choose the most relevant Diadem commercial-skills module from the user's question and retrieved INFORMATION.\n"
+            "Use the module language explicitly enough that the answer feels like Diadem, not generic coaching."
+        )
+
+    return f"{module}\n\n{common}"
+
+
 SYSTEM_PROMPT_COACH_FINAL = (
     "You are a professional negotiation coach trained exclusively in the MASTER methodology.\n"
     "You must apply the methodology exactly as defined, without adding external ideas.\n\n"
@@ -2368,12 +2410,14 @@ def chat(payload: Dict = Body(...)):
     matches = get_matches(retrieval_query, top_k, request_id=request_id)
     context = build_context(matches, request_id=request_id) if matches else ""
     assets = _extract_chat_assets(matches, max_items=3, query=query)
+    response_contract = _chat_response_contract(query)
 
     user = (
         f"USER_NAME:\n{user_name}\n\n"
         f"QUESTION:\n{query}\n\n"
         f"CONVERSATION_CONTEXT:\n{conversation_context}\n\n"
-        f"INFORMATION:\n{context}"
+        f"INFORMATION:\n{context}\n\n"
+        f"RESPONSE_CONTRACT:\n{response_contract}"
     )
 
     resp = anthropod.messages.create(
@@ -2429,12 +2473,14 @@ def chat_sse(payload: Dict = Body(...)):
             matches = get_matches(retrieval_query, top_k, request_id=request_id)
             context = build_context(matches, request_id=request_id) if matches else ""
             assets = _extract_chat_assets(matches, max_items=3, query=query)
+            response_contract = _chat_response_contract(query)
 
             user = (
                 f"USER_NAME:\n{user_name}\n\n"
                 f"QUESTION:\n{query}\n\n"
                 f"CONVERSATION_CONTEXT:\n{conversation_context}\n\n"
-                f"INFORMATION:\n{context}"
+                f"INFORMATION:\n{context}\n\n"
+                f"RESPONSE_CONTRACT:\n{response_contract}"
             )
             messages = [
             {"role": "system", "content": SYSTEM_PROMPT_CHAT + DIADEM_CALIBRATION_ADDENDUM + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="chat")},
