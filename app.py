@@ -1089,7 +1089,7 @@ def _keyword_query(query: str) -> str:
 
 
 def _source_id(md: Dict[str, Any]) -> str:
-    for k in ["source", "doc_id", "document_id", "file", "filename", "title"]:
+    for k in ["source", "doc_id", "document_id", "file", "file_name", "filename", "title"]:
         v = md.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
@@ -1125,10 +1125,140 @@ def _merge_dedup_matches(list_of_lists: List[List[Dict]]) -> List[Dict]:
     return list(best.values())
 
 
+def _match_source_text(md: Dict[str, Any]) -> str:
+    parts = []
+    for k in ("file_name", "source", "doc_id", "document_id", "file", "filename", "title"):
+        v = md.get(k)
+        if v:
+            parts.append(str(v))
+    return " ".join(parts).lower()
+
+
+def _diadem_retrieval_profile(query: str) -> Dict[str, Any]:
+    q = (query or "").lower()
+
+    negotiation_terms = [
+        "negotiat", "supplier", "renewal", "price", "increase", "discount", "concession",
+        "variable", "variables", "payment terms", "contract length", "service levels",
+        "volume", "walk-away", "walk away", "anchor", "anchoring", "procurement",
+        "deadline", "final offer", "take it or leave it", "master", "graphite",
+    ]
+    selling_terms = [
+        "sell", "selling", "sales", "customer", "proposal", "recommendation", "pitch",
+        "objection", "needs", "discovery", "opportunity", "business case", "value",
+        "strong", "next steps",
+    ]
+    presenting_terms = [
+        "present", "presentation", "presenting", "slides", "deck", "audience",
+        "delivery", "speech", "inspired", "story", "rehearse",
+    ]
+    document_terms = [
+        "document review", "uploaded", "upload", "draft", "review", "feedback",
+        "rewrite", "strengths", "top three priorities",
+    ]
+
+    scores = {
+        "master": sum(1 for t in negotiation_terms if t in q),
+        "strong": sum(1 for t in selling_terms if t in q),
+        "presenting": sum(1 for t in presenting_terms if t in q),
+        "document": sum(1 for t in document_terms if t in q),
+    }
+    primary = max(scores, key=scores.get)
+    if scores[primary] == 0:
+        primary = "general"
+
+    source_boosts = {
+        "master": [
+            ("master negotiator", 5.0),
+            ("negotiation.pdf", 3.0),
+            ("diadem_ai_system_prompt", 1.5),
+        ],
+        "strong": [
+            ("strong selling", 5.0),
+            ("selling.pdf", 3.0),
+            ("strong selling deck", 3.0),
+        ],
+        "presenting": [
+            ("inspired presenting", 5.0),
+            ("presenting", 3.0),
+        ],
+        "document": [
+            ("master negotiator", 2.0),
+            ("strong selling", 2.0),
+            ("inspired presenting", 2.0),
+        ],
+    }
+
+    concept_terms = {
+        "master": [
+            "variables", "graphite", "negotiation zone", "walk-away", "walk away",
+            "low", "high", "highest", "ambition", "shopping list", "balanced playing field",
+            "confidence", "concession", "trade", "payment terms", "contract length",
+            "service levels", "volume commitments", "anchor", "anchoring",
+        ],
+        "strong": [
+            "set the scene", "tailor the story", "recommend", "opportunity",
+            "negotiate", "get next steps", "needs", "benefit", "value", "objection",
+            "card", "clarify", "right order",
+        ],
+        "presenting": [
+            "audience", "opening", "attention", "message", "story", "delivery",
+            "rehearse", "confidence", "conviction", "slides",
+        ],
+        "document": [
+            "strengths", "priorities", "takeaway", "suggested resources", "rewrite",
+            "commercial why", "review",
+        ],
+    }
+
+    return {
+        "primary": primary,
+        "scores": scores,
+        "source_boosts": source_boosts.get(primary, []),
+        "concept_terms": concept_terms.get(primary, []),
+    }
+
+
+def _diadem_match_bonus(profile: Dict[str, Any], md: Dict[str, Any], text: str) -> float:
+    source = _match_source_text(md)
+    tlow = (text or "").lower()
+    bonus = 0.0
+
+    for marker, value in profile.get("source_boosts", []):
+        if marker in source:
+            bonus += value
+
+    for term in profile.get("concept_terms", []):
+        if term in tlow:
+            bonus += 0.8
+
+    if "slide" in source and profile.get("primary") in {"master", "strong", "presenting", "document"}:
+        bonus += 1.2
+
+    if profile.get("primary") == "master":
+        if "selling.pdf" in source and not any(t in tlow for t in ("variable", "trade", "price", "concession", "negotiat")):
+            bonus -= 3.0
+        if "presenting" in source:
+            bonus -= 3.0
+
+    if profile.get("primary") == "strong":
+        if "negotiation.pdf" in source and not any(t in tlow for t in ("objection", "value", "need", "opportunity", "next step")):
+            bonus -= 2.0
+        if "presenting" in source:
+            bonus -= 3.0
+
+    if profile.get("primary") == "presenting":
+        if "negotiation.pdf" in source or "selling.pdf" in source:
+            bonus -= 2.0
+
+    return bonus
+
+
 def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
     qt = set(_tokenize(query))
     hint = _hint_for_question(query)
     hint_toks = set(_tokenize(hint)) if hint else set()
+    profile = _diadem_retrieval_profile(query)
 
     scored: List[Tuple[float, Dict]] = []
 
@@ -1159,6 +1289,8 @@ def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
             if gp in tlow:
                 penalty += 1.1
 
+        diadem_bonus = _diadem_match_bonus(profile, md, text)
+
         # Base semantic similarity
         try:
             pscore = float(m.get("score") or 0.0)
@@ -1171,12 +1303,28 @@ def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
             (overlap_hint * 1.6) +
             (pscore * 0.35) +
             ((pr - 1) * PRIORITY_BOOST) -
-            penalty
+            penalty +
+            diadem_bonus
         )
 
         scored.append((final_score, m))
 
     scored.sort(key=lambda x: x[0], reverse=True)
+
+    _slog(
+        "search_diadem_profile",
+        query=query,
+        profile=profile.get("primary"),
+        scores=profile.get("scores"),
+        top_scored=[
+            {
+                "score": round(score, 3),
+                "file": (m.get("metadata") or {}).get("file_name") or _source_id(m.get("metadata") or {}),
+                "page": (m.get("metadata") or {}).get("page"),
+            }
+            for score, m in scored[:SEARCH_LOG_MAX_MATCHES]
+        ],
+    )
 
     # Diversity cap per source
     out: List[Dict] = []

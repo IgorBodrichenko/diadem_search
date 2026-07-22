@@ -17,29 +17,33 @@ def _has_any(text: str, terms: Iterable[str]) -> bool:
 
 
 def expand_diadem_retrieval_query(user_message: str, mode: str = "chat") -> str:
-    """Expand a user message with negotiation, selling, and influencing hints."""
+    """Expand a user message with Diadem-specific retrieval hints.
+
+    The hints deliberately name the likely programme, framework, and practical
+    concepts that should be retrieved. They are not shown to the user.
+    """
     message = (user_message or "").strip()
     q = message.lower()
     additions: List[str] = []
 
     if mode.lower().startswith("document"):
         additions.append(
-            "document review classify qualify review deliver strengths top three priorities takeaway suggested resources delegate upload"
+            "document review classify qualify review deliver strengths first top three priorities before after rewrite commercial why takeaway suggested resources delegate upload"
         )
 
     if mode.lower().startswith("master"):
         additions.append(
-            "MASTER negotiation template variables Low High Highest ambition walk-away trade concessions preparation"
+            "MASTER Negotiator master methodology negotiation template variables Low High Highest ambition walk-away trade concessions preparation confidence balanced playing field shopping list mindset"
         )
 
     if _has_any(q, ["supplier", "renewal", "incumbent", "long-term", "long term"]):
         additions.append(
-            "supplier renewal relationship leverage negotiation zone Graphite variables contract length payment terms service levels volume commitments implementation support"
+            "MASTER Negotiator supplier renewal incumbent relationship leverage negotiation zone Graphite variables contract length payment terms service levels response times volume commitments implementation support trade variables not price only"
         )
 
     if _has_any(q, ["price", "increase", "discount", "expensive", "too high", "%", "margin"]):
         additions.append(
-            "price pressure anchoring discount concession value variables trade if you then I commercial control ambition"
+            "price pressure anchoring opening position discount concession value variables trade if you then I commercial control ambition price-only conversation challenge the number"
         )
 
     if _has_any(q, ["payment", "terms", "90 days", "60 days", "30 days"]):
@@ -54,7 +58,7 @@ def expand_diadem_retrieval_query(user_message: str, mode: str = "chat") -> str:
 
     if _has_any(q, ["procurement", "final offer", "deadline", "today", "take it or leave it"]):
         additions.append(
-            "procurement pressure tactics deadline walk-away commercial control balanced playing field confidence"
+            "procurement pressure tactics deadline walk-away commercial control balanced playing field confidence difficult behaviour power"
         )
 
     if _has_any(q, ["tactic", "pressure", "power", "no budget", "do better", "tricky", "difficult"]):
@@ -64,17 +68,17 @@ def expand_diadem_retrieval_query(user_message: str, mode: str = "chat") -> str:
 
     if _has_any(q, ["prepare", "planning", "meeting tomorrow", "where to start", "not sure"]):
         additions.append(
-            "preparation mindset ambition MASTER variables walk-away stakeholder support commercial objective"
+            "preparation mindset ambition MASTER plan variables shopping list walk-away stakeholder support commercial objective confidence before every negotiation"
         )
 
     if _has_any(q, ["sell", "selling", "pitch", "recommendation", "proposal", "influence", "persuade"]):
         additions.append(
-            "STRONG selling storyboard Set the Scene Tailor the Story Recommend Opportunity Negotiate Get Next Steps commercial benefit make it easy to say yes"
+            "STRONG Selling storyboard Set the Scene Tailor the Story Recommend Opportunity Negotiate Get Next Steps needs opportunity value commercial benefit make it easy to say yes"
         )
 
     if _has_any(q, ["present", "presentation", "presenting", "audience", "slides", "deck", "delivery", "inspire"]):
         additions.append(
-            "Inspired Presenting inner confidence audience needs strong introduction attention points data story inspired delivery rehearse end with conviction"
+            "Inspired Presenting inner confidence audience needs strong introduction attention points data story clear message inspired delivery rehearse end with conviction"
         )
 
     if _has_any(q, ["review", "upload", "document", "transcript", "proposal", "deck", "feedback"]):
