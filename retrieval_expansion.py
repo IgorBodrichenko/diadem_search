@@ -73,12 +73,12 @@ def expand_diadem_retrieval_query(user_message: str, mode: str = "chat") -> str:
 
     if _has_any(q, ["sell", "selling", "pitch", "recommendation", "proposal", "influence", "persuade"]):
         additions.append(
-            "STRONG Selling storyboard Set the Scene Tailor the Story Recommend Opportunity Negotiate Get Next Steps needs opportunity value commercial benefit make it easy to say yes"
+            "STRONG Selling storyboard Set the Scene Tailor the Story Recommend Opportunity Negotiate Get Next Steps customer needs clever questions benefits not features make it easy to say yes what who when CARD objection value"
         )
 
     if _has_any(q, ["present", "presentation", "presenting", "audience", "slides", "deck", "delivery", "inspire"]):
         additions.append(
-            "Inspired Presenting inner confidence audience needs strong introduction attention points data story clear message inspired delivery rehearse end with conviction"
+            "Inspired Presenting inner confidence purpose outcome audience needs clear message strong introduction light touch contracting attention change points data story delivery rehearse base position end with conviction"
         )
 
     if _has_any(q, ["review", "upload", "document", "transcript", "proposal", "deck", "feedback"]):

@@ -18,7 +18,7 @@
         "top_k": 5
       },
       "must_include": ["anchor", "variables", "contract length", "payment terms", "trade"],
-      "should_include": ["Graphite", "relationship", "ambition", "MASTER", "service levels", "volume"],
+      "should_include": ["Graphite", "relationship", "ambition", "service levels", "volume", "Takeaway", "Suggested resources"],
       "avoid": ["just push back", "accept the increase", "discount immediately"],
       "asset_should_prefer": ["Master Negotiator", "Negotiation"]
     },
@@ -31,7 +31,7 @@
         "top_k": 5
       },
       "must_include": ["payment terms", "variable", "trade"],
-      "should_include": ["value", "cash flow", "Low", "High", "Highest", "concession"],
+      "should_include": ["value", "cash flow", "Low", "High", "Highest", "concession", "Takeaway"],
       "avoid": ["say yes", "purely legal"]
     },
     {
@@ -43,7 +43,7 @@
         "top_k": 5
       },
       "must_include": ["pressure", "walk", "deadline"],
-      "should_include": ["confidence", "balanced playing field", "tactic", "pause", "commercial control"],
+      "should_include": ["confidence", "balanced playing field", "tactic", "pause", "commercial control", "Takeaway"],
       "avoid": ["panic", "accept today"]
     },
     {
@@ -55,7 +55,7 @@
         "top_k": 5
       },
       "must_include": ["variables", "ambition", "walk-away"],
-      "should_include": ["MASTER", "mindset", "support", "shopping list", "objective"],
+      "should_include": ["mindset", "support", "shopping list", "objective", "Takeaway", "Suggested resources"],
       "avoid": ["wing it"]
     },
     {
@@ -67,7 +67,7 @@
         "top_k": 5
       },
       "must_include": ["scope", "trade", "value"],
-      "should_include": ["variables", "if", "then", "commercial", "relationship"],
+      "should_include": ["variables", "if", "then", "commercial", "relationship", "Takeaway"],
       "avoid": ["do it for free"]
     },
     {
@@ -78,8 +78,8 @@
         "query": "A customer says our proposal is too expensive. How do I respond without just discounting?",
         "top_k": 5
       },
-      "must_include": ["value", "need", "question"],
-      "should_include": ["STRONG", "Opportunity", "benefit", "objection", "next step"],
+      "must_include": ["value", "need", "ask"],
+      "should_include": ["STRONG", "Opportunity", "benefit", "objection", "next step", "CARD", "Takeaway"],
       "avoid": ["discount immediately", "argue"]
     },
     {
@@ -91,7 +91,7 @@
         "top_k": 5
       },
       "must_include": ["customer", "need", "recommendation"],
-      "should_include": ["Set the Scene", "Tailor the Story", "Opportunity", "benefit", "next steps"],
+      "should_include": ["Set the Scene", "Tailor the Story", "Opportunity", "benefit", "next steps", "Takeaway", "Suggested resources"],
       "avoid": ["add more features"]
     },
     {
@@ -102,8 +102,8 @@
         "query": "I had a good sales meeting but left without a clear next step. How do I recover it?",
         "top_k": 5
       },
-      "must_include": ["next step", "customer", "specific"],
-      "should_include": ["Get Next Steps", "commitment", "follow up", "value"],
+      "must_include": ["next step", "specific", "what"],
+      "should_include": ["Get Next Steps", "commitment", "follow up", "who", "when", "Takeaway"],
       "avoid": ["just check in"]
     },
     {
@@ -115,7 +115,7 @@
         "top_k": 5
       },
       "must_include": ["audience", "message", "slides"],
-      "should_include": ["Inspired Presenting", "opening", "story", "confidence", "takeaway"],
+      "should_include": ["Inspired Presenting", "purpose", "outcome", "opening", "story", "confidence", "Takeaway"],
       "avoid": ["read every slide"]
     },
     {
@@ -127,7 +127,7 @@
         "top_k": 5
       },
       "must_include": ["confidence", "rehearse", "audience"],
-      "should_include": ["opening", "delivery", "message", "conviction"],
+      "should_include": ["inner voice", "delivery", "message", "conviction", "Takeaway", "Suggested resources"],
       "avoid": ["just relax"]
     },
     {
@@ -142,7 +142,7 @@
         "top_k": 5
       },
       "must_include": ["strengths", "priorities", "takeaway"],
-      "should_include": ["variables", "ambition", "trade", "MASTER", "review"],
+      "should_include": ["variables", "ambition", "trade", "MASTER", "review", "Suggested resources"],
       "avoid": ["slide", "page"]
     },
     {
@@ -157,7 +157,7 @@
         "top_k": 5
       },
       "must_include": ["strengths", "priorities", "rewrite"],
-      "should_include": ["customer need", "value", "Opportunity", "next step", "commercial"],
+      "should_include": ["customer need", "value", "Opportunity", "next step", "commercial", "Suggested resources"],
       "avoid": ["copy exactly", "developer"]
     }
   ]
