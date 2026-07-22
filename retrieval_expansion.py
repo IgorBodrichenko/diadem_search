@@ -66,6 +66,11 @@ def expand_diadem_retrieval_query(user_message: str, mode: str = "chat") -> str:
             "tactics difficult behaviour confidence balanced playing field self-control emotional intelligence get back to business"
         )
 
+    if _has_any(q, ["nervous", "nerve", "confidence", "confident", "mindset", "headspace", "anxious", "anxiety"]):
+        additions.append(
+            "MASTER Negotiator Mindset and Self-Knowing Preparing A Confident Mindset slide_014 Confident Mindset Tool inner thoughts flip negative thoughts personal strengths Optimal Performance Correlates To Stretch Zone slide_002 comfort zone stretch zone panic zone ABC Awareness Balanced Playing Field Confidence"
+        )
+
     if _has_any(q, ["prepare", "planning", "meeting tomorrow", "where to start", "not sure"]):
         additions.append(
             "preparation mindset ambition MASTER plan variables shopping list walk-away stakeholder support commercial objective confidence before every negotiation"

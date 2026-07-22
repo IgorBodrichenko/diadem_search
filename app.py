@@ -664,6 +664,17 @@ SEARCH_HINTS = [
         "hint": "balanced playing field confident mindset ABC model pages 6 14",
     },
     {
+        "match_any": [
+            "nervous before a big negotiation",
+            "knocks my confidence",
+            "right mindset",
+            "get myself into the right mindset",
+            "pre negotiation nerves",
+            "pre-negotiation nerves",
+        ],
+        "hint": "Preparing A Confident Mindset slide_014 Confident Mindset Tool Optimal Performance Correlates To Stretch Zone slide_002 stretch zone comfort zone panic zone MASTER mindset",
+    },
+    {
         "match_any": ["push back without upsetting the relationship", "push back without upsetting", "push back"],
         "hint": "five elements tool tactics prepared to respond pages 28 33 34",
     },
@@ -1195,6 +1206,7 @@ def _diadem_retrieval_profile(query: str) -> Dict[str, Any]:
             "low", "high", "highest", "ambition", "shopping list", "balanced playing field",
             "confidence", "concession", "trade", "payment terms", "contract length",
             "service levels", "volume commitments", "anchor", "anchoring",
+            "mindset", "confident", "confident mindset", "inner thoughts", "stretch zone", "comfort zone",
         ],
         "strong": [
             "set the scene", "tailor the story", "recommend", "opportunity",
@@ -1252,6 +1264,32 @@ def _diadem_match_bonus(profile: Dict[str, Any], md: Dict[str, Any], text: str) 
             bonus -= 2.0
 
     return bonus
+
+
+def _curated_asset_bonus(query: str, page: Any, text: str) -> float:
+    """Small resource-serving boosts based on the Q&A calibration documents."""
+    q = (query or "").lower()
+    tlow = (text or "").lower()
+    try:
+        p = int(float(page))
+    except Exception:
+        p = 0
+
+    confidence_query = any(
+        term in q
+        for term in ("nervous", "nerve", "confidence", "confident", "mindset", "headspace", "anxious", "anxiety")
+    )
+    if confidence_query:
+        if p == 14 or "preparing a confident mindset" in tlow:
+            return 12.0
+        if p == 2 or "optimal performance correlates to stretch zone" in tlow:
+            return 10.0
+        if p == 6 or "abc" in tlow or "balanced playing field" in tlow:
+            return 2.0
+        if p in {51, 73} or "preparing for graphite" in tlow or "preparing for diamond" in tlow:
+            return -4.0
+
+    return 0.0
 
 
 def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
@@ -1542,18 +1580,71 @@ def _extract_chat_assets(matches: List[Dict], max_items: int = 3, query: str = "
         sid = _asset_slide_id(md, source=source, page=page)
         kw = float(keyword_scores.get(sid, 0.0))
         module_bonus = _diadem_match_bonus(profile, md, txt)
+        curated_bonus = _curated_asset_bonus(query, page, txt)
 
         # Assets are what users visibly see, so module/source relevance matters
         # more here than raw semantic order. Keep retrieval order as the tie-break.
-        rank_score = module_bonus + kw + (0.5 if bool(image_url) else 0.0)
+        rank_score = module_bonus + curated_bonus + kw + (0.5 if bool(image_url) else 0.0)
         candidates.append((rank_score, idx, asset))
 
     # Higher module/keyword score first, then preserve original retrieval order.
     candidates.sort(key=lambda x: (-x[0], x[1]))
-    for _, _, asset in candidates[:max_items]:
+    selected_resource_keys: set = set()
+    for _, _, asset in candidates:
+        try:
+            page_key = int(float(asset.get("page")))
+        except Exception:
+            page_key = str(asset.get("page") or "")
+        source_key = str(asset.get("source") or "")
+        resource_key = (source_key, page_key)
+        if resource_key in selected_resource_keys:
+            continue
+        selected_resource_keys.add(resource_key)
         assets.append(asset)
+        if len(assets) >= max_items:
+            break
 
     return assets
+
+
+def _augment_matches_for_assets(query: str, matches: List[Dict], request_id: str = "") -> List[Dict]:
+    """Add tightly scoped resource matches for known Q&A resource-serving cases."""
+    q = (query or "").lower()
+    augmented = list(matches or [])
+
+    confidence_query = any(
+        term in q
+        for term in ("nervous", "nerve", "confidence", "confident", "mindset", "headspace", "anxious", "anxiety")
+    )
+    if not confidence_query:
+        return augmented
+
+    extra_queries = [
+        "Preparing A Confident Mindset slide_014 Confident Mindset Tool",
+        "Optimal Performance Correlates To Stretch Zone slide_002 comfort zone stretch zone panic zone",
+    ]
+
+    seen = set()
+    for m in augmented:
+        md = m.get("metadata") or {}
+        seen.add((str(m.get("id") or ""), str(md.get("page") or ""), str(md.get("image_url") or "")))
+
+    for idx, extra_query in enumerate(extra_queries, 1):
+        try:
+            extra = get_matches(extra_query, 6, request_id=f"{request_id}-asset{idx}" if request_id else None)
+        except Exception as e:
+            _slog("asset_augment_error", request_id=request_id, query=extra_query, err=str(e)[:300])
+            continue
+
+        for m in extra:
+            md = m.get("metadata") or {}
+            key = (str(m.get("id") or ""), str(md.get("page") or ""), str(md.get("image_url") or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            augmented.append(m)
+
+    return augmented
 
 def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) -> List[Dict]:
     q_clean = (query or "").strip()
@@ -2409,7 +2500,8 @@ def chat(payload: Dict = Body(...)):
 
     matches = get_matches(retrieval_query, top_k, request_id=request_id)
     context = build_context(matches, request_id=request_id) if matches else ""
-    assets = _extract_chat_assets(matches, max_items=3, query=query)
+    asset_matches = _augment_matches_for_assets(query, matches, request_id=request_id)
+    assets = _extract_chat_assets(asset_matches, max_items=3, query=query)
     response_contract = _chat_response_contract(query)
 
     user = (
@@ -2472,7 +2564,8 @@ def chat_sse(payload: Dict = Body(...)):
 
             matches = get_matches(retrieval_query, top_k, request_id=request_id)
             context = build_context(matches, request_id=request_id) if matches else ""
-            assets = _extract_chat_assets(matches, max_items=3, query=query)
+            asset_matches = _augment_matches_for_assets(query, matches, request_id=request_id)
+            assets = _extract_chat_assets(asset_matches, max_items=3, query=query)
             response_contract = _chat_response_contract(query)
 
             user = (
