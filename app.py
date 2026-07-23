@@ -1943,7 +1943,7 @@ SYSTEM_PROMPT_CHAT = (
     "- Base your answer on INFORMATION when relevant. If INFORMATION is empty or unrelated, use general knowledge only.\n"
     "- Never mention documents, pages, sources, citations, or reference materials.\n"
     "- Do NOT repeat or paraphrase the user's question - answer directly.\n"
-    "- Avoid unnecessary verbosity. Keep answers under 300 words unless user asks for more.\n"
+    "- Avoid unnecessary verbosity. Keep answers around 250-400 words unless user asks for more.\n"
     "- Use natural business language. Use named Diadem ideas, but do not dump a full framework unless the user asks for one.\n"
     "- Challenge weak thinking where appropriate, especially price-only responses, vague asks, weak ambition, or giving without getting.\n"
     "\n"
@@ -1952,9 +1952,10 @@ SYSTEM_PROMPT_CHAT = (
     "- Name the pressure, leverage, need, tactic, or issue in plain English.\n"
     "- Apply the most relevant Diadem framework in practical terms.\n"
     "- Give concrete moves: variables, trade language, clever questions, example wording, before/after rewrites, or what/who/when next steps.\n"
-    "- Include one 'Takeaway:' sentence for substantive coaching answers.\n"
-    "- Include 'Suggested resources' with one or two named Diadem tools/models when useful. Never include slide numbers.\n"
+    "- Include one exact 'Takeaway:' sentence for every substantive coaching answer.\n"
+    "- Include exact heading 'Suggested resources:' with one or two named Diadem tools/models for every substantive coaching answer. Never include slide numbers.\n"
     "- End with at most one useful question only if it moves the user forward.\n"
+    "- Do not use horizontal separator lines like '---'.\n"
     "\n"
     "Negotiation rules:\n"
     "- When the user faces price pressure, discounts, supplier increases, procurement pressure, or scope creep, do not let price become the only lever.\n"
@@ -1966,6 +1967,7 @@ SYSTEM_PROMPT_CHAT = (
     "- If the user is selling, pitching, influencing, or making a recommendation, explicitly use the relevant STRONG step: Set the Scene, Tailor the Story, Recommend, Opportunity, Negotiate, or Get Next Steps.\n"
     "- Help the user make it easy for the customer to say yes by clarifying the ask, linking to customer needs, selling benefits not just features, showing the Opportunity at the right time, and closing with specific what/who/when next steps.\n"
     "- For price objections or concerns, do not jump to discounting. Clarify whether it is a real issue or pressure, use CARD for real issues, return to customer value, and ask a clever question before responding.\n"
+    "- CARD must always mean: Clarify, All Out, Right Order, Deal. Never redefine the letters.\n"
     "- For missed follow-up or vague close, use Get Next Steps language: name the commitment, make the next action specific, and recover momentum quickly.\n"
     "\n"
     "Inspired Presenting rules:\n"
@@ -1997,8 +1999,10 @@ def _chat_response_contract(query: str) -> str:
         "Required Q&A shape:\n"
         "- Open with a warm, commercially sharp acknowledgement or reframe.\n"
         "- Give practical guidance in short paragraphs or bullets.\n"
-        "- Include a 'Takeaway:' line.\n"
-        "- Include 'Suggested resources:' with one or two relevant Diadem tools/models and a one-line reason. Do not include slide numbers.\n"
+        "- Include an exact 'Takeaway:' line. This is mandatory.\n"
+        "- Include exact heading 'Suggested resources:' with one or two relevant Diadem tools/models and a one-line reason. This is mandatory.\n"
+        "- Resource names should be real Diadem-style tools/models, not vague labels.\n"
+        "- Never use horizontal rules or separator lines.\n"
         "- Do not expose documents, sources, retrieval, pages, or developer notes."
     )
 
@@ -2013,6 +2017,7 @@ def _chat_response_contract(query: str) -> str:
             "Lead module: STRONG Selling.\n"
             "Must use the relevant STRONG step explicitly: Set the Scene, Tailor the Story, Recommend, Opportunity, Negotiate, or Get Next Steps.\n"
             "For price objections, include a clever question, reconnect to customer needs, name the benefit or Opportunity, protect the ask, and end with a specific next step.\n"
+            "If using CARD, define it exactly as Clarify, All Out, Right Order, Deal.\n"
             "For vague closes or missed follow-up, use Get Next Steps and specify what, who, and when."
         )
     elif primary == "presenting":
@@ -2523,6 +2528,7 @@ def chat(payload: Dict = Body(...)):
     )
 
     answer = _finalize_chat_text((resp.content[0].text or ""), max_questions=1)
+    answer = _ensure_diadem_answer_shape(answer, query)
     if assets and _looks_like_low_context_deflection(answer):
         answer = _chat_practical_fallback(assets)
     if answer:
@@ -2582,7 +2588,8 @@ def chat_sse(payload: Dict = Body(...)):
 
             full_text = "".join(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2))
 
-        full_text = _finalize_chat_text(full_text, max_questions=1)
+            full_text = _finalize_chat_text(full_text, max_questions=1)
+            full_text = _ensure_diadem_answer_shape(full_text, query)
         if assets and _looks_like_low_context_deflection(full_text):
             full_text = _chat_practical_fallback(assets)
         chunks = _iter_text_as_sse_chunks([full_text], min_chars=28)
@@ -3417,6 +3424,130 @@ def _finalize_chat_text(text: str, max_questions: int = 1) -> str:
     if not t:
         return ""
     return _limit_question_marks(t, max_questions=max_questions)
+
+
+def _diadem_fallback_takeaway_and_resources(query: str) -> Tuple[str, List[str]]:
+    profile = _diadem_retrieval_profile(query)
+    primary = str(profile.get("primary") or "general")
+    q = (query or "").lower()
+
+    if primary == "strong":
+        if any(term in q for term in ("too expensive", "price", "discount", "cost")):
+            return (
+                "Price pressure is a cue to strengthen the value story before you trade anything.",
+                [
+                    "STRONG - Opportunity step: helps you reconnect the price to the customer's commercial benefit before entering negotiation.",
+                    "CARD: helps you clarify whether a price concern is real, get the issue all out, handle it in the right order, and then deal with it.",
+                ],
+            )
+        if "next step" in q or "follow" in q:
+            return (
+                "Momentum is protected by a clear what, who and when, not a polite hope that they come back.",
+                [
+                    "Get Next Steps: the STRONG close for turning interest into a specific commitment.",
+                    "Be Clear On Your Objective: helps you define the exact ask before the conversation starts.",
+                ],
+            )
+        return (
+            "Strong selling makes it easy for the customer to say yes by linking the ask to needs they recognise.",
+            [
+                "Set the Scene: helps uncover the customer needs your recommendation must answer.",
+                "Tailor the Story: helps turn features into benefits that matter to the customer.",
+            ],
+        )
+
+    if primary == "presenting":
+        if any(term in q for term in ("confidence", "nervous", "rehearse", "delivery")):
+            return (
+                "Confidence comes from preparing your delivery, not just knowing your content.",
+                [
+                    "Emotional Regulation Preparation: helps you quiet the inner voice before you present.",
+                    "Rehearsal Principles: helps you practise the structure, message and delivery out loud.",
+                ],
+            )
+        return (
+            "A strong presentation starts with the audience, the message and the outcome before it starts with slides.",
+            [
+                "Purpose, Outcome, Audience: helps you decide what earns a place in the presentation.",
+                "Strong Introduction Checklist: helps you open with credibility, confidence and a clear hook.",
+            ],
+        )
+
+    if primary == "master":
+        if any(term in q for term in ("nervous", "confidence", "mindset", "headspace", "anxious")):
+            return (
+                "Mindset preparation is commercial preparation; it keeps you ambitious before the negotiation starts.",
+                [
+                    "Preparing A Confident Mindset: helps you capture and flip the thoughts that weaken confidence.",
+                    "Optimal Performance Stretch Zone: helps you reframe nerves as useful stretch rather than panic.",
+                ],
+            )
+        if any(term in q for term in ("price", "increase", "renewal", "supplier", "discount")):
+            return (
+                "Do not let one number become the whole negotiation; use variables to move the conversation to Graphite.",
+                [
+                    "Graphite Variables: helps you create a wider tradeable deal rather than a price-only fight.",
+                    "MASTER Plan: helps you prepare ambition, positions, variables and walk-away before the meeting.",
+                ],
+            )
+        return (
+            "A master negotiator protects ambition by preparing mindset, variables, positions and walk-away before trading.",
+            [
+                "MASTER Plan: helps structure variables, positions and the deal shape before the conversation.",
+                "Balanced Playing Field: helps you stay confident when the other side tries to take power.",
+            ],
+        )
+
+    return (
+        "The strongest Diadem answers turn the framework into one practical move the user can apply immediately.",
+        [
+            "Diadem framework check: helps choose the right module before giving advice.",
+            "Suggested next step: helps turn the answer into an action rather than theory.",
+        ],
+    )
+
+
+def _ensure_diadem_answer_shape(text: str, query: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return ""
+
+    # The Q&A examples do not use markdown separator lines in delegate-facing text.
+    t = re.sub(r"(?m)^\s*-{3,}\s*$", "", t)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+
+    # Guard against the model inventing a non-Diadem CARD expansion.
+    if "card" in t.lower() and re.search(r"(?i)\b(acknowledge|revisit|demonstrate)\b", t):
+        card_block = (
+            "Use CARD for real issues:\n"
+            "- Clarify: check exactly what the concern is.\n"
+            "- All Out: get every issue on the table before responding.\n"
+            "- Right Order: agree which issue to handle first.\n"
+            "- Deal: respond to the real issue and move the conversation forward."
+        )
+        t = re.sub(
+            r"(?ims)^.*real\s+issue.*use\s+card\s*:.*?(?:\n\s*-\s+.*?)+(?=\n\n|^[A-Z][^\n]*$|Takeaway|Suggested resources|$)",
+            card_block,
+            t,
+            count=1,
+        )
+        t = re.sub(
+            r"(?ims)^.*use\s+card\s*:.*?(?:\n\s*-\s+.*?)+(?=\n\n|^[A-Z][^\n]*$|Takeaway|Suggested resources|$)",
+            card_block,
+            t,
+            count=1,
+        )
+
+    takeaway, resources = _diadem_fallback_takeaway_and_resources(query)
+
+    if "takeaway:" not in t.lower():
+        t = f"{t}\n\nTakeaway: {takeaway}".strip()
+
+    if "suggested resources" not in t.lower():
+        resource_lines = "\n".join(f"- {item}" for item in resources[:2])
+        t = f"{t}\n\nSuggested resources:\n{resource_lines}".strip()
+
+    return t
 
 
 def _looks_like_low_context_deflection(text: str) -> bool:
