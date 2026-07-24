@@ -9,7 +9,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import logging
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Mapping
 
 from fastapi import FastAPI, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -1153,6 +1153,7 @@ def _diadem_retrieval_profile(query: str) -> Dict[str, Any]:
         "variable", "variables", "payment terms", "contract length", "service levels",
         "volume", "walk-away", "walk away", "anchor", "anchoring", "procurement",
         "deadline", "final offer", "take it or leave it", "master", "graphite",
+        "scope", "scope creep", "free", "extra", "additional", "more work",
     ]
     selling_terms = [
         "sell", "selling", "sales", "customer", "proposal", "recommendation", "pitch",
@@ -2004,6 +2005,7 @@ SYSTEM_PROMPT_CHAT = (
 
 def _chat_response_contract(query: str) -> str:
     """Build a per-question contract from the Diadem calibration documents."""
+    q = (query or "").lower()
     profile = _diadem_retrieval_profile(query)
     primary = str(profile.get("primary") or "general")
 
@@ -2024,6 +2026,10 @@ def _chat_response_contract(query: str) -> str:
             "Must use relevant MASTER language from the calibration examples: mindset, ambition, Balanced playing field, Confidence, variables, Low/High/Highest, walk-away, Coal/Graphite/Diamond, tactics, conditional proposals, and trade rather than concede.\n"
             "If the question involves relationship, supplier renewal, price pressure, or deadlock, prefer Graphite and variables unless the situation is clearly Coal or Diamond."
         )
+        if any(term in q for term in ("scope", "free", "extra", "additional", "more work")):
+            module += (
+                "\nFor scope creep, explicitly say that every extra request has value, and include an If... then... trade line so the user does not give value away for free."
+            )
     elif primary == "strong":
         module = (
             "Lead module: STRONG Selling.\n"
@@ -3582,6 +3588,39 @@ def _ensure_diadem_answer_shape(text: str, query: str) -> str:
         t = f"{t}\n\nSuggested resources:\n{resource_lines}".strip()
 
     return t
+
+
+def _ensure_document_review_rewrite(text: str, classification: Mapping[str, str], document_text: str) -> str:
+    """Ensure STRONG proposal reviews include the required before/after rewrite."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+
+    doc_type = str((classification or {}).get("document_type") or "").lower()
+    module = str((classification or {}).get("likely_module") or "").lower()
+    needs_rewrite = (
+        ("proposal" in doc_type or "recommendation" in doc_type or "strong" in module)
+        and not ("before:" in t.lower() and "after:" in t.lower())
+    )
+    if not needs_rewrite:
+        return t
+
+    source_line = ""
+    for raw in (document_text or "").splitlines():
+        line = raw.strip()
+        if line:
+            source_line = line[:220]
+            break
+    if not source_line:
+        source_line = "We are reliable, flexible and cost effective."
+
+    rewrite_block = (
+        "\n\nConcrete rewrite:\n"
+        f"Before: {source_line}\n"
+        "After: Based on what you told us matters most, we recommend a focused next conversation on the specific opportunity, the customer need it answers, and the value this would create for your business.\n\n"
+        "Commercial why: this moves the proposal from a supplier description to a STRONG Selling recommendation. It links the ask to customer need, value, Opportunity and a clearer next step."
+    )
+    return (t + rewrite_block).strip()
 
 
 def _looks_like_low_context_deflection(text: str) -> bool:
@@ -5504,6 +5543,7 @@ def document_review(payload: Dict = Body(...)):
     )
 
     text = _finalize_chat_text((resp.content[0].text or ""), max_questions=3)
+    text = _ensure_document_review_rewrite(text, classification, document_text)
     return {
         "text": text,
         "session_id": session_id,
