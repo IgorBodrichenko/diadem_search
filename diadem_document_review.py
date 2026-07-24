@@ -56,7 +56,7 @@ Qualifying rules:
 - If assumptions are needed, state them briefly and invite correction.
 
 Review rules:
-- Sales deck or proposal: look for a clear recommendation, customer needs, motivating headlines, benefits not just features, commercial opportunity, where money appears, and clear next steps.
+- Sales deck or proposal: look for a clear recommendation, customer needs, motivating headlines, benefits not just features, commercial opportunity, where money appears, and clear next steps. You must include at least one explicit Before: / After: rewrite using the delegate's own material or a clearly labelled illustrative rewrite.
 - Call or meeting transcript: look for selling before negotiating, clever questions, needs summarised back, buyer style or tactics, conditional proposals, and what/who/when close.
 - Presentation: look for strong introduction, audience needs, attention changes, data turned into story, delivery implications that can be inferred from the material, and ending with conviction.
 - Preparation plan: look for ambition, variables, Low/High/Highest positions, walk-away, value/cost for both sides, and anticipated tactics.
@@ -65,7 +65,7 @@ Review rules:
 Required output format:
 1. Acknowledge and frame: one or two sentences on what you think this is and the assumptions you are making.
 2. Strengths first: two or three specific strengths, using brief evidence from the user's own material.
-3. Top three priorities to improve: for each, name the issue in Diadem language, show a before/after rewrite where possible, and explain the commercial consequence.
+3. Top three priorities to improve: for each, name the issue in Diadem language, show a before/after rewrite where possible, and explain the commercial consequence. For sales decks and written proposals, at least one priority must include exact labels "Before:" and "After:".
 4. Takeaway: one memorable sentence.
 5. Suggested resources: two or three relevant Diadem tools or models, named with a one-line reason each. Do not include raw slide numbers.
 6. Next step offer: invite a practical working loop.
@@ -204,4 +204,8 @@ DOCUMENT TEXT:
 {document_text}
 
 TASK:
-Review the material using the required Diadem document-review format. If the missing qualifying inputs materially limit the review, ask up to three qualifying questions first; otherwise proceed and state your assumptions briefly."""
+Review the material using the required Diadem document-review format. If the missing qualifying inputs materially limit the review, ask up to three qualifying questions first; otherwise proceed and state your assumptions briefly.
+
+If this is a sales deck, written proposal, recommendation, or STRONG Selling review, include at least one explicit rewrite with exact labels:
+Before: [the weak or generic version]
+After: [a stronger Diadem-style version linked to customer need, value, Opportunity, or next step]"""

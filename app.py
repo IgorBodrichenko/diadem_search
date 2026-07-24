@@ -1270,16 +1270,22 @@ def _curated_asset_bonus(query: str, page: Any, text: str) -> float:
     """Small resource-serving boosts based on the Q&A calibration documents."""
     q = (query or "").lower()
     tlow = (text or "").lower()
+    profile = _diadem_retrieval_profile(query)
+    primary = str(profile.get("primary") or "general")
     try:
         p = int(float(page))
     except Exception:
         p = 0
 
+    master_context = primary == "master" or any(
+        term in q
+        for term in ("negotiation", "negotiator", "negotiate", "supplier", "buyer", "procurement", "deal")
+    )
     confidence_query = any(
         term in q
         for term in ("nervous", "nerve", "confidence", "confident", "mindset", "headspace", "anxious", "anxiety")
     )
-    if confidence_query:
+    if confidence_query and master_context:
         if p == 14 or "preparing a confident mindset" in tlow:
             return 12.0
         if p == 2 or "optimal performance correlates to stretch zone" in tlow:
@@ -1611,12 +1617,18 @@ def _augment_matches_for_assets(query: str, matches: List[Dict], request_id: str
     """Add tightly scoped resource matches for known Q&A resource-serving cases."""
     q = (query or "").lower()
     augmented = list(matches or [])
+    profile = _diadem_retrieval_profile(query)
+    primary = str(profile.get("primary") or "general")
 
+    master_context = primary == "master" or any(
+        term in q
+        for term in ("negotiation", "negotiator", "negotiate", "supplier", "buyer", "procurement", "deal")
+    )
     confidence_query = any(
         term in q
         for term in ("nervous", "nerve", "confidence", "confident", "mindset", "headspace", "anxious", "anxiety")
     )
-    if not confidence_query:
+    if not (confidence_query and master_context):
         return augmented
 
     extra_queries = [
@@ -3525,17 +3537,39 @@ def _ensure_diadem_answer_shape(text: str, query: str) -> str:
             "- Right Order: agree which issue to handle first.\n"
             "- Deal: respond to the real issue and move the conversation forward."
         )
-        t = re.sub(
-            r"(?ims)^.*real\s+issue.*use\s+card\s*:.*?(?:\n\s*-\s+.*?)+(?=\n\n|^[A-Z][^\n]*$|Takeaway|Suggested resources|$)",
-            card_block,
-            t,
-            count=1,
-        )
-        t = re.sub(
-            r"(?ims)^.*use\s+card\s*:.*?(?:\n\s*-\s+.*?)+(?=\n\n|^[A-Z][^\n]*$|Takeaway|Suggested resources|$)",
-            card_block,
-            t,
-            count=1,
+        lines = t.splitlines()
+        out: List[str] = []
+        i = 0
+        replaced = False
+        while i < len(lines):
+            line = lines[i]
+            if (not replaced) and re.search(r"(?i)\buse\s+card\b|^card\b", line):
+                out.append(card_block)
+                replaced = True
+                i += 1
+                while i < len(lines):
+                    nxt = lines[i]
+                    if not nxt.strip():
+                        out.append(nxt)
+                        i += 1
+                        break
+                    if re.match(r"\s*[-•]\s+", nxt) or re.search(r"(?i)\b(clarify|acknowledge|revisit|demonstrate|all out|right order|deal)\b", nxt):
+                        i += 1
+                        continue
+                    break
+                continue
+            out.append(line)
+            i += 1
+        t = "\n".join(out).strip()
+
+    strong_price_query = _diadem_retrieval_profile(query).get("primary") == "strong" and any(
+        term in (query or "").lower()
+        for term in ("too expensive", "price", "discount", "cost")
+    )
+    if strong_price_query and t.lower().startswith("use card"):
+        t = (
+            "Price pressure is easy to misread. Before you move on price, slow the conversation down and find out whether this is a real issue or a negotiating pressure move.\n\n"
+            + t
         )
 
     takeaway, resources = _diadem_fallback_takeaway_and_resources(query)
