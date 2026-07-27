@@ -3764,11 +3764,13 @@ def _ensure_document_review_rewrite(text: str, classification: Mapping[str, str]
 
     doc_type = str((classification or {}).get("document_type") or "").lower()
     module = str((classification or {}).get("likely_module") or "").lower()
-    needs_rewrite = (
-        ("proposal" in doc_type or "recommendation" in doc_type or "strong" in module)
-        and not ("before:" in t.lower() and "after:" in t.lower())
-    )
-    if not needs_rewrite:
+    proposal_review = "proposal" in doc_type or "recommendation" in doc_type or "strong" in module
+    if not proposal_review:
+        return t
+
+    has_before_after = "before:" in t.lower() and "after:" in t.lower()
+    has_rewrite_label = "rewrite" in t.lower()
+    if has_before_after and has_rewrite_label:
         return t
 
     source_line = ""
@@ -3780,13 +3782,16 @@ def _ensure_document_review_rewrite(text: str, classification: Mapping[str, str]
     if not source_line:
         source_line = "We are reliable, flexible and cost effective."
 
-    rewrite_block = (
-        "\n\nConcrete rewrite:\n"
-        f"Before: {source_line}\n"
-        "After: Based on what you told us matters most, we recommend a focused next conversation on the specific opportunity, the customer need it answers, and the value this would create for your business.\n\n"
-        "Commercial why: this moves the proposal from a supplier description to a STRONG Selling recommendation. It links the ask to customer need, value, Opportunity and a clearer next step."
-    )
-    return (t + rewrite_block).strip()
+    if has_before_after:
+        return (t + "\n\nRewrite note: the Before and After example above shows how to move the proposal from supplier description to customer-centred recommendation.").strip()
+
+    return (
+        t
+        + "\n\nConcrete rewrite:\n"
+        + f"Before: {source_line}\n"
+        + "After: Based on what you told us matters most, we recommend a focused next conversation on the specific opportunity, the customer need it answers, and the value this would create for your business.\n\n"
+        + "Commercial why: this moves the proposal from a supplier description to a STRONG Selling recommendation. It links the ask to customer need, value, Opportunity and a clearer next step."
+    ).strip()
 
 
 def _looks_like_low_context_deflection(text: str) -> bool:
