@@ -9,6 +9,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import logging
+from collections import defaultdict, deque
 from typing import List, Dict, Any, Optional, Tuple, Mapping
 
 from fastapi import FastAPI, Body, Request
@@ -41,8 +42,34 @@ logging.basicConfig(
 log = logging.getLogger("coach")
 
 
+_SECRET_FIELD_RE = re.compile(r"(api[_-]?key|authorization|bearer|token|secret|password|credential)", re.I)
+
+
+def _redact_for_log(value: Any, max_chars: int = 800) -> Any:
+    """Return log-safe values without exposing keys, auth headers, or large user content."""
+    if isinstance(value, Mapping):
+        out = {}
+        for k, v in value.items():
+            key = str(k)
+            if _SECRET_FIELD_RE.search(key):
+                out[key] = "[REDACTED]"
+            else:
+                out[key] = _redact_for_log(v, max_chars=max_chars)
+        return out
+    if isinstance(value, list):
+        return [_redact_for_log(v, max_chars=max_chars) for v in value[:20]]
+    if isinstance(value, str):
+        text = value
+        text = re.sub(r"sk-[A-Za-z0-9_\-]{12,}", "[REDACTED_OPENAI_KEY]", text)
+        text = re.sub(r"(Bearer\s+)[A-Za-z0-9._\-]{12,}", r"\1[REDACTED]", text, flags=re.I)
+        if len(text) > max_chars:
+            return text[:max_chars] + "...[truncated]"
+        return text
+    return value
+
+
 def _jlog(event: str, **fields):
-    payload = {"event": event, **fields}
+    payload = {"event": event, **_redact_for_log(fields)}
     try:
         log.info(json.dumps(payload, ensure_ascii=False))
     except Exception:
@@ -62,11 +89,18 @@ EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "claude-sonnet-4-6")
 
 TOP_K = int(os.getenv("TOP_K", "10"))
+MAX_TOP_K = int(os.getenv("MAX_TOP_K", "20"))
 PINECONE_TOPK_RAW = int(os.getenv("PINECONE_TOPK_RAW", "30"))
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "14000"))
 EMBED_DIM = int(os.getenv("EMBED_DIM", "1536"))
 
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
+MAX_SESSION_ID_CHARS = int(os.getenv("MAX_SESSION_ID_CHARS", "128"))
+MAX_QUERY_CHARS = int(os.getenv("MAX_QUERY_CHARS", "4000"))
+MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "12"))
+MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", "262144"))
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development").strip().lower() or "development"
 
 MIN_MATCH_SCORE = float(os.getenv("MIN_MATCH_SCORE", "0.35"))
 MIN_CONTEXT_CHARS = int(os.getenv("MIN_CONTEXT_CHARS", "700"))
@@ -94,6 +128,23 @@ def _slog(event: str, **fields):
 
 # IMPORTANT: confirmation cadence (PDF intent: not after every answer)
 CONFIRM_EVERY_N = int(os.getenv("COACH_CONFIRM_EVERY_N", "3"))  # checkpoint confirm after N answers (default 3)
+
+
+def _env_list(name: str, default: str = "") -> List[str]:
+    raw = os.getenv(name, default)
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def _bounded_int(value: Any, default: int, low: int, high: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = default
+    return max(low, min(high, parsed))
+
+
+def _bounded_text(value: Any, max_chars: int) -> str:
+    return _safe_str(value)[:max_chars]
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -333,29 +384,106 @@ def _iter_text_as_sse_chunks(text_iter, *, min_chars: int = 24):
         yield buf
 
 
-app = FastAPI()
+app = FastAPI(title="Diadem Search API", version=os.getenv("APP_VERSION", "local"))
+
+ALLOWED_ORIGINS = _env_list(
+    "ALLOWED_ORIGINS",
+    "https://ai.diademperformance.com,https://diadem-51532.bubbleapps.io,http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173",
+)
+if not ALLOWED_ORIGINS:
+    ALLOWED_ORIGINS = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials="*" not in ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+_RATE_BUCKETS: Dict[str, deque] = defaultdict(deque)
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:64]
+    if request.client and request.client.host:
+        return request.client.host[:64]
+    return "unknown"
+
+
+def _rate_limited(key: str) -> bool:
+    if RATE_LIMIT_PER_MINUTE <= 0:
+        return False
+    now = time.time()
+    bucket = _RATE_BUCKETS[key]
+    cutoff = now - 60
+    while bucket and bucket[0] < cutoff:
+        bucket.popleft()
+    if len(bucket) >= RATE_LIMIT_PER_MINUTE:
+        return True
+    bucket.append(now)
+    return False
 
 # =========================
 # REQUEST LOG (optional)
 # =========================
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())[:8]
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_REQUEST_BYTES:
+                return JSONResponse(
+                    {"error": "Request body too large.", "request_id": request_id},
+                    status_code=413,
+                    headers={"X-Request-ID": request_id},
+                )
+        except Exception:
+            pass
+
+    rate_key = f"{_client_ip(request)}:{request.url.path}"
+    if _rate_limited(rate_key):
+        return JSONResponse(
+            {"error": "Too many requests. Please retry shortly.", "request_id": request_id},
+            status_code=429,
+            headers={"Retry-After": "60", "X-Request-ID": request_id},
+        )
+
     if DEBUG:
         try:
             body = await request.body()
-            preview = body.decode("utf-8", errors="ignore")[:800]
+            preview = _redact_for_log(body.decode("utf-8", errors="ignore")[:800])
         except Exception:
             preview = ""
-        _jlog("http_in", method=request.method, path=str(request.url.path), body_preview=preview)
+        _jlog("http_in", request_id=request_id, method=request.method, path=str(request.url.path), body_preview=preview)
     resp = await call_next(request)
+    resp.headers["X-Request-ID"] = request_id
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    if ENVIRONMENT in {"production", "prod"}:
+        resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return resp
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())[:8]
+    _jlog(
+        "unhandled_exception",
+        request_id=request_id,
+        method=request.method,
+        path=str(request.url.path),
+        err=str(exc)[:800],
+    )
+    return JSONResponse(
+        {"error": "Internal server error. Please retry.", "request_id": request_id},
+        status_code=500,
+        headers={"X-Request-ID": request_id},
+    )
 
 
 # =========================
@@ -432,9 +560,11 @@ def _cleanup_sessions() -> None:
 def _get_or_create_session_id(payload: Dict[str, Any]) -> str:
     # MASTER template: use Bubble template_id as stable session_id so memory persists per template.
     tid = str(payload.get("template_id") or payload.get("templateId") or payload.get("template") or "").strip()
+    tid = re.sub(r"[^A-Za-z0-9_.:-]", "", tid)[:MAX_SESSION_ID_CHARS]
     if tid:
         return tid
     sid = str(payload.get("session_id") or "").strip()
+    sid = re.sub(r"[^A-Za-z0-9_.:-]", "", sid)[:MAX_SESSION_ID_CHARS]
     if not sid:
         sid = uuid.uuid4().hex
     return sid
@@ -2321,7 +2451,7 @@ def _set_active_section(mode: str, state: Dict[str, Any], active_section: str) -
 def coach_turn_server_state(payload: Dict[str, Any], session_id: str, stream: bool = False):
     raw_query = _extract_user_text(payload)
 
-    top_k = _clamp_int(payload.get("top_k"), TOP_K, 1, 30)
+    top_k = _clamp_int(payload.get("top_k"), TOP_K, 1, MAX_TOP_K)
     reset = _as_bool(payload.get("reset"))
     start_template = _as_bool(payload.get("start_template"))
     user_name = _extract_user_name(payload)
@@ -2491,7 +2621,43 @@ def _chat_build_conversation_context(history: Any, max_turns: int = 4) -> str:
 
 @app.get("/health")
 def health():
-    return {"ok": True, "debug": DEBUG}
+    required_config = {
+        "OPENAI_API_KEY": bool(OPENAI_API_KEY),
+        "ANTHROPIC_API_KEY": bool(ANTHROPIC_API_KEY),
+        "PINECONE_API_KEY": bool(PINECONE_API_KEY),
+        "PINECONE_INDEX_NAME": bool(PINECONE_INDEX_NAME),
+        "PINECONE_HOST": bool(PINECONE_HOST),
+    }
+    return {
+        "ok": all(required_config.values()),
+        "environment": ENVIRONMENT,
+        "debug": DEBUG,
+        "required_config": required_config,
+        "limits": {
+            "max_request_bytes": MAX_REQUEST_BYTES,
+            "rate_limit_per_minute": RATE_LIMIT_PER_MINUTE,
+            "max_query_chars": MAX_QUERY_CHARS,
+            "max_top_k": MAX_TOP_K,
+        },
+    }
+
+
+@app.get("/ready")
+def ready():
+    missing = [
+        name
+        for name, value in {
+            "OPENAI_API_KEY": OPENAI_API_KEY,
+            "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
+            "PINECONE_API_KEY": PINECONE_API_KEY,
+            "PINECONE_INDEX_NAME": PINECONE_INDEX_NAME,
+            "PINECONE_HOST": PINECONE_HOST,
+        }.items()
+        if not value
+    ]
+    if missing:
+        return JSONResponse({"ok": False, "missing": missing}, status_code=503)
+    return {"ok": True}
 
 
 # =========================
@@ -2499,9 +2665,9 @@ def health():
 # =========================
 @app.post("/chat")
 def chat(payload: Dict = Body(...)):
-    query = (payload.get("query") or "").strip()
-    top_k = int(payload.get("top_k") or TOP_K)
-    history = payload.get("history") or []
+    query = _bounded_text(payload.get("query"), MAX_QUERY_CHARS)
+    top_k = _bounded_int(payload.get("top_k"), TOP_K, 1, MAX_TOP_K)
+    history = (payload.get("history") or [])[:MAX_HISTORY_TURNS] if isinstance(payload.get("history") or [], list) else []
     user_name = _extract_user_name(payload)
     admin_prompt, summary_guidance_all = _extract_admin_settings(payload)
 
@@ -2562,9 +2728,9 @@ def chat_sse(payload: Dict = Body(...)):
     request_id = str(uuid.uuid4())[:8]
     _cleanup_sessions()
 
-    query = (payload.get("query") or "").strip()
-    top_k = int(payload.get("top_k") or TOP_K)
-    history = payload.get("history") or []
+    query = _bounded_text(payload.get("query"), MAX_QUERY_CHARS)
+    top_k = _bounded_int(payload.get("top_k"), TOP_K, 1, MAX_TOP_K)
+    history = (payload.get("history") or [])[:MAX_HISTORY_TURNS] if isinstance(payload.get("history") or [], list) else []
     user_name = _extract_user_name(payload)
     admin_prompt, summary_guidance_all = _extract_admin_settings(payload)
 
@@ -5526,7 +5692,7 @@ def document_review(payload: Dict = Body(...)):
     )
     retrieval_query = expand_diadem_retrieval_query(retrieval_seed, mode="document_review")
 
-    matches = get_matches(retrieval_query, int(payload.get("top_k") or TOP_K), request_id=request_id)
+    matches = get_matches(retrieval_query, _bounded_int(payload.get("top_k"), TOP_K, 1, MAX_TOP_K), request_id=request_id)
     info = build_context(matches, request_id=request_id) if matches else ""
     assets = _extract_chat_assets(matches, max_items=3, query=retrieval_seed)
 
