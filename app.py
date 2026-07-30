@@ -557,18 +557,26 @@ def _cleanup_sessions() -> None:
     _db().commit()
 
 
-def _get_or_create_session_id(payload: Dict[str, Any]) -> str:
+def _get_or_create_session_id(payload: Dict[str, Any], query_params: Optional[Any] = None) -> str:
     # MASTER template: use Bubble template_id as stable session_id so memory persists per template.
-    tid = str(payload.get("template_id") or payload.get("templateId") or payload.get("template") or "").strip()
+    def _param(name: str) -> Any:
+        value = payload.get(name)
+        if value not in (None, ""):
+            return value
+        if query_params is not None:
+            return query_params.get(name)
+        return None
+
+    tid = str(_param("template_id") or _param("templateId") or _param("template") or "").strip()
     tid = re.sub(r"[^A-Za-z0-9_.:-]", "", tid)[:MAX_SESSION_ID_CHARS]
     if tid:
         return tid
     sid = str(
-        payload.get("session_id")
-        or payload.get("sessionId")
-        or payload.get("chat_id")
-        or payload.get("chatId")
-        or payload.get("chat")
+        _param("session_id")
+        or _param("sessionId")
+        or _param("chat_id")
+        or _param("chatId")
+        or _param("chat")
         or ""
     ).strip()
     sid = re.sub(r"[^A-Za-z0-9_.:-]", "", sid)[:MAX_SESSION_ID_CHARS]
@@ -2815,14 +2823,14 @@ def ready():
 # CHAT (RAG)
 # =========================
 @app.post("/chat")
-def chat(payload: Dict = Body(...)):
+def chat(request: Request, payload: Dict = Body(...)):
     query = _bounded_text(payload.get("query"), MAX_QUERY_CHARS)
     top_k = _bounded_int(payload.get("top_k"), TOP_K, 1, MAX_TOP_K)
     history = (payload.get("history") or [])[:MAX_HISTORY_TURNS] if isinstance(payload.get("history") or [], list) else []
     user_name = _extract_user_name(payload)
     admin_prompt, summary_guidance_all = _extract_admin_settings(payload)
 
-    session_id = _get_or_create_session_id(payload)
+    session_id = _get_or_create_session_id(payload, request.query_params)
     request_id = str(uuid.uuid4())[:8]
     _cleanup_sessions()
 
@@ -2878,8 +2886,8 @@ def chat(payload: Dict = Body(...)):
 
 
 @app.post("/chat/sse")
-def chat_sse(payload: Dict = Body(...)):
-    session_id = _get_or_create_session_id(payload)
+def chat_sse(request: Request, payload: Dict = Body(...)):
+    session_id = _get_or_create_session_id(payload, request.query_params)
     request_id = str(uuid.uuid4())[:8]
     _cleanup_sessions()
 
