@@ -128,7 +128,8 @@
       },
       "must_include": ["confidence", "rehearse", "audience"],
       "should_include": ["inner voice", "delivery", "message", "conviction", "Takeaway", "Suggested resources"],
-      "avoid": ["just relax"]
+      "avoid": ["just relax"],
+      "asset_must_not_include": ["Master Negotiator", "Negotiation.pdf", "Selling.pdf"]
     },
     {
       "id": "document_review_negotiation_plan",

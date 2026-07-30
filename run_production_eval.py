@@ -22,6 +22,7 @@ import requests
 
 DEFAULT_BASE_URL = "https://diadem-searchv3.onrender.com"
 DEFAULT_EVAL_SET = "diadem_production_eval_set.json"
+DEFAULT_OUTPUT_DIR = "evaluation_outputs"
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -88,17 +89,30 @@ def _asset_sources(body: Mapping[str, Any]) -> List[str]:
 
 def _asset_score(case: Mapping[str, Any], body: Mapping[str, Any]) -> Dict[str, Any]:
     preferred = list(case.get("asset_should_prefer") or [])
-    if not preferred:
-        return {"preferred": preferred, "sources": _asset_sources(body), "hits": [], "score": 1.0}
-
+    avoid = list(case.get("asset_must_not_include") or [])
     sources = _asset_sources(body)
     source_text = " ".join(sources).lower()
+    avoid_hits = [term for term in avoid if term.lower() in source_text]
+
+    if not preferred:
+        return {
+            "preferred": preferred,
+            "must_not_include": avoid,
+            "sources": sources,
+            "hits": [],
+            "avoid_hits": avoid_hits,
+            "score": 0.0 if avoid_hits else 1.0,
+        }
+
     hits = [term for term in preferred if term.lower() in source_text]
+    preferred_score = (len(hits) / len(preferred)) if preferred else 1.0
     return {
         "preferred": preferred,
+        "must_not_include": avoid,
         "sources": sources,
         "hits": hits,
-        "score": (len(hits) / len(preferred)) if preferred else 1.0,
+        "avoid_hits": avoid_hits,
+        "score": 0.0 if avoid_hits else preferred_score,
     }
 
 
@@ -228,9 +242,10 @@ def main(argv: List[str]) -> int:
     eval_path = Path(args.eval_set)
     report = run_eval(args.base_url, eval_path, args.timeout, args.limit)
 
-    output = Path(args.output) if args.output else Path(
+    output = Path(args.output) if args.output else Path(DEFAULT_OUTPUT_DIR) / (
         "eval_results_" + dt.datetime.now().strftime("%Y%m%d_%H%M%S") + ".json"
     )
+    output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 

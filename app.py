@@ -563,7 +563,14 @@ def _get_or_create_session_id(payload: Dict[str, Any]) -> str:
     tid = re.sub(r"[^A-Za-z0-9_.:-]", "", tid)[:MAX_SESSION_ID_CHARS]
     if tid:
         return tid
-    sid = str(payload.get("session_id") or "").strip()
+    sid = str(
+        payload.get("session_id")
+        or payload.get("sessionId")
+        or payload.get("chat_id")
+        or payload.get("chatId")
+        or payload.get("chat")
+        or ""
+    ).strip()
     sid = re.sub(r"[^A-Za-z0-9_.:-]", "", sid)[:MAX_SESSION_ID_CHARS]
     if not sid:
         sid = uuid.uuid4().hex
@@ -1278,6 +1285,10 @@ def _match_source_text(md: Dict[str, Any]) -> str:
 def _diadem_retrieval_profile(query: str) -> Dict[str, Any]:
     q = (query or "").lower()
 
+    confidence_terms = [
+        "nervous", "nerve", "confidence", "confident", "mindset", "headspace",
+        "anxious", "anxiety", "heart races", "mind goes blank",
+    ]
     negotiation_terms = [
         "negotiat", "supplier", "renewal", "price", "increase", "discount", "concession",
         "variable", "variables", "payment terms", "contract length", "service levels",
@@ -1305,6 +1316,13 @@ def _diadem_retrieval_profile(query: str) -> Dict[str, Any]:
         "presenting": sum(1 for t in presenting_terms if t in q),
         "document": sum(1 for t in document_terms if t in q),
     }
+
+    # Short-term category guard: shared words like confidence, mindset and
+    # stretch zone appear in more than one Diadem programme. When the user is
+    # clearly asking about presenting, keep the retrieval profile anchored there
+    # so visible resources do not drift into MASTER negotiation assets.
+    if scores["presenting"] > 0 and any(t in q for t in confidence_terms):
+        scores["presenting"] += 4
     primary = max(scores, key=scores.get)
     if scores[primary] == 0:
         primary = "general"
@@ -1322,6 +1340,7 @@ def _diadem_retrieval_profile(query: str) -> Dict[str, Any]:
         ],
         "presenting": [
             ("inspired presenting", 5.0),
+            ("presenting.pdf", 6.0),
             ("presenting", 3.0),
         ],
         "document": [
@@ -1346,7 +1365,8 @@ def _diadem_retrieval_profile(query: str) -> Dict[str, Any]:
         ],
         "presenting": [
             "audience", "opening", "attention", "message", "story", "delivery",
-            "rehearse", "confidence", "conviction", "slides",
+            "rehearse", "confidence", "conviction", "slides", "inner voice",
+            "emotional regulation", "stretch zone", "panic zone", "base position",
         ],
         "document": [
             "strengths", "priorities", "takeaway", "suggested resources", "rewrite",
@@ -1360,6 +1380,41 @@ def _diadem_retrieval_profile(query: str) -> Dict[str, Any]:
         "source_boosts": source_boosts.get(primary, []),
         "concept_terms": concept_terms.get(primary, []),
     }
+
+
+def _is_cross_module_query(query: str) -> bool:
+    q = (query or "").lower()
+    return any(
+        term in q
+        for term in (
+            "compare", "comparison", "across", "between programmes", "between programs",
+            "all modules", "all programmes", "all programs", "master and strong",
+            "strong and presenting", "presenting and negotiation",
+        )
+    )
+
+
+def _asset_module_allowed(profile: Mapping[str, Any], source: str, text: str, query: str = "") -> bool:
+    """Keep visible frontend resources inside the detected Diadem category."""
+    if _is_cross_module_query(query):
+        return True
+
+    primary = str((profile or {}).get("primary") or "general")
+    source_l = str(source or "").lower()
+    text_l = str(text or "").lower()
+    combined = f"{source_l} {text_l}"
+
+    is_master = "master negotiator" in combined or "negotiation.pdf" in combined
+    is_strong = "strong selling" in combined or "selling.pdf" in combined
+    is_presenting = "inspired presenting" in combined or "presenting.pdf" in combined or "presenting" in source_l
+
+    if primary == "presenting":
+        return is_presenting or not (is_master or is_strong)
+    if primary == "master":
+        return is_master or not (is_strong or is_presenting)
+    if primary == "strong":
+        return is_strong or not (is_master or is_presenting)
+    return True
 
 
 def _diadem_match_bonus(profile: Dict[str, Any], md: Dict[str, Any], text: str) -> float:
@@ -1391,8 +1446,8 @@ def _diadem_match_bonus(profile: Dict[str, Any], md: Dict[str, Any], text: str) 
             bonus -= 3.0
 
     if profile.get("primary") == "presenting":
-        if "negotiation.pdf" in source or "selling.pdf" in source:
-            bonus -= 2.0
+        if "negotiation.pdf" in source or "master negotiator" in source or "selling.pdf" in source or "strong selling" in source:
+            bonus -= 8.0
 
     return bonus
 
@@ -1425,6 +1480,16 @@ def _curated_asset_bonus(query: str, page: Any, text: str) -> float:
             return 2.0
         if p in {51, 73} or "preparing for graphite" in tlow or "preparing for diamond" in tlow:
             return -4.0
+
+    if confidence_query and primary == "presenting":
+        if p == 21 or "emotional regulation" in tlow:
+            return 12.0
+        if p == 19 or "inner voice" in tlow:
+            return 10.0
+        if p == 15 or "stretch zone" in tlow or "panic zone" in tlow:
+            return 8.0
+        if "preparing a confident mindset" in tlow or "master negotiator" in tlow:
+            return -12.0
 
     return 0.0
 
@@ -1714,6 +1779,9 @@ def _extract_chat_assets(matches: List[Dict], max_items: int = 3, query: str = "
             "has_image": bool(image_url),
         }
 
+        if not _asset_module_allowed(profile, source, txt, query=query):
+            continue
+
         sid = _asset_slide_id(md, source=source, page=page)
         kw = float(keyword_scores.get(sid, 0.0))
         module_bonus = _diadem_match_bonus(profile, md, txt)
@@ -1759,13 +1827,19 @@ def _augment_matches_for_assets(query: str, matches: List[Dict], request_id: str
         term in q
         for term in ("nervous", "nerve", "confidence", "confident", "mindset", "headspace", "anxious", "anxiety")
     )
-    if not (confidence_query and master_context):
+    if confidence_query and primary == "presenting":
+        extra_queries = [
+            "Inspired Presenting Emotional Regulation Preparation confidence audience yourself inner voice",
+            "Inspired Presenting Tune Into Your Inner Voice flip negative thoughts positive thoughts",
+            "Inspired Presenting stretch zone panic zone delivery confidence rehearse out loud",
+        ]
+    elif confidence_query and master_context:
+        extra_queries = [
+            "Preparing A Confident Mindset slide_014 Confident Mindset Tool",
+            "Optimal Performance Correlates To Stretch Zone slide_002 comfort zone stretch zone panic zone",
+        ]
+    else:
         return augmented
-
-    extra_queries = [
-        "Preparing A Confident Mindset slide_014 Confident Mindset Tool",
-        "Optimal Performance Correlates To Stretch Zone slide_002 comfort zone stretch zone panic zone",
-    ]
 
     seen = set()
     for m in augmented:
@@ -2619,6 +2693,83 @@ def _chat_build_conversation_context(history: Any, max_turns: int = 4) -> str:
     return "\n".join(parts).strip()
 
 
+def _chat_history_turns(history: Any, max_turns: int = MAX_HISTORY_TURNS) -> List[Dict[str, str]]:
+    """Normalize supported frontend history formats into user/assistant turn pairs."""
+    if not isinstance(history, list) or not history:
+        return []
+
+    turns: List[Dict[str, str]] = []
+
+    if all(isinstance(x, dict) and ("role" in x or "content" in x) for x in history):
+        pending_user = ""
+        for msg in history:
+            role = str(msg.get("role") or "").strip().lower()
+            content = _bounded_text(msg.get("content"), MAX_QUERY_CHARS)
+            if not content:
+                continue
+            if role == "user":
+                if pending_user:
+                    turns.append({"user": pending_user, "assistant": ""})
+                pending_user = content
+            elif role == "assistant":
+                if pending_user:
+                    turns.append({"user": pending_user, "assistant": content})
+                    pending_user = ""
+                else:
+                    turns.append({"user": "", "assistant": content})
+        if pending_user:
+            turns.append({"user": pending_user, "assistant": ""})
+    else:
+        for turn in history:
+            if not isinstance(turn, dict):
+                continue
+            user_msg = _bounded_text(turn.get("user") or turn.get("u"), MAX_QUERY_CHARS)
+            assistant_msg = _bounded_text(turn.get("assistant") or turn.get("a"), MAX_QUERY_CHARS)
+            if user_msg or assistant_msg:
+                turns.append({"user": user_msg, "assistant": assistant_msg})
+
+    return turns[-max_turns:]
+
+
+def _chat_get_session_history(session_id: str) -> List[Dict[str, str]]:
+    entry = _db_get(session_id) or {}
+    history = entry.get("chat_history")
+    return _chat_history_turns(history, max_turns=MAX_HISTORY_TURNS)
+
+
+def _chat_merge_histories(stored: List[Dict[str, str]], supplied: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    merged: List[Dict[str, str]] = []
+    seen = set()
+    for turn in (stored or []) + (supplied or []):
+        user_msg = _bounded_text(turn.get("user"), MAX_QUERY_CHARS)
+        assistant_msg = _bounded_text(turn.get("assistant"), MAX_QUERY_CHARS)
+        if not user_msg and not assistant_msg:
+            continue
+        key = (user_msg, assistant_msg)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append({"user": user_msg, "assistant": assistant_msg})
+    return merged[-MAX_HISTORY_TURNS:]
+
+
+def _chat_save_turn(session_id: str, user_msg: str, assistant_msg: str, base_history: Optional[List[Dict[str, str]]] = None) -> None:
+    if not session_id or not user_msg or not assistant_msg:
+        return
+    entry = _db_get(session_id) or {}
+    current = _chat_history_turns(entry.get("chat_history"), max_turns=MAX_HISTORY_TURNS)
+    merged = _chat_merge_histories(current, base_history or [])
+    merged.append(
+        {
+            "user": _bounded_text(user_msg, MAX_QUERY_CHARS),
+            "assistant": _bounded_text(assistant_msg, MAX_QUERY_CHARS),
+        }
+    )
+    entry["chat_history"] = merged[-MAX_HISTORY_TURNS:]
+    entry["updated_at"] = _now()
+    _db_set(session_id, entry)
+
+
 @app.get("/health")
 def health():
     required_config = {
@@ -2681,7 +2832,10 @@ def chat(payload: Dict = Body(...)):
     if _is_smalltalk(query):
         return {"answer": _smalltalk_reply(user_name), "session_id": session_id, "assets": []}
 
-    conversation_context = _chat_build_conversation_context(history)
+    supplied_history = _chat_history_turns(history)
+    stored_history = _chat_get_session_history(session_id)
+    conversation_history = _chat_merge_histories(stored_history, supplied_history)
+    conversation_context = _chat_build_conversation_context(conversation_history)
     retrieval_query = query
     if conversation_context:
         retrieval_query = f"{query}\n\nRECENT_CONVERSATION:\n{conversation_context}"
@@ -2718,6 +2872,7 @@ def chat(payload: Dict = Body(...)):
     if answer:
         opener = _pick_opener(session_id, user_name, "qa_last_opener")
         answer = _rewrite_bad_opening(answer, opener)
+        _chat_save_turn(session_id, query, answer, base_history=conversation_history)
 
     return {"answer": answer, "session_id": session_id, "assets": assets}
 
@@ -2739,6 +2894,7 @@ def chat_sse(payload: Dict = Body(...)):
         yield f"event: start\ndata: {start_payload}\n\n"
 
         assets: List[Dict[str, Any]] = []
+        conversation_history: List[Dict[str, str]] = []
 
         # Smalltalk / empty
         if not query:
@@ -2746,7 +2902,10 @@ def chat_sse(payload: Dict = Body(...)):
         elif _is_smalltalk(query):
             full_text = _smalltalk_reply(user_name)
         else:
-            conversation_context = _chat_build_conversation_context(history)
+            supplied_history = _chat_history_turns(history)
+            stored_history = _chat_get_session_history(session_id)
+            conversation_history = _chat_merge_histories(stored_history, supplied_history)
+            conversation_context = _chat_build_conversation_context(conversation_history)
             retrieval_query = query
             if conversation_context:
                 retrieval_query = f"{query}\n\nRECENT_CONVERSATION:\n{conversation_context}"
@@ -2776,6 +2935,8 @@ def chat_sse(payload: Dict = Body(...)):
             full_text = _ensure_diadem_answer_shape(full_text, query)
         if assets and _looks_like_low_context_deflection(full_text):
             full_text = _chat_practical_fallback(assets)
+        if query and not _is_smalltalk(query) and full_text:
+            _chat_save_turn(session_id, query, full_text, base_history=conversation_history)
         chunks = _iter_text_as_sse_chunks([full_text], min_chars=28)
 
         # Emit chunks

@@ -23,7 +23,7 @@ consistently:
 - `run_production_eval.py`
   - Calls the backend, captures responses, and applies transparent heuristic checks.
 
-Generated reports are written as `eval_results_*.json` and are ignored by Git.
+Generated reports are written into `evaluation_outputs/` and are ignored by Git.
 
 ## Running Against Live Render
 

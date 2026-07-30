@@ -7,3 +7,4 @@ __pycache__/
 .env.*
 !.env.example
 eval_results_*.json
+evaluation_outputs/
