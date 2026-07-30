@@ -167,6 +167,7 @@ def _call_case(base_url: str, case: Mapping[str, Any], timeout: int) -> Dict[str
     return {
         "http_status": resp.status_code,
         "elapsed_ms": elapsed_ms,
+        "backend_elapsed_ms": int(resp.headers.get("x-response-time-ms") or 0),
         "body": body,
     }
 
@@ -208,6 +209,7 @@ def run_eval(base_url: str, eval_path: Path, timeout: int, limit: int = 0) -> Di
                 "endpoint": case.get("endpoint"),
                 "http_status": called["http_status"],
                 "elapsed_ms": called["elapsed_ms"],
+                "backend_elapsed_ms": called.get("backend_elapsed_ms", 0),
                 "score": scored["score"],
                 "status": scored["status"],
                 "details": scored,

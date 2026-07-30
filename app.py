@@ -9,6 +9,8 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict, deque
 from typing import List, Dict, Any, Optional, Tuple, Mapping
 
@@ -92,6 +94,7 @@ TOP_K = int(os.getenv("TOP_K", "10"))
 MAX_TOP_K = int(os.getenv("MAX_TOP_K", "20"))
 PINECONE_TOPK_RAW = int(os.getenv("PINECONE_TOPK_RAW", "30"))
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "14000"))
+CHAT_MAX_TOKENS = int(os.getenv("CHAT_MAX_TOKENS", "4096"))
 EMBED_DIM = int(os.getenv("EMBED_DIM", "1536"))
 
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
@@ -108,6 +111,9 @@ MIN_OVERLAP_SCORE = float(os.getenv("MIN_OVERLAP_SCORE", "1.3"))
 
 MULTI_QUERY_K = int(os.getenv("MULTI_QUERY_K", "3"))
 DIVERSITY_SAME_SOURCE_CAP = int(os.getenv("DIVERSITY_SAME_SOURCE_CAP", "3"))
+RETRIEVAL_MAX_WORKERS = int(os.getenv("RETRIEVAL_MAX_WORKERS", "3"))
+EMBED_CACHE_MAX = int(os.getenv("EMBED_CACHE_MAX", "512"))
+ENABLE_ASSET_AUGMENT_RETRIEVAL = os.getenv("ENABLE_ASSET_AUGMENT_RETRIEVAL", "1").strip().lower() in ("1","true","yes","y","on")
 
 # Priority boost for specific documents (e.g., Negotiation.pdf vectors tagged with metadata priority=2)
 # Applied during reranking; base retrieval is still semantic similarity.
@@ -117,6 +123,7 @@ PRIORITY_MAX = int(os.getenv("PRIORITY_MAX", "3"))          # safety clamp (e.g.
 SEARCH_DEBUG_LOGS = os.getenv("SEARCH_DEBUG_LOGS", "0").strip().lower() in ("1","true","yes","y","on")
 SEARCH_LOG_MAX_MATCHES = int(os.getenv("SEARCH_LOG_MAX_MATCHES", "8"))   # how many matches to print
 SEARCH_LOG_TEXT_PREVIEW = int(os.getenv("SEARCH_LOG_TEXT_PREVIEW", "140"))  # chars of text preview in logs
+PERF_DEBUG_LOGS = os.getenv("PERF_DEBUG_LOGS", "0").strip().lower() in ("1","true","yes","y","on")
 
 # Optional hybrid slide keyword boost for assets (semantic retrieval stays primary)
 SLIDE_INDEX_PATH = os.getenv("SLIDE_INDEX_PATH", "slide_index.json")
@@ -124,6 +131,12 @@ SLIDE_INDEX_PATH = os.getenv("SLIDE_INDEX_PATH", "slide_index.json")
 def _slog(event: str, **fields):
     """Search logs (opt-in) that you can copy from server logs."""
     if SEARCH_DEBUG_LOGS:
+        _jlog(event, **fields)
+
+
+def _plog(event: str, **fields):
+    """Performance logs (opt-in) for local eval timing diagnosis."""
+    if PERF_DEBUG_LOGS:
         _jlog(event, **fields)
 
 # IMPORTANT: confirmation cadence (PDF intent: not after every answer)
@@ -332,7 +345,7 @@ def _openai_stream_text(messages: List[Dict[str, str]], model: str, temperature:
         stream_kwargs: Dict[str, Any] = {
             "model": model,
             "messages": clean_messages,
-            "max_tokens": 4096,
+            "max_tokens": CHAT_MAX_TOKENS,
             "temperature": temperature,
         }
         if system_prompt:
@@ -349,7 +362,7 @@ def _openai_stream_text(messages: List[Dict[str, str]], model: str, temperature:
             create_kwargs: Dict[str, Any] = {
                 "model": model,
                 "messages": clean_messages,
-                "max_tokens": 4096,
+                "max_tokens": CHAT_MAX_TOKENS,
                 "temperature": temperature,
             }
             if system_prompt:
@@ -431,6 +444,7 @@ def _rate_limited(key: str) -> bool:
 # =========================
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
+    perf_t0 = time.time()
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())[:8]
     content_length = request.headers.get("content-length")
     if content_length:
@@ -460,12 +474,15 @@ async def log_requests(request: Request, call_next):
             preview = ""
         _jlog("http_in", request_id=request_id, method=request.method, path=str(request.url.path), body_preview=preview)
     resp = await call_next(request)
+    elapsed_ms = int((time.time() - perf_t0) * 1000)
     resp.headers["X-Request-ID"] = request_id
+    resp.headers["X-Response-Time-ms"] = str(elapsed_ms)
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     if ENVIRONMENT in {"production", "prod"}:
         resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    _plog("http_timing", request_id=request_id, method=request.method, path=str(request.url.path), status_code=resp.status_code, elapsed_ms=elapsed_ms)
     return resp
 
 
@@ -1021,7 +1038,56 @@ def _tactics_instruction(text: str) -> str:
 # =========================
 # RAG HELPERS
 # =========================
+_EMBED_CACHE: Dict[Tuple[str, int, str], Tuple[float, ...]] = {}
+_EMBED_CACHE_LOCK = threading.Lock()
+
+
+def _embed_cache_key(text: str) -> Tuple[str, int, str]:
+    return (EMBED_MODEL, EMBED_QUERY_DIM, text)
+
+
+def embed_queries(texts: List[str]) -> List[List[float]]:
+    if not texts:
+        return []
+
+    vectors_by_text: Dict[str, Tuple[float, ...]] = {}
+    missing: List[str] = []
+    seen_missing = set()
+
+    with _EMBED_CACHE_LOCK:
+        for text in texts:
+            cached = _EMBED_CACHE.get(_embed_cache_key(text))
+            if cached is not None:
+                vectors_by_text[text] = cached
+            elif text not in seen_missing:
+                missing.append(text)
+                seen_missing.add(text)
+
+    if missing:
+        resp = openai.embeddings.create(
+            model=EMBED_MODEL,
+            input=missing,
+            dimensions=EMBED_QUERY_DIM,
+        )
+        new_vectors = {
+            text: tuple(item.embedding)
+            for text, item in zip(missing, resp.data)
+        }
+        with _EMBED_CACHE_LOCK:
+            for text, vector in new_vectors.items():
+                _EMBED_CACHE[_embed_cache_key(text)] = vector
+                vectors_by_text[text] = vector
+            while len(_EMBED_CACHE) > EMBED_CACHE_MAX:
+                _EMBED_CACHE.pop(next(iter(_EMBED_CACHE)))
+
+    return [list(vectors_by_text[text]) for text in texts]
+
+
 def embed_query(text: str) -> List[float]:
+    return embed_queries([text])[0]
+
+
+def _embed_query_uncached(text: str) -> List[float]:
     resp = openai.embeddings.create(
         model=EMBED_MODEL,
         input=[text],
@@ -1822,6 +1888,9 @@ def _extract_chat_assets(matches: List[Dict], max_items: int = 3, query: str = "
 
 def _augment_matches_for_assets(query: str, matches: List[Dict], request_id: str = "") -> List[Dict]:
     """Add tightly scoped resource matches for known Q&A resource-serving cases."""
+    if not ENABLE_ASSET_AUGMENT_RETRIEVAL:
+        return list(matches or [])
+
     q = (query or "").lower()
     augmented = list(matches or [])
     profile = _diadem_retrieval_profile(query)
@@ -1872,6 +1941,7 @@ def _augment_matches_for_assets(query: str, matches: List[Dict], request_id: str
     return augmented
 
 def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) -> List[Dict]:
+    perf_t0 = time.time()
     q_clean = (query or "").strip()
     if not q_clean:
         return []
@@ -1901,33 +1971,53 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
     _slog("search_queries",
           request_id=request_id,
           queries=queries)
-    all_results: List[List[Dict]] = []
-    failed_queries = 0
-    for q in queries:
+
+    vectors_by_query: Dict[str, List[float]] = {}
+    try:
+        t_embed = time.time()
+        vectors = embed_queries(queries)
+        vectors_by_query = {q: vec for q, vec in zip(queries, vectors)}
+        _plog("embedding_timing", request_id=request_id, elapsed_ms=int((time.time() - t_embed) * 1000), query_count=len(queries), batched=True)
+    except Exception as e:
+        _jlog("embedding_batch_error", request_id=request_id, err=str(e)[:500], query_count=len(queries))
+
+    def _query_pinecone(q: str) -> Tuple[str, Optional[List[Dict]], Optional[str], int]:
         try:
             t0 = time.time()
-            vec = embed_query(q)
+            vec = vectors_by_query.get(q) or _embed_query_uncached(q)
             res = index.query(vector=vec, top_k=PINECONE_TOPK_RAW, include_metadata=True)
             ms = int((time.time() - t0) * 1000)
             matches = res.get("matches") or []
-            all_results.append(matches)
-            _slog("pinecone_query",
-                  request_id=request_id,
-                  q=q,
-                  ms=ms,
-                  matches_count=len(matches),
-                  top_matches=[_brief_match(x) for x in matches[:SEARCH_LOG_MAX_MATCHES]])
+            return q, matches, None, ms
         except Exception as e:
+            return q, None, str(e)[:500], 0
+
+    all_results: List[List[Dict]] = []
+    failed_queries = 0
+    workers = max(1, min(len(queries), RETRIEVAL_MAX_WORKERS))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        query_results = list(executor.map(_query_pinecone, queries))
+
+    for q, matches, err, ms in query_results:
+        if err:
             failed_queries += 1
             _jlog(
                 "pinecone_query_error",
                 request_id=request_id,
                 q=q,
-                err=str(e)[:500],
+                err=err,
                 index_name=PINECONE_INDEX_NAME,
                 host=PINECONE_HOST,
             )
             continue
+        matches = matches or []
+        all_results.append(matches)
+        _slog("pinecone_query",
+              request_id=request_id,
+              q=q,
+              ms=ms,
+              matches_count=len(matches),
+              top_matches=[_brief_match(x) for x in matches[:SEARCH_LOG_MAX_MATCHES]])
 
     if failed_queries == len(queries):
         _jlog(
@@ -1972,6 +2062,7 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
               relevant=True,
               kept=len(reranked),
               reason="hint_override")
+        _plog("retrieval_timing", request_id=request_id, elapsed_ms=int((time.time() - perf_t0) * 1000), query_count=len(queries), final_count=len(reranked), reason="hint_override")
         return reranked
 
     relevant = is_context_relevant(q_clean, reranked)
@@ -1980,8 +2071,10 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
           relevant=relevant,
           kept=len(reranked))
     if not relevant:
+        _plog("retrieval_timing", request_id=request_id, elapsed_ms=int((time.time() - perf_t0) * 1000), query_count=len(queries), final_count=0, reason="not_relevant")
         return []
 
+    _plog("retrieval_timing", request_id=request_id, elapsed_ms=int((time.time() - perf_t0) * 1000), query_count=len(queries), final_count=len(reranked), reason="relevant")
     return reranked
 
 def _reflect_line() -> str:
@@ -2449,7 +2542,7 @@ def _generate_final(mode: str, state: Dict[str, Any], top_k: int, user_name: str
         messages=[
             {"role": "user", "content": final_user},
         ],
-        max_tokens=4096,
+        max_tokens=CHAT_MAX_TOKENS,
         system=SYSTEM_PROMPT_COACH_FINAL,
         temperature=0.2,
     )
@@ -2824,6 +2917,15 @@ def ready():
 # =========================
 @app.post("/chat")
 def chat(request: Request, payload: Dict = Body(...)):
+    perf_t0 = time.time()
+    perf_last = perf_t0
+
+    def perf_step(step: str, **fields):
+        nonlocal perf_last
+        now = time.time()
+        _plog("chat_stage_timing", request_id=request_id, step=step, step_ms=int((now - perf_last) * 1000), total_ms=int((now - perf_t0) * 1000), **fields)
+        perf_last = now
+
     query = _bounded_text(payload.get("query"), MAX_QUERY_CHARS)
     top_k = _bounded_int(payload.get("top_k"), TOP_K, 1, MAX_TOP_K)
     history = (payload.get("history") or [])[:MAX_HISTORY_TURNS] if isinstance(payload.get("history") or [], list) else []
@@ -2833,6 +2935,7 @@ def chat(request: Request, payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload, request.query_params)
     request_id = str(uuid.uuid4())[:8]
     _cleanup_sessions()
+    perf_step("setup", session_id=session_id)
 
     if not query:
         return JSONResponse({"answer": "", "session_id": session_id, "assets": []})
@@ -2844,16 +2947,19 @@ def chat(request: Request, payload: Dict = Body(...)):
     stored_history = _chat_get_session_history(session_id)
     conversation_history = _chat_merge_histories(stored_history, supplied_history)
     conversation_context = _chat_build_conversation_context(conversation_history)
+    perf_step("history", history_turns=len(conversation_history))
     retrieval_query = query
     if conversation_context:
         retrieval_query = f"{query}\n\nRECENT_CONVERSATION:\n{conversation_context}"
     retrieval_query = expand_diadem_retrieval_query(retrieval_query, mode="chat")
 
     matches = get_matches(retrieval_query, top_k, request_id=request_id)
+    perf_step("retrieval", matches=len(matches))
     context = build_context(matches, request_id=request_id) if matches else ""
     asset_matches = _augment_matches_for_assets(query, matches, request_id=request_id)
     assets = _extract_chat_assets(asset_matches, max_items=3, query=query)
     response_contract = _chat_response_contract(query)
+    perf_step("context_assets", context_chars=len(context), assets=len(assets))
 
     user = (
         f"USER_NAME:\n{user_name}\n\n"
@@ -2868,10 +2974,11 @@ def chat(request: Request, payload: Dict = Body(...)):
         messages=[
             {"role": "user", "content": user},
         ],
-        max_tokens=4096,
+        max_tokens=CHAT_MAX_TOKENS,
         system=SYSTEM_PROMPT_CHAT + DIADEM_CALIBRATION_ADDENDUM + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="chat"),
         temperature=0.2,
     )
+    perf_step("model", model=CHAT_MODEL)
 
     answer = _finalize_chat_text((resp.content[0].text or ""), max_questions=1)
     answer = _ensure_diadem_answer_shape(answer, query)
@@ -2881,6 +2988,7 @@ def chat(request: Request, payload: Dict = Body(...)):
         opener = _pick_opener(session_id, user_name, "qa_last_opener")
         answer = _rewrite_bad_opening(answer, opener)
         _chat_save_turn(session_id, query, answer, base_history=conversation_history)
+    perf_step("finalize", answer_chars=len(answer or ""))
 
     return {"answer": answer, "session_id": session_id, "assets": assets}
 
@@ -2937,20 +3045,27 @@ def chat_sse(request: Request, payload: Dict = Body(...)):
                 {"role": "user", "content": user},
             ]
 
-            full_text = "".join(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2))
+            streamed_parts: List[str] = []
+            for part in _iter_text_as_sse_chunks(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2), min_chars=28):
+                streamed_parts.append(part)
+                data = json.dumps({"text": part}, ensure_ascii=False)
+                yield f"event: chunk\ndata: {data}\n\n"
 
+            full_text = "".join(streamed_parts)
             full_text = _finalize_chat_text(full_text, max_questions=1)
             full_text = _ensure_diadem_answer_shape(full_text, query)
         if assets and _looks_like_low_context_deflection(full_text):
             full_text = _chat_practical_fallback(assets)
         if query and not _is_smalltalk(query) and full_text:
             _chat_save_turn(session_id, query, full_text, base_history=conversation_history)
-        chunks = _iter_text_as_sse_chunks([full_text], min_chars=28)
 
-        # Emit chunks
-        for part in chunks:
-            data = json.dumps({"text": part}, ensure_ascii=False)
-            yield f"event: chunk\ndata: {data}\n\n"
+        if not query or _is_smalltalk(query):
+            for part in _iter_text_as_sse_chunks([full_text], min_chars=28):
+                data = json.dumps({"text": part}, ensure_ascii=False)
+                yield f"event: chunk\ndata: {data}\n\n"
+
+        final_payload = json.dumps({"text": full_text, "replace": True}, ensure_ascii=False)
+        yield f"event: final_text\ndata: {final_payload}\n\n"
 
         if assets:
             assets_payload = json.dumps({"assets": assets}, ensure_ascii=False)
@@ -5070,7 +5185,7 @@ def _master_llm_text(
     resp = anthropod.messages.create(
         model=CHAT_MODEL,
         messages=messages,
-        max_tokens=4096,
+        max_tokens=CHAT_MAX_TOKENS,
         system=system_prompt + DIADEM_CALIBRATION_ADDENDUM + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="master"),
         temperature=0.2,
     )
@@ -5875,7 +5990,7 @@ def document_review(payload: Dict = Body(...)):
     resp = anthropod.messages.create(
         model=CHAT_MODEL,
         messages=[{"role": "user", "content": user_prompt}],
-        max_tokens=4096,
+        max_tokens=CHAT_MAX_TOKENS,
         system=DOCUMENT_REVIEW_SYSTEM_PROMPT
         + DIADEM_CALIBRATION_ADDENDUM
         + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="document_review"),
