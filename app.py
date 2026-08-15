@@ -5,16 +5,19 @@ import time
 import random
 import re
 import sqlite3
+import io
+import zipfile
 import urllib.request
 import urllib.parse
 import urllib.error
 import logging
 import threading
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict, deque
 from typing import List, Dict, Any, Optional, Tuple, Mapping
 
-from fastapi import FastAPI, Body, Request
+from fastapi import FastAPI, Body, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -25,6 +28,7 @@ from dotenv import load_dotenv
 from diadem_document_review import (
     DIADEM_CALIBRATION_ADDENDUM,
     DOCUMENT_REVIEW_SYSTEM_PROMPT,
+    MAX_DOCUMENT_REVIEW_CHARS,
     build_document_review_user_prompt,
     classify_document_review,
     extract_document_text,
@@ -102,6 +106,7 @@ MAX_SESSION_ID_CHARS = int(os.getenv("MAX_SESSION_ID_CHARS", "128"))
 MAX_QUERY_CHARS = int(os.getenv("MAX_QUERY_CHARS", "4000"))
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "12"))
 MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", "262144"))
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", "10485760"))
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development").strip().lower() or "development"
 
@@ -447,9 +452,10 @@ async def log_requests(request: Request, call_next):
     perf_t0 = time.time()
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())[:8]
     content_length = request.headers.get("content-length")
+    request_limit = MAX_UPLOAD_BYTES + 1048576 if request.url.path == "/document/review/upload" else MAX_REQUEST_BYTES
     if content_length:
         try:
-            if int(content_length) > MAX_REQUEST_BYTES:
+            if int(content_length) > request_limit:
                 return JSONResponse(
                     {"error": "Request body too large.", "request_id": request_id},
                     status_code=413,
@@ -5948,9 +5954,129 @@ def master_template_sse(payload: Dict = Body(...)):
     return StreamingResponse(gen(), media_type="text/event-stream", headers=_sse_headers())
 
 
-@app.post("/document/review")
-def document_review(payload: Dict = Body(...)):
-    """Review pasted/extracted delegate material using Diadem document-review rules."""
+def _decode_text_bytes(data: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-16", "latin-1"):
+        try:
+            return data.decode(encoding).strip()
+        except Exception:
+            continue
+    return data.decode("utf-8", errors="ignore").strip()
+
+
+def _xml_text(xml_bytes: bytes) -> str:
+    try:
+        root = ET.fromstring(xml_bytes)
+    except Exception:
+        return ""
+    parts: List[str] = []
+    for node in root.iter():
+        if node.text and node.text.strip():
+            parts.append(node.text.strip())
+    return " ".join(parts)
+
+
+def _extract_docx_text(data: bytes) -> str:
+    parts: List[str] = []
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        names = [
+            name
+            for name in zf.namelist()
+            if name.startswith("word/") and name.endswith(".xml") and not name.startswith("word/_rels/")
+        ]
+        for name in sorted(names):
+            if any(skip in name for skip in ("/styles.xml", "/settings.xml", "/fontTable.xml", "/webSettings.xml")):
+                continue
+            text = _xml_text(zf.read(name))
+            if text:
+                parts.append(text)
+    return "\n\n".join(parts).strip()
+
+
+def _ppt_sort_key(name: str) -> Tuple[int, str]:
+    match = re.search(r"slide(\d+)\.xml$", name)
+    return (int(match.group(1)) if match else 9999, name)
+
+
+def _extract_pptx_text(data: bytes) -> str:
+    slide_parts: List[str] = []
+    notes_parts: List[str] = []
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        slide_names = [
+            name for name in zf.namelist()
+            if name.startswith("ppt/slides/slide") and name.endswith(".xml")
+        ]
+        notes_names = [
+            name for name in zf.namelist()
+            if name.startswith("ppt/notesSlides/notesSlide") and name.endswith(".xml")
+        ]
+        for name in sorted(slide_names, key=_ppt_sort_key):
+            text = _xml_text(zf.read(name))
+            if text:
+                slide_no = re.search(r"slide(\d+)\.xml$", name)
+                label = f"Slide {slide_no.group(1)}" if slide_no else name
+                slide_parts.append(f"{label}: {text}")
+        for name in sorted(notes_names, key=_ppt_sort_key):
+            text = _xml_text(zf.read(name))
+            if text:
+                notes_parts.append(text)
+    return "\n\n".join(slide_parts + notes_parts).strip()
+
+
+def _extract_pdf_text(data: bytes) -> str:
+    try:
+        import fitz
+    except Exception as exc:
+        raise ValueError("PDF extraction is not available on this server.") from exc
+
+    parts: List[str] = []
+    with fitz.open(stream=data, filetype="pdf") as doc:
+        for idx, page in enumerate(doc, start=1):
+            text = (page.get_text("text") or "").strip()
+            if text:
+                parts.append(f"Page {idx}:\n{text}")
+            if sum(len(part) for part in parts) >= MAX_DOCUMENT_REVIEW_CHARS:
+                break
+    return "\n\n".join(parts).strip()
+
+
+def _extract_uploaded_document_text(data: bytes, filename: str, content_type: str = "") -> Tuple[str, Dict[str, Any]]:
+    safe_name = os.path.basename(filename or "uploaded_document").strip() or "uploaded_document"
+    ext = os.path.splitext(safe_name)[1].lower()
+    content_type = (content_type or "").lower()
+
+    if ext == ".pdf" or "pdf" in content_type:
+        text = _extract_pdf_text(data)
+        kind = "PDF"
+    elif ext == ".docx" or "wordprocessingml" in content_type:
+        text = _extract_docx_text(data)
+        kind = "Word document"
+    elif ext == ".pptx" or "presentationml" in content_type:
+        text = _extract_pptx_text(data)
+        kind = "PowerPoint deck"
+    elif ext in {".txt", ".md", ".csv", ".tsv", ".srt", ".vtt", ".log"} or content_type.startswith("text/"):
+        text = _decode_text_bytes(data)
+        kind = "text/transcript"
+    else:
+        raise ValueError(
+            "Unsupported file type. Please upload a PDF, .docx, .pptx, .txt, .csv, .srt, or .vtt file."
+        )
+
+    text = re.sub(r"\n{3,}", "\n\n", text or "").strip()[:MAX_DOCUMENT_REVIEW_CHARS]
+    if len(text) < 50:
+        raise ValueError(
+            "I could not extract enough readable text from this file. If it is scanned or image-only, please export it with selectable text or paste the transcript/text."
+        )
+
+    return text, {
+        "file_name": safe_name,
+        "file_type": kind,
+        "content_type": content_type,
+        "bytes_received": len(data),
+        "chars_extracted": len(text),
+    }
+
+
+def _run_document_review(payload: Dict[str, Any]) -> Any:
     session_id = _get_or_create_session_id(payload)
     request_id = str(uuid.uuid4())[:8]
     _cleanup_sessions()
@@ -6004,7 +6130,69 @@ def document_review(payload: Dict = Body(...)):
         "session_id": session_id,
         "classification": classification,
         "assets": assets,
+        "document": payload.get("_document_meta") or {},
     }
+
+
+@app.post("/document/review")
+def document_review(payload: Dict = Body(...)):
+    """Review pasted/extracted delegate material using Diadem document-review rules."""
+    return _run_document_review(payload)
+
+
+@app.post("/document/review/upload")
+def document_review_upload(
+    file: UploadFile = File(...),
+    session_id: str = Form(""),
+    user_name: str = Form(""),
+    review_focus: str = Form(""),
+    situation: str = Form(""),
+    audience: str = Form(""),
+    desired_outcome: str = Form(""),
+    module: str = Form(""),
+    document_type: str = Form(""),
+    top_k: int = Form(TOP_K),
+):
+    """Extract text from an uploaded document and review it with the existing Diadem engine."""
+    data = file.file.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        return JSONResponse(
+            {
+                "text": f"That file is too large for this review endpoint. Please upload a file under {MAX_UPLOAD_BYTES // (1024 * 1024)}MB or paste an extract.",
+                "session_id": session_id,
+                "classification": {},
+                "assets": [],
+            },
+            status_code=413,
+        )
+
+    try:
+        document_text, meta = _extract_uploaded_document_text(data, file.filename or "", file.content_type or "")
+    except ValueError as exc:
+        return JSONResponse(
+            {
+                "text": str(exc),
+                "session_id": session_id,
+                "classification": {},
+                "assets": [],
+            },
+            status_code=400,
+        )
+
+    payload: Dict[str, Any] = {
+        "session_id": session_id,
+        "user_name": user_name,
+        "review_focus": review_focus,
+        "situation": situation,
+        "audience": audience,
+        "desired_outcome": desired_outcome,
+        "module": module,
+        "document_type": document_type or meta["file_type"],
+        "document_text": document_text,
+        "top_k": top_k,
+        "_document_meta": meta,
+    }
+    return _run_document_review(payload)
 
 
 
