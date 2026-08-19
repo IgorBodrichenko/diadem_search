@@ -4084,6 +4084,34 @@ def _ensure_document_review_rewrite(text: str, classification: Mapping[str, str]
     ).strip()
 
 
+def _plain_text_document_review(text: str) -> str:
+    """Make document-review output safe for Bubble plain-text rendering."""
+    t = strip_markdown_chars(text or "")
+    if not t.strip():
+        return ""
+
+    # Convert common Markdown links to their visible label.
+    t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)
+
+    cleaned: List[str] = []
+    for raw in t.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw.rstrip()
+        stripped = line.strip()
+
+        if re.fullmatch(r"[-=]{3,}", stripped):
+            cleaned.append("")
+            continue
+
+        stripped = re.sub(r"^\s{0,3}#{1,6}\s*", "", stripped)
+        stripped = re.sub(r"\s*#{1,6}\s*$", "", stripped)
+        stripped = re.sub(r"^\s*>\s?", "", stripped)
+        cleaned.append(stripped)
+
+    t = "\n".join(cleaned)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
 def _looks_like_low_context_deflection(text: str) -> bool:
     t = (text or "").strip().lower()
     if not t:
@@ -6125,6 +6153,7 @@ def _run_document_review(payload: Dict[str, Any]) -> Any:
 
     text = _finalize_chat_text((resp.content[0].text or ""), max_questions=3)
     text = _ensure_document_review_rewrite(text, classification, document_text)
+    text = _plain_text_document_review(text)
     return {
         "text": text,
         "session_id": session_id,
