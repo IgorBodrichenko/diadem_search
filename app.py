@@ -666,8 +666,20 @@ def _extract_user_key(payload: Dict[str, Any]) -> str:
         "userId",
         "user_unique_id",
         "userUniqueId",
+        "user_uniqueid",
+        "userUniqueID",
+        "bubble_user_id",
+        "bubbleUserId",
         "current_user_id",
         "currentUserId",
+        "current_user_unique_id",
+        "currentUserUniqueId",
+        "current_user_uniqueid",
+        "currentUserUniqueID",
+        "current_user",
+        "currentUser",
+        "owner_id",
+        "ownerId",
         "user_email",
         "userEmail",
         "current_user_email",
@@ -2985,8 +2997,6 @@ def _save_document_memory(
 
 
 def _chat_document_memory_context(session_id: str, query: str, user_key: str = "") -> str:
-    if not _document_memory_trigger(query):
-        return ""
     memory = None
     if session_id:
         entry = _db_get(session_id) or {}
@@ -2997,9 +3007,17 @@ def _chat_document_memory_context(session_id: str, query: str, user_key: str = "
     if not isinstance(memory, dict):
         return ""
 
+    document_related = _document_memory_trigger(query)
     classification = memory.get("classification") if isinstance(memory.get("classification"), dict) else {}
     parts = [
         "RECENT_UPLOADED_DOCUMENT:",
+        (
+            "Use this context when the user refers to an uploaded or attached document, asks for a document "
+            "review, requests edits or improvements, or makes a vague follow-up such as 'make it sharper', "
+            "'shorter', 'try again', 'what about the headline', 'this', 'that', or 'it'. If the new message is "
+            "clearly unrelated, ignore this context."
+        ),
+        f"Current message appears document-related: {'yes' if document_related else 'unclear'}",
         f"File: {memory.get('file_name') or 'uploaded document'}",
         f"Document type: {classification.get('document_type') or ''}",
         f"Likely module: {classification.get('likely_module') or ''}",
