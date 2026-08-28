@@ -106,7 +106,7 @@ MAX_SESSION_ID_CHARS = int(os.getenv("MAX_SESSION_ID_CHARS", "128"))
 MAX_QUERY_CHARS = int(os.getenv("MAX_QUERY_CHARS", "4000"))
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "12"))
 MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", "262144"))
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", "10485760"))
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", "52428800"))
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development").strip().lower() or "development"
 
@@ -2086,11 +2086,17 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
 def _reflect_line() -> str:
     return random.choice(["Got it.", "Okay.", "Thanks — noted.", "Understood.", "That helps."])
 
-def _retrieve_info_for_coach(mode: str, query: str, top_k: int) -> str:
+def _retrieve_info_and_assets_for_coach(mode: str, query: str, top_k: int) -> Tuple[str, List[Dict[str, Any]]]:
     rag_query = f"{mode}: {query}"
     request_id = str(uuid.uuid4())[:8]
     matches = get_matches(rag_query, top_k, request_id=request_id)
-    return build_context(matches, request_id=request_id)
+    info = build_context(matches, request_id=request_id)
+    assets = _extract_chat_assets(matches, max_items=3, query=rag_query)
+    return info, assets
+
+def _retrieve_info_for_coach(mode: str, query: str, top_k: int) -> str:
+    info, _assets = _retrieve_info_and_assets_for_coach(mode, query, top_k)
+    return info
 
 def _make_final_user_message(mode: str, state: Dict[str, Any], info: str, user_name: str) -> str:
     tpl = TEMPLATES[mode]
@@ -2541,7 +2547,7 @@ def _checkpoint_prompt() -> str:
 
 def _generate_final(mode: str, state: Dict[str, Any], top_k: int, user_name: str, session_id: str) -> Dict[str, Any]:
     _jlog("final_generate", session_id=session_id, mode=mode)
-    info = _retrieve_info_for_coach(mode, "final summary", top_k)
+    info, assets = _retrieve_info_and_assets_for_coach(mode, "final summary", top_k)
     final_user = _make_final_user_message(mode, state, info, user_name=user_name)
     resp_llm = anthropod.messages.create(
         model=CHAT_MODEL,
@@ -2558,7 +2564,7 @@ def _generate_final(mode: str, state: Dict[str, Any], top_k: int, user_name: str
 
     state["template_done"] = True
     _save_state(session_id, state)
-    return {"text": text, "session_id": session_id, "done": True}
+    return {"text": text, "session_id": session_id, "done": True, "assets": assets}
 
 def _parse_yes_no(text: str) -> Optional[bool]:
     t = (text or "").strip()
@@ -3093,10 +3099,12 @@ def coach_chat(payload: Dict = Body(...)):
     session_id = _get_or_create_session_id(payload)
     try:
         out = coach_turn_server_state(payload, session_id=session_id, stream=False)
+        if isinstance(out, dict) and "assets" not in out:
+            out["assets"] = []
         return JSONResponse(out)
     except Exception as e:
         _jlog("coach_chat_error", session_id=session_id, err=str(e))
-        return JSONResponse({"text": "Server error.", "session_id": session_id, "done": False}, status_code=500)
+        return JSONResponse({"text": "Server error.", "session_id": session_id, "done": False, "assets": []}, status_code=500)
 
 
 @app.post("/coach/sse")
@@ -3119,16 +3127,21 @@ def coach_sse(payload: Dict = Body(...)):
                 result = coach_turn_server_state(payload, session_id=session_id, stream=False)
             except Exception as e:
                 _jlog("coach_sse_error", session_id=session_id, err=str(e))
-                result = {"text": "Server error.", "session_id": session_id, "done": False}
+                result = {"text": "Server error.", "session_id": session_id, "done": False, "assets": []}
 
             # гарантируем dict
             if not isinstance(result, dict):
-                result = {"text": "Internal error.", "done": False}
+                result = {"text": "Internal error.", "done": False, "assets": []}
+            assets = result.get("assets") or []
 
             chunk_payload = json.dumps({"text": result.get("text", "")}, ensure_ascii=False)
             yield f"event: chunk\ndata: {chunk_payload}\n\n"
 
-            done_payload = json.dumps({"done": bool(result.get("done"))}, ensure_ascii=False)
+            if assets:
+                assets_payload = json.dumps({"assets": assets}, ensure_ascii=False)
+                yield f"event: assets\ndata: {assets_payload}\n\n"
+
+            done_payload = json.dumps({"done": bool(result.get("done")), "assets": assets}, ensure_ascii=False)
             yield f"event: done\ndata: {done_payload}\n\n"
 
         except Exception as e:
@@ -3138,7 +3151,7 @@ def coach_sse(payload: Dict = Body(...)):
             err_chunk = json.dumps({"text": "Internal error. Please retry."}, ensure_ascii=False)
             yield f"event: chunk\ndata: {err_chunk}\n\n"
 
-            err_done = json.dumps({"done": True}, ensure_ascii=False)
+            err_done = json.dumps({"done": True, "assets": []}, ensure_ascii=False)
             yield f"event: done\ndata: {err_done}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers())
