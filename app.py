@@ -6294,6 +6294,10 @@ def document_review(payload: Dict = Body(...)):
 def document_review_upload(
     file: UploadFile = File(...),
     session_id: str = Form(""),
+    sessionId: str = Form(""),
+    chat_id: str = Form(""),
+    chatId: str = Form(""),
+    chat: str = Form(""),
     user_name: str = Form(""),
     review_focus: str = Form(""),
     situation: str = Form(""),
@@ -6329,8 +6333,10 @@ def document_review_upload(
             status_code=400,
         )
 
+    resolved_session_id = session_id or sessionId or chat_id or chatId or chat
+
     payload: Dict[str, Any] = {
-        "session_id": session_id,
+        "session_id": resolved_session_id,
         "user_name": user_name,
         "review_focus": review_focus,
         "situation": situation,
