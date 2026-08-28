@@ -4,6 +4,7 @@ import uuid
 import time
 import random
 import re
+import hashlib
 import sqlite3
 import io
 import zipfile
@@ -656,6 +657,32 @@ def _extract_user_name(payload: Dict[str, Any]) -> str:
 
 
 _FALSEY_STRS = {"false", "true", "null", "none", "undefined", ""}
+
+
+def _extract_user_key(payload: Dict[str, Any]) -> str:
+    """Return a stable, non-display user identifier for private per-user memory."""
+    for key in (
+        "user_id",
+        "userId",
+        "user_unique_id",
+        "userUniqueId",
+        "current_user_id",
+        "currentUserId",
+        "user_email",
+        "userEmail",
+        "current_user_email",
+        "currentUserEmail",
+        "email",
+    ):
+        value = _safe_str(payload.get(key))
+        if value and value.lower() not in _FALSEY_STRS:
+            return value.lower()
+    return ""
+
+
+def _user_document_memory_session_id(user_key: str) -> str:
+    digest = hashlib.sha256(user_key.encode("utf-8")).hexdigest()[:32]
+    return f"userdoc:{digest}"
 
 
 def _extract_user_text(payload: Dict[str, Any]) -> str:
@@ -2922,13 +2949,13 @@ def _save_document_memory(
     meta: Optional[Mapping[str, Any]] = None,
     classification: Optional[Mapping[str, Any]] = None,
     review_focus: str = "",
+    user_key: str = "",
 ) -> None:
     if not session_id or not document_text:
         return
     meta = meta or {}
     classification = classification or {}
-    entry = _db_get(session_id) or {}
-    entry["last_document_review"] = {
+    memory = {
         "file_name": _bounded_text(meta.get("file_name") or meta.get("filename") or "", 240),
         "file_type": _bounded_text(meta.get("file_type") or meta.get("content_type") or "", 120),
         "review_focus": _bounded_text(review_focus, MAX_QUERY_CHARS),
@@ -2941,15 +2968,32 @@ def _save_document_memory(
         "review_summary": _bounded_text(review_text, MAX_DOCUMENT_REVIEW_MEMORY_CHARS),
         "uploaded_at": _now(),
     }
-    entry["updated_at"] = _now()
-    _db_set(session_id, entry)
+    for memory_session_id in [session_id, _user_document_memory_session_id(user_key) if user_key else ""]:
+        if not memory_session_id:
+            continue
+        entry = _db_get(memory_session_id) or {}
+        entry["last_document_review"] = memory
+        entry["updated_at"] = _now()
+        _db_set(memory_session_id, entry)
+    _jlog(
+        "document_memory_saved",
+        session_id=session_id,
+        user_memory=bool(user_key),
+        document_chars=len(document_text),
+        review_chars=len(review_text or ""),
+    )
 
 
-def _chat_document_memory_context(session_id: str, query: str) -> str:
-    if not session_id or not _document_memory_trigger(query):
+def _chat_document_memory_context(session_id: str, query: str, user_key: str = "") -> str:
+    if not _document_memory_trigger(query):
         return ""
-    entry = _db_get(session_id) or {}
-    memory = entry.get("last_document_review")
+    memory = None
+    if session_id:
+        entry = _db_get(session_id) or {}
+        memory = entry.get("last_document_review")
+    if not isinstance(memory, dict) and user_key:
+        entry = _db_get(_user_document_memory_session_id(user_key)) or {}
+        memory = entry.get("last_document_review")
     if not isinstance(memory, dict):
         return ""
 
@@ -3030,6 +3074,7 @@ def chat(request: Request, payload: Dict = Body(...)):
     top_k = _bounded_int(payload.get("top_k"), TOP_K, 1, MAX_TOP_K)
     history = (payload.get("history") or [])[:MAX_HISTORY_TURNS] if isinstance(payload.get("history") or [], list) else []
     user_name = _extract_user_name(payload)
+    user_key = _extract_user_key(payload)
     admin_prompt, summary_guidance_all = _extract_admin_settings(payload)
 
     session_id = _get_or_create_session_id(payload, request.query_params)
@@ -3047,7 +3092,7 @@ def chat(request: Request, payload: Dict = Body(...)):
     stored_history = _chat_get_session_history(session_id)
     conversation_history = _chat_merge_histories(stored_history, supplied_history)
     conversation_context = _chat_build_conversation_context(conversation_history)
-    document_memory_context = _chat_document_memory_context(session_id, query)
+    document_memory_context = _chat_document_memory_context(session_id, query, user_key=user_key)
     perf_step("history", history_turns=len(conversation_history), document_memory=bool(document_memory_context))
     retrieval_query = query
     if conversation_context:
@@ -3107,6 +3152,7 @@ def chat_sse(request: Request, payload: Dict = Body(...)):
     top_k = _bounded_int(payload.get("top_k"), TOP_K, 1, MAX_TOP_K)
     history = (payload.get("history") or [])[:MAX_HISTORY_TURNS] if isinstance(payload.get("history") or [], list) else []
     user_name = _extract_user_name(payload)
+    user_key = _extract_user_key(payload)
     admin_prompt, summary_guidance_all = _extract_admin_settings(payload)
 
     def gen():
@@ -3126,7 +3172,7 @@ def chat_sse(request: Request, payload: Dict = Body(...)):
             stored_history = _chat_get_session_history(session_id)
             conversation_history = _chat_merge_histories(stored_history, supplied_history)
             conversation_context = _chat_build_conversation_context(conversation_history)
-            document_memory_context = _chat_document_memory_context(session_id, query)
+            document_memory_context = _chat_document_memory_context(session_id, query, user_key=user_key)
             retrieval_query = query
             if conversation_context:
                 retrieval_query = f"{query}\n\nRECENT_CONVERSATION:\n{conversation_context}"
@@ -6215,6 +6261,7 @@ def _extract_uploaded_document_text(data: bytes, filename: str, content_type: st
 
 def _run_document_review(payload: Dict[str, Any]) -> Any:
     session_id = _get_or_create_session_id(payload)
+    user_key = _extract_user_key(payload)
     request_id = str(uuid.uuid4())[:8]
     _cleanup_sessions()
 
@@ -6273,11 +6320,14 @@ def _run_document_review(payload: Dict[str, Any]) -> Any:
         meta=document_meta,
         classification=classification,
         review_focus=review_focus,
+        user_key=user_key,
     )
     _chat_save_turn(session_id, document_user_msg, text)
     return {
         "text": text,
         "session_id": session_id,
+        "memory_saved": True,
+        "memory_keyed_to_user": bool(user_key),
         "classification": classification,
         "assets": assets,
         "document": document_meta,
@@ -6298,6 +6348,17 @@ def document_review_upload(
     chat_id: str = Form(""),
     chatId: str = Form(""),
     chat: str = Form(""),
+    user_id: str = Form(""),
+    userId: str = Form(""),
+    user_unique_id: str = Form(""),
+    userUniqueId: str = Form(""),
+    current_user_id: str = Form(""),
+    currentUserId: str = Form(""),
+    user_email: str = Form(""),
+    userEmail: str = Form(""),
+    current_user_email: str = Form(""),
+    currentUserEmail: str = Form(""),
+    email: str = Form(""),
     user_name: str = Form(""),
     review_focus: str = Form(""),
     situation: str = Form(""),
@@ -6337,6 +6398,17 @@ def document_review_upload(
 
     payload: Dict[str, Any] = {
         "session_id": resolved_session_id,
+        "user_id": user_id,
+        "userId": userId,
+        "user_unique_id": user_unique_id,
+        "userUniqueId": userUniqueId,
+        "current_user_id": current_user_id,
+        "currentUserId": currentUserId,
+        "user_email": user_email,
+        "userEmail": userEmail,
+        "current_user_email": current_user_email,
+        "currentUserEmail": currentUserEmail,
+        "email": email,
         "user_name": user_name,
         "review_focus": review_focus,
         "situation": situation,
