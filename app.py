@@ -107,6 +107,8 @@ MAX_QUERY_CHARS = int(os.getenv("MAX_QUERY_CHARS", "4000"))
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "12"))
 MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", "262144"))
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", "52428800"))
+MAX_DOCUMENT_MEMORY_CHARS = int(os.getenv("MAX_DOCUMENT_MEMORY_CHARS", "6000"))
+MAX_DOCUMENT_REVIEW_MEMORY_CHARS = int(os.getenv("MAX_DOCUMENT_REVIEW_MEMORY_CHARS", "2400"))
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development").strip().lower() or "development"
 
@@ -2883,6 +2885,92 @@ def _chat_save_turn(session_id: str, user_msg: str, assistant_msg: str, base_his
     _db_set(session_id, entry)
 
 
+def _document_memory_trigger(query: str) -> bool:
+    q = (query or "").strip().lower()
+    if not q:
+        return False
+    return any(
+        term in q
+        for term in (
+            "document",
+            "file",
+            "upload",
+            "proposal",
+            "deck",
+            "slides",
+            "transcript",
+            "headlines",
+            "review",
+            "rewrite",
+            "improve",
+            "change",
+            "make it",
+            "this",
+            "that",
+            "it",
+            "above",
+            "attached",
+            "previous",
+        )
+    )
+
+
+def _save_document_memory(
+    session_id: str,
+    document_text: str,
+    review_text: str,
+    meta: Optional[Mapping[str, Any]] = None,
+    classification: Optional[Mapping[str, Any]] = None,
+    review_focus: str = "",
+) -> None:
+    if not session_id or not document_text:
+        return
+    meta = meta or {}
+    classification = classification or {}
+    entry = _db_get(session_id) or {}
+    entry["last_document_review"] = {
+        "file_name": _bounded_text(meta.get("file_name") or meta.get("filename") or "", 240),
+        "file_type": _bounded_text(meta.get("file_type") or meta.get("content_type") or "", 120),
+        "review_focus": _bounded_text(review_focus, MAX_QUERY_CHARS),
+        "classification": {
+            "document_type": _bounded_text(classification.get("document_type"), 160),
+            "likely_module": _bounded_text(classification.get("likely_module"), 160),
+            "condition": _bounded_text(classification.get("condition"), 160),
+        },
+        "document_excerpt": _bounded_text(document_text, MAX_DOCUMENT_MEMORY_CHARS),
+        "review_summary": _bounded_text(review_text, MAX_DOCUMENT_REVIEW_MEMORY_CHARS),
+        "uploaded_at": _now(),
+    }
+    entry["updated_at"] = _now()
+    _db_set(session_id, entry)
+
+
+def _chat_document_memory_context(session_id: str, query: str) -> str:
+    if not session_id or not _document_memory_trigger(query):
+        return ""
+    entry = _db_get(session_id) or {}
+    memory = entry.get("last_document_review")
+    if not isinstance(memory, dict):
+        return ""
+
+    classification = memory.get("classification") if isinstance(memory.get("classification"), dict) else {}
+    parts = [
+        "RECENT_UPLOADED_DOCUMENT:",
+        f"File: {memory.get('file_name') or 'uploaded document'}",
+        f"Document type: {classification.get('document_type') or ''}",
+        f"Likely module: {classification.get('likely_module') or ''}",
+        f"Condition: {classification.get('condition') or ''}",
+        f"User review focus: {memory.get('review_focus') or ''}",
+        "",
+        "Previous document review:",
+        str(memory.get("review_summary") or ""),
+        "",
+        "Document excerpt for follow-up questions:",
+        str(memory.get("document_excerpt") or ""),
+    ]
+    return "\n".join(parts).strip()
+
+
 @app.get("/health")
 def health():
     required_config = {
@@ -2959,10 +3047,13 @@ def chat(request: Request, payload: Dict = Body(...)):
     stored_history = _chat_get_session_history(session_id)
     conversation_history = _chat_merge_histories(stored_history, supplied_history)
     conversation_context = _chat_build_conversation_context(conversation_history)
-    perf_step("history", history_turns=len(conversation_history))
+    document_memory_context = _chat_document_memory_context(session_id, query)
+    perf_step("history", history_turns=len(conversation_history), document_memory=bool(document_memory_context))
     retrieval_query = query
     if conversation_context:
         retrieval_query = f"{query}\n\nRECENT_CONVERSATION:\n{conversation_context}"
+    if document_memory_context:
+        retrieval_query = f"{retrieval_query}\n\n{document_memory_context}"
     retrieval_query = expand_diadem_retrieval_query(retrieval_query, mode="chat")
 
     matches = get_matches(retrieval_query, top_k, request_id=request_id)
@@ -2977,6 +3068,7 @@ def chat(request: Request, payload: Dict = Body(...)):
         f"USER_NAME:\n{user_name}\n\n"
         f"QUESTION:\n{query}\n\n"
         f"CONVERSATION_CONTEXT:\n{conversation_context}\n\n"
+        f"DOCUMENT_CONTEXT:\n{document_memory_context}\n\n"
         f"INFORMATION:\n{context}\n\n"
         f"RESPONSE_CONTRACT:\n{response_contract}"
     )
@@ -3034,9 +3126,12 @@ def chat_sse(request: Request, payload: Dict = Body(...)):
             stored_history = _chat_get_session_history(session_id)
             conversation_history = _chat_merge_histories(stored_history, supplied_history)
             conversation_context = _chat_build_conversation_context(conversation_history)
+            document_memory_context = _chat_document_memory_context(session_id, query)
             retrieval_query = query
             if conversation_context:
                 retrieval_query = f"{query}\n\nRECENT_CONVERSATION:\n{conversation_context}"
+            if document_memory_context:
+                retrieval_query = f"{retrieval_query}\n\n{document_memory_context}"
             retrieval_query = expand_diadem_retrieval_query(retrieval_query, mode="chat")
 
             matches = get_matches(retrieval_query, top_k, request_id=request_id)
@@ -3049,6 +3144,7 @@ def chat_sse(request: Request, payload: Dict = Body(...)):
                 f"USER_NAME:\n{user_name}\n\n"
                 f"QUESTION:\n{query}\n\n"
                 f"CONVERSATION_CONTEXT:\n{conversation_context}\n\n"
+                f"DOCUMENT_CONTEXT:\n{document_memory_context}\n\n"
                 f"INFORMATION:\n{context}\n\n"
                 f"RESPONSE_CONTRACT:\n{response_contract}"
             )
@@ -6167,12 +6263,24 @@ def _run_document_review(payload: Dict[str, Any]) -> Any:
     text = _finalize_chat_text((resp.content[0].text or ""), max_questions=3)
     text = _ensure_document_review_rewrite(text, classification, document_text)
     text = _plain_text_document_review(text)
+    document_meta = payload.get("_document_meta") or {}
+    document_label = document_meta.get("file_name") or document_meta.get("filename") or "uploaded document"
+    document_user_msg = review_focus or f"Review uploaded document: {document_label}"
+    _save_document_memory(
+        session_id=session_id,
+        document_text=document_text,
+        review_text=text,
+        meta=document_meta,
+        classification=classification,
+        review_focus=review_focus,
+    )
+    _chat_save_turn(session_id, document_user_msg, text)
     return {
         "text": text,
         "session_id": session_id,
         "classification": classification,
         "assets": assets,
-        "document": payload.get("_document_meta") or {},
+        "document": document_meta,
     }
 
 

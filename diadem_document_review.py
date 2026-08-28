@@ -205,7 +205,7 @@ DOCUMENT TEXT:
 {document_text}
 
 TASK:
-Review the material using the required Diadem document-review format. If the missing qualifying inputs materially limit the review, ask up to three qualifying questions first; otherwise proceed and state your assumptions briefly.
+Review the material using the required Diadem document-review format. If the user supplied a Main concern or User question, treat it as the review brief and prioritise that specific request over generic document feedback. If no review brief is supplied, make a short, clearly labelled assumption about the most useful review angle. If the missing qualifying inputs materially limit the review, ask up to three qualifying questions first; otherwise proceed and state your assumptions briefly.
 
 If this is a sales deck, written proposal, recommendation, or STRONG Selling review, include at least one explicit rewrite with exact labels:
 Before: [the weak or generic version]
