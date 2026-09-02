@@ -121,6 +121,9 @@ MULTI_QUERY_K = int(os.getenv("MULTI_QUERY_K", "3"))
 DIVERSITY_SAME_SOURCE_CAP = int(os.getenv("DIVERSITY_SAME_SOURCE_CAP", "3"))
 RETRIEVAL_MAX_WORKERS = int(os.getenv("RETRIEVAL_MAX_WORKERS", "3"))
 EMBED_CACHE_MAX = int(os.getenv("EMBED_CACHE_MAX", "512"))
+RETRIEVAL_CACHE_TTL_SECONDS = int(os.getenv("RETRIEVAL_CACHE_TTL_SECONDS", "120"))
+RETRIEVAL_CACHE_MAX = int(os.getenv("RETRIEVAL_CACHE_MAX", "256"))
+ENABLE_PROMPT_CACHE = os.getenv("ENABLE_PROMPT_CACHE", "1").strip().lower() in ("1", "true", "yes", "y", "on")
 ENABLE_ASSET_AUGMENT_RETRIEVAL = os.getenv("ENABLE_ASSET_AUGMENT_RETRIEVAL", "1").strip().lower() in ("1","true","yes","y","on")
 
 # Priority boost for specific documents (e.g., Negotiation.pdf vectors tagged with metadata priority=2)
@@ -330,6 +333,19 @@ _jlog(
 # =========================
 # CLAUDE STREAM HELPERS (SSE)
 # =========================
+def _claude_system(system_prompt: Optional[str]):
+    """Return the same system prompt with an Anthropic cache breakpoint."""
+    if not system_prompt or not ENABLE_PROMPT_CACHE:
+        return system_prompt
+    return [
+        {
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+
+
 def _openai_stream_text(messages: List[Dict[str, str]], model: str, temperature: float = 0.2):
     """Yield incremental text deltas from Claude API with robust system-message handling."""
     system_parts: List[str] = []
@@ -357,7 +373,7 @@ def _openai_stream_text(messages: List[Dict[str, str]], model: str, temperature:
             "temperature": temperature,
         }
         if system_prompt:
-            stream_kwargs["system"] = system_prompt
+            stream_kwargs["system"] = _claude_system(system_prompt)
 
         with anthropod.messages.stream(**stream_kwargs) as stream:
             for text in stream.text_stream:
@@ -374,7 +390,7 @@ def _openai_stream_text(messages: List[Dict[str, str]], model: str, temperature:
                 "temperature": temperature,
             }
             if system_prompt:
-                create_kwargs["system"] = system_prompt
+                create_kwargs["system"] = _claude_system(system_prompt)
 
             resp = anthropod.messages.create(**create_kwargs)
             full = (resp.content[0].text or "")
@@ -1087,10 +1103,38 @@ def _tactics_instruction(text: str) -> str:
 # =========================
 _EMBED_CACHE: Dict[Tuple[str, int, str], Tuple[float, ...]] = {}
 _EMBED_CACHE_LOCK = threading.Lock()
+_RETRIEVAL_CACHE: Dict[Tuple[str, int], Tuple[float, List[Dict]]] = {}
+_RETRIEVAL_CACHE_LOCK = threading.Lock()
 
 
 def _embed_cache_key(text: str) -> Tuple[str, int, str]:
     return (EMBED_MODEL, EMBED_QUERY_DIM, text)
+
+
+def _retrieval_cache_get(query: str, top_k: int) -> Optional[List[Dict]]:
+    if RETRIEVAL_CACHE_TTL_SECONDS <= 0:
+        return None
+    key = (query.casefold(), top_k)
+    with _RETRIEVAL_CACHE_LOCK:
+        cached = _RETRIEVAL_CACHE.get(key)
+        if cached is None:
+            return None
+        created_at, matches = cached
+        if time.monotonic() - created_at > RETRIEVAL_CACHE_TTL_SECONDS:
+            _RETRIEVAL_CACHE.pop(key, None)
+            return None
+        return list(matches)
+
+
+def _retrieval_cache_set(query: str, top_k: int, matches: List[Dict]) -> None:
+    if RETRIEVAL_CACHE_TTL_SECONDS <= 0:
+        return
+    key = (query.casefold(), top_k)
+    with _RETRIEVAL_CACHE_LOCK:
+        if len(_RETRIEVAL_CACHE) >= RETRIEVAL_CACHE_MAX:
+            oldest = min(_RETRIEVAL_CACHE, key=lambda item: _RETRIEVAL_CACHE[item][0])
+            _RETRIEVAL_CACHE.pop(oldest, None)
+        _RETRIEVAL_CACHE[key] = (time.monotonic(), list(matches))
 
 
 def embed_queries(texts: List[str]) -> List[List[float]]:
@@ -1996,6 +2040,11 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
     if request_id is None:
         request_id = str(uuid.uuid4())[:8]
 
+    cached = _retrieval_cache_get(q_clean, top_k_final)
+    if cached is not None:
+        _plog("retrieval_timing", request_id=request_id, elapsed_ms=0, query_count=0, final_count=len(cached), reason="cache_hit")
+        return cached
+
     _slog("search_start",
           request_id=request_id,
           query=q_clean,
@@ -2110,6 +2159,7 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
               kept=len(reranked),
               reason="hint_override")
         _plog("retrieval_timing", request_id=request_id, elapsed_ms=int((time.time() - perf_t0) * 1000), query_count=len(queries), final_count=len(reranked), reason="hint_override")
+        _retrieval_cache_set(q_clean, top_k_final, reranked)
         return reranked
 
     relevant = is_context_relevant(q_clean, reranked)
@@ -2119,9 +2169,11 @@ def get_matches(query: str, top_k_final: int, request_id: Optional[str] = None) 
           kept=len(reranked))
     if not relevant:
         _plog("retrieval_timing", request_id=request_id, elapsed_ms=int((time.time() - perf_t0) * 1000), query_count=len(queries), final_count=0, reason="not_relevant")
+        _retrieval_cache_set(q_clean, top_k_final, [])
         return []
 
     _plog("retrieval_timing", request_id=request_id, elapsed_ms=int((time.time() - perf_t0) * 1000), query_count=len(queries), final_count=len(reranked), reason="relevant")
+    _retrieval_cache_set(q_clean, top_k_final, reranked)
     return reranked
 
 def _reflect_line() -> str:
@@ -2596,7 +2648,7 @@ def _generate_final(mode: str, state: Dict[str, Any], top_k: int, user_name: str
             {"role": "user", "content": final_user},
         ],
         max_tokens=CHAT_MAX_TOKENS,
-        system=SYSTEM_PROMPT_COACH_FINAL,
+        system=_claude_system(SYSTEM_PROMPT_COACH_FINAL),
         temperature=0.2,
     )
     text = strip_markdown_chars((resp_llm.content[0].text or "").strip())
@@ -3142,7 +3194,7 @@ def chat(request: Request, payload: Dict = Body(...)):
             {"role": "user", "content": user},
         ],
         max_tokens=CHAT_MAX_TOKENS,
-        system=SYSTEM_PROMPT_CHAT + DIADEM_CALIBRATION_ADDENDUM + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="chat"),
+        system=_claude_system(SYSTEM_PROMPT_CHAT + DIADEM_CALIBRATION_ADDENDUM + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="chat")),
         temperature=0.2,
     )
     perf_step("model", model=CHAT_MODEL)
@@ -5393,7 +5445,7 @@ def _master_llm_text(
         model=CHAT_MODEL,
         messages=messages,
         max_tokens=CHAT_MAX_TOKENS,
-        system=system_prompt + DIADEM_CALIBRATION_ADDENDUM + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="master"),
+        system=_claude_system(system_prompt + DIADEM_CALIBRATION_ADDENDUM + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="master")),
         temperature=0.2,
     )
     text = _finalize_master_text((resp.content[0].text or ""), max_words=320)
@@ -6319,9 +6371,11 @@ def _run_document_review(payload: Dict[str, Any]) -> Any:
         model=CHAT_MODEL,
         messages=[{"role": "user", "content": user_prompt}],
         max_tokens=CHAT_MAX_TOKENS,
-        system=DOCUMENT_REVIEW_SYSTEM_PROMPT
-        + DIADEM_CALIBRATION_ADDENDUM
-        + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="document_review"),
+        system=_claude_system(
+            DOCUMENT_REVIEW_SYSTEM_PROMPT
+            + DIADEM_CALIBRATION_ADDENDUM
+            + _build_admin_system_addendum(admin_prompt, summary_guidance_all, mode_label="document_review")
+        ),
         temperature=0.2,
     )
 
