@@ -207,4 +207,3 @@ The remaining major delay is full model generation. Safe next steps are:
 - Evaluate shorter answer contracts using the production quality test set.
 - Consider a faster model only after side-by-side quality evaluation; do not
   switch models solely for latency.
-
