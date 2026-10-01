@@ -36,6 +36,13 @@ from diadem_document_review import (
     first_present,
 )
 from retrieval_expansion import expand_diadem_retrieval_query
+from diadem_feedback_rules import (
+    asset_preference_score,
+    asset_search_queries,
+    contextual_resource_query,
+    response_instruction,
+    reviewed_intent,
+)
 load_dotenv()
 # =========================
 # DEBUG / LOGGING
@@ -885,6 +892,17 @@ def _norm_q(s: str) -> str:
 
 SEARCH_HINTS = [
     {
+        "match_any": [
+            "rude", "bullying", "belittle", "undermine", "incompetent",
+            "dominating the meeting", "talking over me", "ignore them",
+        ],
+        "hint": "Master Negotiator Slides Five Elements pages 28 33 tactics preparation AIR page 34",
+    },
+    {
+        "match_any": ["cpi", "power sits with", "all the power"],
+        "hint": "Master Negotiator Variables Planner Low High Highest balanced playing field page 6",
+    },
+    {
         "match_any": ["balance the power in a negotiation", "balance power in a negotiation", "balance the power"],
         "hint": "balanced playing field confident mindset ABC model pages 6 14",
     },
@@ -965,6 +983,17 @@ def _hint_for_question(question: str) -> str:
     return ""
 
 TACTICS_QUERY_PHRASES = [
+    "rude",
+    "bully",
+    "bullying",
+    "belittle",
+    "undermine",
+    "incompetent",
+    "dominating the meeting",
+    "talking over me",
+    "cut me off",
+    "steamroll",
+    "ignore them",
     "buyer uses tactics",
     "using tactics",
     "uses tactics",
@@ -1460,6 +1489,8 @@ def _diadem_retrieval_profile(query: str) -> Dict[str, Any]:
         "volume", "walk-away", "walk away", "anchor", "anchoring", "procurement",
         "deadline", "final offer", "take it or leave it", "master", "graphite",
         "scope", "scope creep", "free", "extra", "additional", "more work",
+        "cpi", "rude", "bully", "bullying", "belittle", "undermine", "incompetent",
+        "dominating", "talk over", "steamroll", "five elements",
     ]
     selling_terms = [
         "sell", "selling", "sales", "customer", "proposal", "recommendation", "pitch",
@@ -1619,6 +1650,7 @@ def _diadem_match_bonus(profile: Dict[str, Any], md: Dict[str, Any], text: str) 
 
 def _curated_asset_bonus(query: str, page: Any, text: str) -> float:
     """Small resource-serving boosts based on the Q&A calibration documents."""
+    reviewed_bonus = asset_preference_score(query, page, text)
     q = (query or "").lower()
     tlow = (text or "").lower()
     profile = _diadem_retrieval_profile(query)
@@ -1638,25 +1670,25 @@ def _curated_asset_bonus(query: str, page: Any, text: str) -> float:
     )
     if confidence_query and master_context:
         if p == 14 or "preparing a confident mindset" in tlow:
-            return 12.0
+            return 12.0 + reviewed_bonus
         if p == 2 or "optimal performance correlates to stretch zone" in tlow:
-            return 10.0
+            return 10.0 + reviewed_bonus
         if p == 6 or "abc" in tlow or "balanced playing field" in tlow:
-            return 2.0
+            return 2.0 + reviewed_bonus
         if p in {51, 73} or "preparing for graphite" in tlow or "preparing for diamond" in tlow:
-            return -4.0
+            return -4.0 + reviewed_bonus
 
     if confidence_query and primary == "presenting":
         if p == 21 or "emotional regulation" in tlow:
-            return 12.0
+            return 12.0 + reviewed_bonus
         if p == 19 or "inner voice" in tlow:
-            return 10.0
+            return 10.0 + reviewed_bonus
         if p == 15 or "stretch zone" in tlow or "panic zone" in tlow:
-            return 8.0
+            return 8.0 + reviewed_bonus
         if "preparing a confident mindset" in tlow or "master negotiator" in tlow:
-            return -12.0
+            return -12.0 + reviewed_bonus
 
-    return 0.0
+    return reviewed_bonus
 
 
 def _rerank(query: str, matches: List[Dict], final_k: int) -> List[Dict]:
@@ -1995,7 +2027,10 @@ def _augment_matches_for_assets(query: str, matches: List[Dict], request_id: str
         term in q
         for term in ("nervous", "nerve", "confidence", "confident", "mindset", "headspace", "anxious", "anxiety")
     )
-    if confidence_query and primary == "presenting":
+    reviewed_queries = asset_search_queries(query)
+    if reviewed_queries:
+        extra_queries = reviewed_queries
+    elif confidence_query and primary == "presenting":
         extra_queries = [
             "Inspired Presenting Emotional Regulation Preparation confidence audience yourself inner voice",
             "Inspired Presenting Tune Into Your Inner Voice flip negative thoughts positive thoughts",
@@ -2460,6 +2495,9 @@ def _chat_response_contract(query: str) -> str:
             "Use the module language explicitly enough that the answer feels like Diadem, not generic coaching."
         )
 
+    reviewed_requirement = response_instruction(query)
+    if reviewed_requirement:
+        return f"{module}\n\n{common}\n\n{reviewed_requirement}"
     return f"{module}\n\n{common}"
 
 
@@ -3085,6 +3123,16 @@ def _chat_document_memory_context(session_id: str, query: str, user_key: str = "
     return "\n".join(parts).strip()
 
 
+def _chat_resource_query(query: str, history: List[Dict[str, str]]) -> str:
+    """Retain user intent for short or referential follow-ups when selecting resources."""
+    previous_user_messages = [
+        str(turn.get("user") or "").strip()
+        for turn in (history or [])[-3:]
+        if isinstance(turn, dict) and str(turn.get("user") or "").strip()
+    ]
+    return contextual_resource_query(query, previous_user_messages)
+
+
 @app.get("/health")
 def health():
     required_config = {
@@ -3174,9 +3222,10 @@ def chat(request: Request, payload: Dict = Body(...)):
     matches = get_matches(retrieval_query, top_k, request_id=request_id)
     perf_step("retrieval", matches=len(matches))
     context = build_context(matches, request_id=request_id) if matches else ""
-    asset_matches = _augment_matches_for_assets(query, matches, request_id=request_id)
-    assets = _extract_chat_assets(asset_matches, max_items=3, query=query)
-    response_contract = _chat_response_contract(query)
+    resource_query = _chat_resource_query(query, conversation_history)
+    asset_matches = _augment_matches_for_assets(resource_query, matches, request_id=request_id)
+    assets = _extract_chat_assets(asset_matches, max_items=3, query=resource_query)
+    response_contract = _chat_response_contract(resource_query)
     perf_step("context_assets", context_chars=len(context), assets=len(assets))
 
     user = (
@@ -3252,9 +3301,10 @@ def chat_sse(request: Request, payload: Dict = Body(...)):
 
             matches = get_matches(retrieval_query, top_k, request_id=request_id)
             context = build_context(matches, request_id=request_id) if matches else ""
-            asset_matches = _augment_matches_for_assets(query, matches, request_id=request_id)
-            assets = _extract_chat_assets(asset_matches, max_items=3, query=query)
-            response_contract = _chat_response_contract(query)
+            resource_query = _chat_resource_query(query, conversation_history)
+            asset_matches = _augment_matches_for_assets(resource_query, matches, request_id=request_id)
+            assets = _extract_chat_assets(asset_matches, max_items=3, query=resource_query)
+            response_contract = _chat_response_contract(resource_query)
 
             user = (
                 f"USER_NAME:\n{user_name}\n\n"
@@ -4129,6 +4179,43 @@ def _diadem_fallback_takeaway_and_resources(query: str) -> Tuple[str, List[str]]
     profile = _diadem_retrieval_profile(query)
     primary = str(profile.get("primary") or "general")
     q = (query or "").lower()
+    reviewed_case = reviewed_intent(query)
+
+    if reviewed_case == "selling_boundary":
+        return (
+            "Selling builds value; negotiation starts once a proposal is on the table and the other party asks for movement on the terms.",
+            [
+                "Selling versus Negotiating: helps you recognise the moment a value conversation becomes a trading conversation.",
+                "STRONG and MASTER transition: helps you finish building value before you begin trading variables.",
+            ],
+        )
+
+    if reviewed_case == "difficult_behaviour":
+        return (
+            "Respond to difficult behaviour with prepared, composed commercial control rather than absorbing it or matching it.",
+            [
+                "Five Elements tool: gives you the Diadem response structure for difficult behaviour and negotiation tactics.",
+                "Tactics Preparation/AIR: helps you anticipate the move, prepare your response and return to the commercial issue.",
+            ],
+        )
+
+    if reviewed_case == "cpi_power":
+        return (
+            "Preparation restores leverage: set Low, High and Highest positions across several tradeable variables before the CPI.",
+            [
+                "Variables Planner: helps you prepare Low, High and Highest positions beyond price.",
+                "Balanced Playing Field: helps you identify your leverage and hold commercial confidence with a powerful customer.",
+            ],
+        )
+
+    if reviewed_case == "negotiation_anxiety":
+        return (
+            "Preparation reduces live pressure by giving you clear positions, variables and a deliberate next move.",
+            [
+                "Variables Planner: helps you prepare Low, High and Highest positions before pressure builds.",
+                "Preparing A Confident Mindset: helps you manage the inner voice and stay present in the conversation.",
+            ],
+        )
 
     if primary == "strong":
         if any(term in q for term in ("too expensive", "price", "discount", "cost")):
@@ -4183,9 +4270,9 @@ def _diadem_fallback_takeaway_and_resources(query: str) -> Tuple[str, List[str]]
             )
         if any(term in q for term in ("price", "increase", "renewal", "supplier", "discount")):
             return (
-                "Do not let one number become the whole negotiation; use variables to move the conversation to Graphite.",
+                "Do not let one number become the whole negotiation; prepare several variables and clear Low, High and Highest positions.",
                 [
-                    "Graphite Variables: helps you create a wider tradeable deal rather than a price-only fight.",
+                    "Variables Planner: helps you create a wider tradeable deal rather than a price-only fight.",
                     "MASTER Plan: helps you prepare ambition, positions, variables and walk-away before the meeting.",
                 ],
             )
@@ -5219,6 +5306,7 @@ def _master_llm_text(
     admin_prompt: str = "",
     summary_guidance_all: str = "",
     runtime_system_prompt: str = "",
+    resource_query: str = "",
 ) -> str:
     # Compact user prompt. INFORMATION is retrieved from Pinecone.
     deal_line = "" if deal_value is None else f"DEAL_VALUE: {deal_value}\n"
@@ -5350,13 +5438,18 @@ def _master_llm_text(
     if any(phrase in user_msg_lower for phrase in ["what about", "how can i prepare", "should i", "can i", "is it", "will they", "pay up front", "part pay", "upfront payment"]):
         business_question_handling = "\n\nCRITICAL: User is asking a business/coaching question. Acknowledge their thinking first, then answer it fully using INFORMATION. Provide coaching, suggestions, and guidance using INFORMATION dynamically. Do NOT redirect to template filling or variable selection unless the user explicitly asks to add variables or continue filling the template. CRITICAL: Do NOT end your response with ANY question. Do NOT ask 'Would you like to explore this further?', 'Would you like to add it as a variable?', 'How would you like to proceed?', 'Would you like to incorporate this?', or ANY other follow-up question. Answer their question completely and END your response without asking anything. Let them decide the next step."
     
+    reviewed_query = resource_query or user_message
+
     # Special handling for tricky behaviors question
     tricky_behaviors_handling = ""
-    if _is_tactics_query(user_message):
-        tricky_behaviors_handling = _tactics_instruction(user_message)
+    if _is_tactics_query(reviewed_query):
+        tricky_behaviors_handling = _tactics_instruction(reviewed_query)
+    reviewed_case_handling = response_instruction(reviewed_query)
+    if reviewed_case_handling:
+        tricky_behaviors_handling += f"\n\n{reviewed_case_handling}"
 
     non_tactics_guard = ""
-    if not _is_tactics_query(user_message):
+    if not _is_tactics_query(reviewed_query):
         non_tactics_guard = "\n\nIMPORTANT: The CURRENT user message is NOT a tactics question. Do NOT frame this answer around tactics, power play, tricky behaviour, difficult buyer behaviour, losing control, Coal, Soft Coal, good-cop behaviour, flattery, curveballs, balanced playing field, or Five Elements unless the user explicitly asked for that. Ignore any spillover from earlier turns. Answer the CURRENT question directly in normal MASTER template mode. If the user is asking what variables to prepare, what to type in a field, or how to complete the template, stay focused on that task only. Do NOT add tactics examples, ABC, Five Elements, or power-play framing by habit. Keep the answer tightly scoped to the current template task."
     
     # Special handling for table entries recognition
@@ -5610,6 +5703,7 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
     # Get conversation history for query expansion and context building
     history = _mnt_get_history_for_chat(st)  # Convert MNT history to chat format
     expanded_query = _expand_query_with_context(user_message, history)
+    resource_query = _chat_resource_query(user_message, history)
     
     rag_query = f"master_template {active_section_id} {focus_field}: {expanded_query}".strip()
     rag_query = expand_diadem_retrieval_query(rag_query, mode="master")
@@ -5627,7 +5721,8 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
             matches = raw2 or []
 
     info = build_context(matches, request_id=request_id) if matches else ""
-    assets = _extract_chat_assets(matches, max_items=3, query=user_message)
+    asset_matches = _augment_matches_for_assets(resource_query, matches, request_id=request_id)
+    assets = _extract_chat_assets(asset_matches, max_items=3, query=resource_query)
 
     # --- MASTER phase guidance (M/A/S/T/E/R) ---
     # Skip phase guidance if user just accepted help and no active_section_id is set (guide to variables first)
@@ -5709,6 +5804,7 @@ def master_template_turn_text(payload: Dict[str, Any], session_id: str) -> Dict[
             admin_prompt=admin_prompt,
             summary_guidance_all=summary_guidance_all,
             runtime_system_prompt=runtime_system_prompt,
+            resource_query=resource_query,
         )
     except Exception as e:
         _jlog("master_template_llm_error", session_id=session_id, err=str(e)[:800])
@@ -5839,6 +5935,7 @@ def master_template_sse(payload: Dict = Body(...)):
             # Get conversation history for query expansion and context building
             history = _mnt_get_history_for_chat(st)  # Convert MNT history to chat format
             expanded_query = _expand_query_with_context(user_message, history)
+            resource_query = _chat_resource_query(user_message, history)
             
             rag_query = f"master_template {st.get('active_section_id','')} {st.get('focus_field','')}: {expanded_query}".strip()
             rag_query = expand_diadem_retrieval_query(rag_query, mode="master")
@@ -5851,7 +5948,8 @@ def master_template_sse(payload: Dict = Body(...)):
                     raw2 = get_matches(rag_query + " negotiation", TOP_K, request_id=request_id)
                     matches = raw2 or []
             info = build_context(matches, request_id=request_id) if matches else ""
-            assets = _extract_chat_assets(matches, max_items=3, query=user_message)
+            asset_matches = _augment_matches_for_assets(resource_query, matches, request_id=request_id)
+            assets = _extract_chat_assets(asset_matches, max_items=3, query=resource_query)
             
             # Build conversation context like /chat
             conversation_context = _mnt_build_conversation_context(st)
@@ -6019,11 +6117,14 @@ def master_template_sse(payload: Dict = Body(...)):
             
             # Special handling for tricky behaviors question
             tricky_behaviors_handling = ""
-            if _is_tactics_query(user_message):
-                tricky_behaviors_handling = _tactics_instruction(user_message)
+            if _is_tactics_query(resource_query):
+                tricky_behaviors_handling = _tactics_instruction(resource_query)
+            reviewed_case_handling = response_instruction(resource_query)
+            if reviewed_case_handling:
+                tricky_behaviors_handling += f"\n\n{reviewed_case_handling}"
 
             non_tactics_guard = ""
-            if not _is_tactics_query(user_message):
+            if not _is_tactics_query(resource_query):
                 non_tactics_guard = "\n\nIMPORTANT: The CURRENT user message is NOT a tactics question. Do NOT frame this answer around tactics, power play, tricky behaviour, difficult buyer behaviour, losing control, Coal, Soft Coal, good-cop behaviour, flattery, curveballs, balanced playing field, or Five Elements unless the user explicitly asked for that. Ignore any spillover from earlier turns. Answer the CURRENT question directly in normal MASTER template mode. If the user is asking what variables to prepare, what to type in a field, or how to complete the template, stay focused on that task only. Do NOT add tactics examples, ABC, Five Elements, or power-play framing by habit. Keep the answer tightly scoped to the current template task."
             
             # Special handling for table entries recognition
