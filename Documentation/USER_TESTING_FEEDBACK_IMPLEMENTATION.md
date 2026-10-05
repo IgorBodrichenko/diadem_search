@@ -6,6 +6,22 @@ This change addresses the resource-selection and coaching issues recorded in `Ma
 
 ## Implemented Behaviour
 
+### Two hour follow-up testing
+
+The second testing session added the following corrections:
+
+- Resource labels now use `MASTER Toolkit` instead of vague or invented labels such as `MASTER Variables`.
+- Counterproposal questions prioritise the image-backed `If you, then I` alternatives slide on page 60.
+- Deadline-driven closing questions prioritise the image-backed Four Questions slide on page 77.
+- Price-pressure questions explicitly use CARD and name the MASTER Toolkit.
+- Pipeline questions focus on genuine intent and a specific what, who and when instead of using Coal/Graphite/Diamond as a generic qualification model.
+- Intimidation, time pressure and threats to go elsewhere route to Five Elements.
+- Repeated `image_url` values are removed from the visible assets list.
+- The repeated phrase `what would need to be true for` is rewritten as the more natural `what needs to happen for`.
+- Targeted resource searches run concurrently to reduce the latency added by richer asset selection.
+
+CARD and SCOTSMAN are not currently available as image-backed Pinecone assets. The answer contract uses CARD correctly, but a CARD visual cannot be guaranteed until that slide is ingested. SCOTSMAN is not named in answers until approved source material has been added to the index.
+
 ### Selling versus negotiating
 
 - Defines selling as building value and earning agreement.
@@ -75,6 +91,10 @@ After deployment, use one new chat session per numbered scenario unless the step
 | Rude, belittling or bullying counterpart | Names Five Elements and gives a composed practical response | Five Elements and Tactics Preparation/AIR |
 | Dominating an internal meeting, followed by `Internal` | Retains meeting-control intent and progresses the advice | Five Elements; no unrelated DISC slide |
 | CPI with a powerful customer | Uses Low/High/Highest and multiple variables | Variables Planner and Balanced Playing Field |
+| Counterproposal after Highest is rejected | Protects Highest and makes movement conditional | If you, then I alternatives and MASTER Toolkit preparation |
+| Closing due to quarterly pressure | Uses the Four Questions before recommending agreement | Four Questions and MASTER Toolkit preparation |
+| Too expensive or competitor-price pressure | Uses CARD before discussing movement | CARD when indexed; MASTER Toolkit preparation |
+| Stalled or unclosed pipeline | Qualifies intent and secures what/who/when | Get Next Steps; no generic Coal/Graphite/Diamond ranking |
 
 For each response, confirm:
 

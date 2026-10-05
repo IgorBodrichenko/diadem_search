@@ -40,6 +40,7 @@ from diadem_feedback_rules import (
     asset_preference_score,
     asset_search_queries,
     contextual_resource_query,
+    naturalise_reviewed_phrasing,
     response_instruction,
     reviewed_intent,
 )
@@ -994,6 +995,12 @@ TACTICS_QUERY_PHRASES = [
     "cut me off",
     "steamroll",
     "ignore them",
+    "intimidating",
+    "afraid to push back",
+    "threat to go elsewhere",
+    "go elsewhere",
+    "time pressure",
+    "tyme prsure",
     "buyer uses tactics",
     "using tactics",
     "uses tactics",
@@ -1491,6 +1498,8 @@ def _diadem_retrieval_profile(query: str) -> Dict[str, Any]:
         "scope", "scope creep", "free", "extra", "additional", "more work",
         "cpi", "rude", "bully", "bullying", "belittle", "undermine", "incompetent",
         "dominating", "talk over", "steamroll", "five elements",
+        "salary", "counter proposal", "counterproposal", "quarterly target", "pipeline",
+        "competitor pricing", "too expensive", "wiggle room", "like for like",
     ]
     selling_terms = [
         "sell", "selling", "sales", "customer", "proposal", "recommendation", "pitch",
@@ -1992,6 +2001,7 @@ def _extract_chat_assets(matches: List[Dict], max_items: int = 3, query: str = "
     # Higher module/keyword score first, then preserve original retrieval order.
     candidates.sort(key=lambda x: (-x[0], x[1]))
     selected_resource_keys: set = set()
+    selected_image_urls: set = set()
     for _, _, asset in candidates:
         try:
             page_key = int(float(asset.get("page")))
@@ -2001,7 +2011,12 @@ def _extract_chat_assets(matches: List[Dict], max_items: int = 3, query: str = "
         resource_key = (source_key, page_key)
         if resource_key in selected_resource_keys:
             continue
+        image_key = str(asset.get("image_url") or "").strip()
+        if image_key and image_key in selected_image_urls:
+            continue
         selected_resource_keys.add(resource_key)
+        if image_key:
+            selected_image_urls.add(image_key)
         assets.append(asset)
         if len(assets) >= max_items:
             break
@@ -2028,6 +2043,7 @@ def _augment_matches_for_assets(query: str, matches: List[Dict], request_id: str
         for term in ("nervous", "nerve", "confidence", "confident", "mindset", "headspace", "anxious", "anxiety")
     )
     reviewed_queries = asset_search_queries(query)
+    asset_lookup_k = 10 if reviewed_queries else 6
     if reviewed_queries:
         extra_queries = reviewed_queries
     elif confidence_query and primary == "presenting":
@@ -2049,13 +2065,23 @@ def _augment_matches_for_assets(query: str, matches: List[Dict], request_id: str
         md = m.get("metadata") or {}
         seen.add((str(m.get("id") or ""), str(md.get("page") or ""), str(md.get("image_url") or "")))
 
-    for idx, extra_query in enumerate(extra_queries, 1):
+    def _asset_lookup(item: Tuple[int, str]) -> Tuple[int, str, List[Dict]]:
+        idx, extra_query = item
         try:
-            extra = get_matches(extra_query, 6, request_id=f"{request_id}-asset{idx}" if request_id else None)
+            extra = get_matches(extra_query, asset_lookup_k, request_id=f"{request_id}-asset{idx}" if request_id else None)
         except Exception as e:
             _slog("asset_augment_error", request_id=request_id, query=extra_query, err=str(e)[:300])
-            continue
+            extra = []
+        return idx, extra_query, extra
 
+    lookups = list(enumerate(extra_queries, 1))
+    if len(lookups) > 1:
+        with ThreadPoolExecutor(max_workers=min(3, len(lookups))) as pool:
+            lookup_results = list(pool.map(_asset_lookup, lookups))
+    else:
+        lookup_results = [_asset_lookup(item) for item in lookups]
+
+    for _, _, extra in lookup_results:
         for m in extra:
             md = m.get("metadata") or {}
             key = (str(m.get("id") or ""), str(md.get("page") or ""), str(md.get("image_url") or ""))
@@ -4172,6 +4198,7 @@ def _finalize_chat_text(text: str, max_questions: int = 1) -> str:
     t = strip_markdown_chars((text or "").strip())
     if not t:
         return ""
+    t = naturalise_reviewed_phrasing(t)
     return _limit_question_marks(t, max_questions=max_questions)
 
 
@@ -4214,6 +4241,51 @@ def _diadem_fallback_takeaway_and_resources(query: str) -> Tuple[str, List[str]]
             [
                 "Variables Planner: helps you prepare Low, High and Highest positions before pressure builds.",
                 "Preparing A Confident Mindset: helps you manage the inner voice and stay present in the conversation.",
+            ],
+        )
+
+    if reviewed_case == "deadline_close":
+        return (
+            "Do not close merely to relieve deadline pressure; use the Four Questions and your prepared positions to test whether the deal is commercially sound.",
+            [
+                "Four Questions: helps you check the deal before internal pressure drives the decision.",
+                "MASTER Toolkit: helps you review ambition, variables, positions and walk-away before agreeing.",
+            ],
+        )
+
+    if reviewed_case == "conditional_proposal":
+        return (
+            "A counterproposal should change the shape of the deal through a conditional trade, not simply lower your Highest position.",
+            [
+                "If you, then I proposal language: helps you make every movement conditional on something in return.",
+                "MASTER Toolkit: helps you identify the variable to introduce and the position to protect.",
+            ],
+        )
+
+    if reviewed_case == "price_issue":
+        return (
+            "Treat price pressure as something to clarify before moving, then trade across variables rather than discounting alone.",
+            [
+                "CARD: helps you Clarify, get All issues out, handle them in the Right Order and then Deal.",
+                "MASTER Toolkit: helps you prepare positions and variables so any movement earns something in return.",
+            ],
+        )
+
+    if reviewed_case == "pipeline_qualification":
+        return (
+            "Prioritise opportunities with real intent and a committed next action, not the deals with the most optimistic labels.",
+            [
+                "Get Next Steps: helps secure a specific what, who and when for every genuinely active opportunity.",
+                "MASTER Toolkit: supports preparation where a live opportunity has moved into negotiation.",
+            ],
+        )
+
+    if reviewed_case == "master_toolkit":
+        return (
+            "Better outcomes come from preparing ambition, variables and Low, High and Highest positions before pressure begins.",
+            [
+                "MASTER Toolkit: provides the practical workspace for ambition, variables, positions and conditional trades.",
+                "Preparing the Negotiation Conversation: helps turn that preparation into a controlled live discussion.",
             ],
         )
 
