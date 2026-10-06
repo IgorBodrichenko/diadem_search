@@ -541,23 +541,25 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 # =========================
 SESSION_DB_PATH = os.getenv("SESSION_DB_PATH", "sessions.sqlite3")
 _DB: Optional[sqlite3.Connection] = None
+_DB_LOCK = threading.RLock()
 
 
 def _db() -> sqlite3.Connection:
     global _DB
-    if _DB is None:
-        _DB = sqlite3.connect(SESSION_DB_PATH, check_same_thread=False)
-        _DB.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sessions (
-              session_id TEXT PRIMARY KEY,
-              updated_at INTEGER NOT NULL,
-              entry_json TEXT NOT NULL
+    with _DB_LOCK:
+        if _DB is None:
+            _DB = sqlite3.connect(SESSION_DB_PATH, check_same_thread=False)
+            _DB.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sessions (
+                  session_id TEXT PRIMARY KEY,
+                  updated_at INTEGER NOT NULL,
+                  entry_json TEXT NOT NULL
+                )
+                """
             )
-            """
-        )
-        _DB.commit()
-    return _DB
+            _DB.commit()
+        return _DB
 
 
 def _now() -> int:
@@ -567,10 +569,11 @@ def _now() -> int:
 def _db_get(session_id: str) -> Optional[Dict[str, Any]]:
     if not session_id:
         return None
-    row = _db().execute(
-        "SELECT entry_json FROM sessions WHERE session_id = ?",
-        (session_id,),
-    ).fetchone()
+    with _DB_LOCK:
+        row = _db().execute(
+            "SELECT entry_json FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
     if not row:
         return None
     try:
@@ -583,28 +586,31 @@ def _db_set(session_id: str, entry: Dict[str, Any]) -> None:
     entry = entry or {}
     entry["updated_at"] = _now()
     payload = json.dumps(entry, ensure_ascii=False)
-    _db().execute(
-        """
-        INSERT INTO sessions(session_id, updated_at, entry_json)
-        VALUES(?, ?, ?)
-        ON CONFLICT(session_id) DO UPDATE SET
-          updated_at=excluded.updated_at,
-          entry_json=excluded.entry_json
-        """,
-        (session_id, int(entry["updated_at"]), payload),
-    )
-    _db().commit()
+    with _DB_LOCK:
+        _db().execute(
+            """
+            INSERT INTO sessions(session_id, updated_at, entry_json)
+            VALUES(?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+              updated_at=excluded.updated_at,
+              entry_json=excluded.entry_json
+            """,
+            (session_id, int(entry["updated_at"]), payload),
+        )
+        _db().commit()
 
 
 def _db_delete(session_id: str) -> None:
-    _db().execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
-    _db().commit()
+    with _DB_LOCK:
+        _db().execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        _db().commit()
 
 
 def _cleanup_sessions() -> None:
     cutoff = _now() - SESSION_TTL_SECONDS
-    _db().execute("DELETE FROM sessions WHERE updated_at < ?", (cutoff,))
-    _db().commit()
+    with _DB_LOCK:
+        _db().execute("DELETE FROM sessions WHERE updated_at < ?", (cutoff,))
+        _db().commit()
 
 
 def _get_or_create_session_id(payload: Dict[str, Any], query_params: Optional[Any] = None) -> str:
@@ -3196,8 +3202,20 @@ def ready():
         if not value
     ]
     if missing:
-        return JSONResponse({"ok": False, "missing": missing}, status_code=503)
-    return {"ok": True}
+        return JSONResponse(
+            {"ok": False, "checks": {"config": False, "session_store": None}, "missing": missing},
+            status_code=503,
+        )
+    try:
+        with _DB_LOCK:
+            _db().execute("SELECT 1").fetchone()
+    except sqlite3.Error:
+        log.exception("Readiness check failed for the session store")
+        return JSONResponse(
+            {"ok": False, "checks": {"config": True, "session_store": False}},
+            status_code=503,
+        )
+    return {"ok": True, "checks": {"config": True, "session_store": True}}
 
 
 # =========================

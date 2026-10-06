@@ -8,3 +8,6 @@ __pycache__/
 !.env.example
 eval_results_*.json
 evaluation_outputs/
+*.log
+*.sqlite3-wal
+*.sqlite3-shm
