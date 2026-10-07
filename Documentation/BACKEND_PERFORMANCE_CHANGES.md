@@ -123,6 +123,14 @@ The following remain unchanged:
 - Resource and image payloads.
 - AI model selection.
 
+The `/chat/sse` stream also emits optional `status` events so the frontend can
+show genuine progress while retrieval and generation are running. Existing
+clients can safely ignore these events. The stages are:
+
+- `understanding` - the request has been accepted.
+- `retrieval` - Diadem resources and document context are being searched.
+- `generation` - the response is being generated.
+
 ## Cache Scope and Limitations
 
 Both caches are in memory and local to one running backend process.

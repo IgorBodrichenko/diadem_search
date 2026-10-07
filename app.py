@@ -3321,6 +3321,11 @@ def chat_sse(request: Request, payload: Dict = Body(...)):
     def gen():
         start_payload = json.dumps({"session_id": session_id}, ensure_ascii=False)
         yield f"event: start\ndata: {start_payload}\n\n"
+        status_payload = json.dumps(
+            {"stage": "understanding", "message": "Understanding your question..."},
+            ensure_ascii=False,
+        )
+        yield f"event: status\ndata: {status_payload}\n\n"
 
         assets: List[Dict[str, Any]] = []
         conversation_history: List[Dict[str, str]] = []
@@ -3343,6 +3348,11 @@ def chat_sse(request: Request, payload: Dict = Body(...)):
                 retrieval_query = f"{retrieval_query}\n\n{document_memory_context}"
             retrieval_query = expand_diadem_retrieval_query(retrieval_query, mode="chat")
 
+            status_payload = json.dumps(
+                {"stage": "retrieval", "message": "Searching Diadem resources..."},
+                ensure_ascii=False,
+            )
+            yield f"event: status\ndata: {status_payload}\n\n"
             matches = get_matches(retrieval_query, top_k, request_id=request_id)
             context = build_context(matches, request_id=request_id) if matches else ""
             resource_query = _chat_resource_query(query, conversation_history)
@@ -3363,6 +3373,11 @@ def chat_sse(request: Request, payload: Dict = Body(...)):
                 {"role": "user", "content": user},
             ]
 
+            status_payload = json.dumps(
+                {"stage": "generation", "message": "Preparing your response..."},
+                ensure_ascii=False,
+            )
+            yield f"event: status\ndata: {status_payload}\n\n"
             streamed_parts: List[str] = []
             for part in _iter_text_as_sse_chunks(_openai_stream_text(messages, model=CHAT_MODEL, temperature=0.2), min_chars=28):
                 streamed_parts.append(part)
